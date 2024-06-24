@@ -24,8 +24,8 @@
  * Values below define offset to each field from start of frame
  */
 #define SUBPORT_OFFSET	7
-#define PIPE_OFFSET		9
-#define QUEUE_OFFSET	20
+#define PIPE_OFFSET	18
+#define QUEUE_OFFSET	9
 #define COLOR_OFFSET	19
 
 static inline int
@@ -33,27 +33,32 @@ get_pkt_sched(struct rte_mbuf *m, uint32_t *subport, uint32_t *pipe,
 			uint32_t *traffic_class, uint32_t *queue, uint32_t *color)
 {
 	uint16_t *pdata = rte_pktmbuf_mtod(m, uint16_t *);
+	struct rte_ether_hdr *eth_hdr;
+	struct rte_ether_addr addr;
 	uint16_t pipe_queue;
 
-	/* Outer VLAN ID*/
-	*subport = (rte_be_to_cpu_16(pdata[SUBPORT_OFFSET]) & 0x0FFF) &
-		(port_params.n_subports_per_port - 1);
+	eth_hdr = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
 
-	/* Inner VLAN ID */
-	*pipe = (rte_be_to_cpu_16(pdata[PIPE_OFFSET]) & 0x0FFF) &
-		(subport_params[*subport].n_pipes_per_subport_enabled - 1);
+ 	*subport = 0; 	
 
-	pipe_queue = active_queues[(pdata[QUEUE_OFFSET] >> 8) % n_active_queues];
+ 	/* Dst Addr */
+ 	*pipe = (rte_be_to_cpu_16(pdata[PIPE_OFFSET]) & 0xFFFF);
 
-	/* Traffic class (Destination IP) */
-	*traffic_class = pipe_queue > RTE_SCHED_TRAFFIC_CLASS_BE ?
-			RTE_SCHED_TRAFFIC_CLASS_BE : pipe_queue;
+ 	pipe_queue = (rte_be_to_cpu_16(pdata[QUEUE_OFFSET]) & 0x000F);
 
-	/* Traffic class queue (Destination IP) */
-	*queue = pipe_queue - *traffic_class;
+ 	/* Traffic class (TOS) */
+ 	*traffic_class = pipe_queue > RTE_SCHED_TRAFFIC_CLASS_BE ?
+ 			RTE_SCHED_TRAFFIC_CLASS_BE : pipe_queue;
+ 	
+ 	/* Traffic class queue (TOS) */
+ 	*queue = pipe_queue - *traffic_class;
+ 	
+ 	/* Color (Destination IP) */
+ 	*color = 0;
 
-	/* Color (Destination IP) */
-	*color = pdata[COLOR_OFFSET] & 0x03;
+	rte_ether_addr_copy(&eth_hdr->dst_addr, &addr);
+	rte_ether_addr_copy(&eth_hdr->src_addr, &eth_hdr->dst_addr);
+	rte_ether_addr_copy(&addr, &eth_hdr->src_addr);
 
 	return 0;
 }
