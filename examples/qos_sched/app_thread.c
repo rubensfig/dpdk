@@ -44,16 +44,17 @@ get_pkt_sched(struct rte_mbuf *m, uint32_t *subport, uint32_t *pipe,
  	/* Dst Addr */
  	*pipe = (rte_be_to_cpu_16(pdata[PIPE_OFFSET]) & 0xFFFF);
 
- 	pipe_queue = (rte_be_to_cpu_16(pdata[QUEUE_OFFSET]) & 0x000F);
+	pipe_queue = (rte_be_to_cpu_16(pdata[QUEUE_OFFSET]) & 0x00FF);
+	// printf("pdata[9]=%x\n", pdata[9] & 0xFF00);
 
  	/* Traffic class (TOS) */
  	*traffic_class = pipe_queue > RTE_SCHED_TRAFFIC_CLASS_BE ?
  			RTE_SCHED_TRAFFIC_CLASS_BE : pipe_queue;
- 	
+
  	/* Traffic class queue (TOS) */
  	*queue = pipe_queue - *traffic_class;
  	
- 	/* Color (Destination IP) */
+ 	/* Color */
  	*color = 0;
 
 	rte_ether_addr_copy(&eth_hdr->dst_addr, &addr);

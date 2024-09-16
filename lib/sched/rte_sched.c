@@ -1326,6 +1326,7 @@ rte_sched_subport_config(struct rte_sched_port *port,
 		n_subport_pipe_queues = rte_sched_subport_pipe_queues(s);
 		bmp_mem_size = rte_bitmap_get_memory_footprint(
 						n_subport_pipe_queues);
+		printf("FOOTPRINT: %d\n", bmp_mem_size);
 		s->bmp = rte_bitmap_init(n_subport_pipe_queues, s->bmp_array,
 					bmp_mem_size);
 		if (s->bmp == NULL) {

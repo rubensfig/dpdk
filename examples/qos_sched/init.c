@@ -203,7 +203,7 @@ static struct rte_sched_subport_profile_params
 
 struct rte_sched_subport_params subport_params[MAX_SCHED_SUBPORTS] = {
 	{
-		.n_pipes_per_subport_enabled = 4096,
+		.n_pipes_per_subport_enabled = 65536,
 		.qsize = {64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64},
 		.pipe_profiles = pipe_profiles,
 		.n_pipe_profiles = sizeof(pipe_profiles) /
@@ -282,6 +282,9 @@ app_init_sched_port(uint32_t portid, uint32_t socketid)
 			rte_exit(EXIT_FAILURE, "Error: invalid config, no pipes enabled for sched subport %u\n",
 					subport);
 	}
+
+	struct rte_sched_subport_params *subport_params_ptr = subport_params;
+	printf("App mem footprint: %d Bytes\n", rte_sched_port_get_memory_footprint(&port_params,  &subport_params_ptr));
 
 	return port;
 }

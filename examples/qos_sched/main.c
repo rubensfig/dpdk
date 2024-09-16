@@ -145,11 +145,12 @@ app_stat(void)
 
 		rte_eth_stats_get(flow->rx_port, &stats);
 		printf("\nRX port %"PRIu16": rx: %"PRIu64 " err: %"PRIu64
-				" no_mbuf: %"PRIu64 "\n",
+				" no_mbuf: %"PRIu64 " missed: %"PRIu64 "\n",
 				flow->rx_port,
 				stats.ipackets - rx_stats[i].ipackets,
 				stats.ierrors - rx_stats[i].ierrors,
-				stats.rx_nombuf - rx_stats[i].rx_nombuf);
+				stats.rx_nombuf - rx_stats[i].rx_nombuf,
+				stats.imissed - rx_stats[i].imissed);
 		memcpy(&rx_stats[i], &stats, sizeof(stats));
 
 		rte_eth_stats_get(flow->tx_port, &stats);
