@@ -169,22 +169,24 @@ static int
 app_parse_flow_conf(const char *conf_str)
 {
 	int ret;
-	uint32_t vals[5];
+	uint32_t vals[7];
 	struct flow_conf *pconf;
 	uint64_t mask;
 
 	memset(vals, 0, sizeof(vals));
-	ret = app_parse_opt_vals(conf_str, ',', 6, vals);
-	if (ret < 4 || ret > 5)
+	ret = app_parse_opt_vals(conf_str, ',', 7, vals);
+	if (ret < 4 || ret > 8)
 		return ret;
 
 	pconf = &qos_conf[nb_pfc];
 
 	pconf->rx_port = vals[0];
 	pconf->tx_port = vals[1];
+	pconf->rx_queue = vals[5];
+	pconf->tx_queue = vals[6];
 	pconf->rx_core = (uint8_t)vals[2];
 	pconf->wt_core = (uint8_t)vals[3];
-	if (ret == 5)
+	if (ret == 7)
 		pconf->tx_core = (uint8_t)vals[4];
 	else
 		pconf->tx_core = pconf->wt_core;
@@ -205,6 +207,7 @@ app_parse_flow_conf(const char *conf_str)
 		return -1;
 	}
 
+	/*
 	mask = 1lu << pconf->rx_port;
 	if (app_used_rx_port_mask & mask) {
 		RTE_LOG(ERR, APP, "pfc %u: rx port %"PRIu16" is used already\n",
@@ -222,6 +225,7 @@ app_parse_flow_conf(const char *conf_str)
 	}
 	app_used_tx_port_mask |= mask;
 	app_used_port_mask |= mask;
+	*/
 
 	nb_pfc++;
 
