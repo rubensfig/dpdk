@@ -44,7 +44,6 @@ app_main_loop(__rte_unused void *dummy)
 	memset(wt_confs, 0, sizeof(wt_confs));
 	memset(tx_confs, 0, sizeof(tx_confs));
 
-
 	mode = APP_MODE_NONE;
 	lcore_id = rte_lcore_id();
 
@@ -52,6 +51,8 @@ app_main_loop(__rte_unused void *dummy)
 		struct flow_conf *flow = &qos_conf[i];
 
 		if (flow->rx_core == lcore_id) {
+			printf("rx core: port %d, queue %d\n", flow->rx_port, flow->rx_queue);
+
 			flow->rx_thread.rx_port = flow->rx_port;
 			flow->rx_thread.rx_ring =  flow->rx_ring;
 			flow->rx_thread.rx_queue = flow->rx_queue;
@@ -62,6 +63,8 @@ app_main_loop(__rte_unused void *dummy)
 			mode |= APP_RX_MODE;
 		}
 		if (flow->tx_core == lcore_id) {
+			printf("tx core: port %d, queue %d\n", flow->tx_port, flow->tx_queue);
+
 			flow->tx_thread.tx_port = flow->tx_port;
 			flow->tx_thread.tx_ring =  flow->tx_ring;
 			flow->tx_thread.tx_queue = flow->tx_queue;
@@ -71,10 +74,13 @@ app_main_loop(__rte_unused void *dummy)
 			mode |= APP_TX_MODE;
 		}
 		if (flow->wt_core == lcore_id) {
+			printf("worker core: port %d, queue %d\n", flow->tx_port, flow->tx_queue);
+
 			flow->wt_thread.rx_ring =  flow->rx_ring;
 			flow->wt_thread.tx_ring =  flow->tx_ring;
 			flow->wt_thread.tx_port =  flow->tx_port;
-			flow->wt_thread.sched_port =  flow->sched_port;
+			flow->wt_thread.tx_queue = flow->tx_queue;
+			flow->wt_thread.sched_port = flow->sched_port;
 
 			wt_confs[wt_idx++] = &flow->wt_thread;
 

@@ -122,7 +122,7 @@ app_tx_thread(struct thread_conf **confs)
 		nb_pkts = rte_ring_sc_dequeue_burst(conf->tx_ring, (void **)mbufs,
 					burst_conf.qos_dequeue, NULL);
 		if (likely(nb_pkts != 0)) {
-			uint16_t nb_tx = rte_eth_tx_burst(conf->tx_port, 0, mbufs, nb_pkts);
+			uint16_t nb_tx = rte_eth_tx_burst(conf->tx_port, conf->tx_queue, mbufs, nb_pkts);
 			if (nb_pkts != nb_tx)
 				rte_pktmbuf_free_bulk(&mbufs[nb_tx], nb_pkts - nb_tx);
 		}
@@ -132,7 +132,6 @@ app_tx_thread(struct thread_conf **confs)
 			conf_idx = 0;
 	}
 }
-
 
 void
 app_worker_thread(struct thread_conf **confs)
@@ -168,7 +167,6 @@ app_worker_thread(struct thread_conf **confs)
 	}
 }
 
-
 void
 app_mixed_thread(struct thread_conf **confs)
 {
@@ -182,6 +180,7 @@ app_mixed_thread(struct thread_conf **confs)
 		/* Read packet from the ring */
 		nb_pkt = rte_ring_sc_dequeue_burst(conf->rx_ring, (void **)mbufs,
 					burst_conf.ring_burst, NULL);
+		/*
 		if (likely(nb_pkt)) {
 			int nb_sent = rte_sched_port_enqueue(conf->sched_port, mbufs,
 					nb_pkt);
@@ -190,9 +189,9 @@ app_mixed_thread(struct thread_conf **confs)
 			APP_STATS_ADD(conf->stat.nb_rx, nb_pkt);
 		}
 
-
 		nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs,
 					burst_conf.qos_dequeue);
+		*/
 		if (likely(nb_pkt > 0)) {
 			uint16_t nb_tx = rte_eth_tx_burst(conf->tx_port, 0, mbufs, nb_pkt);
 			if (nb_tx != nb_pkt)
