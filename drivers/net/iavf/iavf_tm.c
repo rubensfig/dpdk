@@ -35,6 +35,9 @@ static int iavf_node_capabilities_get(struct rte_eth_dev *dev,
 				      struct rte_tm_error *error);
 static int iavf_node_type_get(struct rte_eth_dev *dev, uint32_t node_id,
 		   int *is_leaf, struct rte_tm_error *error);
+static int iavf_node_parent_update(struct rte_eth_dev *dev, uint32_t node_id, 
+		uint32_t parent_node_id, uint32_t priority, uint32_t weight,
+	       	struct rte_tm_error *error);
 
 const struct rte_tm_ops iavf_tm_ops = {
 	.shaper_profile_add = iavf_shaper_profile_add,
@@ -45,6 +48,7 @@ const struct rte_tm_ops iavf_tm_ops = {
 	.level_capabilities_get = iavf_level_capabilities_get,
 	.node_capabilities_get = iavf_node_capabilities_get,
 	.node_type_get = iavf_node_type_get,
+	.node_parent_update = iavf_node_parent_update,
 	.hierarchy_commit = iavf_hierarchy_commit,
 };
 
@@ -917,4 +921,15 @@ fail_clear:
 	}
 err:
 	return ret_val;
+}
+
+static int iavf_node_parent_update(struct rte_eth_dev *dev, uint32_t node_id, 
+		uint32_t parent_node_id, uint32_t priority, uint32_t weight,
+	       	struct rte_tm_error *error)
+{
+	struct iavf_info *vf = IAVF_DEV_PRIVATE_TO_VF(dev->data->dev_private);
+	struct iavf_adapter *adapter =
+		IAVF_DEV_PRIVATE_TO_ADAPTER(dev->data->dev_private);
+	iavf_get_hqos_tree(adapter);
+
 }

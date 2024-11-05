@@ -2286,3 +2286,41 @@ out:
 	rte_spinlock_unlock(&vf->phc_time_aq_lock);
 	return err;
 }
+
+int iavf_get_hqos_tree(struct iavf_adapter *adapter)
+{
+	struct iavf_info *vf = IAVF_DEV_PRIVATE_TO_VF(adapter);
+	struct virtchnl_hqos_cfg_list *cfg_msg = NULL;
+	struct iavf_cmd_info args;
+	int err = 0;
+
+	args.ops = VIRTCHNL_OP_HQOS_TREE_READ;
+	args.in_args = NULL;
+	args.in_args_size = 0;
+	args.out_buffer = vf->aq_resp;
+	args.out_size = IAVF_AQ_BUF_SZ;
+
+	err = iavf_execute_vf_cmd_safe(adapter, &args, 0);
+	if (err) {
+		PMD_DRV_LOG(ERR,
+			    "Failed to execute command of VIRTCHNL_OP_HQOS_TREE_READ");
+		return err;
+	}
+
+	cfg_msg = ((struct virtchnl_hqos_cfg_list *)args.out_buffer);
+
+	printf("TOP LEVEL NUM ELEMS: %d\n", cfg_msg->num_elem);
+	for (int i=0; i < cfg_msg->num_elem; i++)	
+	{
+		// printf("IT: %d", i);
+		printf("Teid: %d\n", cfg_msg->cfg[i].teid);
+		printf("Parent Teid: %d\n", cfg_msg->cfg[i].parent_teid);
+		printf("Leaf? %d\n", cfg_msg->cfg[i].node_type);
+		printf("tx_max %ld\n", cfg_msg->cfg[i].tx_max);
+		printf("tx_share %ld\n", cfg_msg->cfg[i].tx_share);
+
+		printf("\n\n");
+	}
+
+	return err;
+}

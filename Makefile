@@ -3,5 +3,7 @@
 
 .PHONY: all
 all:
-	@echo "To build DPDK please use meson and ninja as described at"
-	@echo "    https://core.dpdk.org/doc/quick-start/"
+	cd build; \
+	ninja; \
+	ninja install;
+	

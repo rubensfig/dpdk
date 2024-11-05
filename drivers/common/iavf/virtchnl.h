@@ -170,6 +170,11 @@ enum virtchnl_ops {
 	VIRTCHNL_OP_CONFIG_QUANTA = 113,
 	VIRTCHNL_OP_FLOW_SUBSCRIBE = 114,
 	VIRTCHNL_OP_FLOW_UNSUBSCRIBE = 115,
+	VIRTCHNL_OP_HQOS_TREE_READ = 131,
+	// VIRTCHNL_OP_HQOS_ELEMS_ADD = 132,
+	// VIRTCHNL_OP_HQOS_ELEMS_DEL = 133,
+	// VIRTCHNL_OP_HQOS_ELEMS_MOVE = 134,
+	// VIRTCHNL_OP_HQOS_ELEMS_CONF = 135,
 	VIRTCHNL_OP_MAX,
 };
 
@@ -2157,6 +2162,34 @@ struct virtchnl_phc_time {
 };
 
 VIRTCHNL_CHECK_STRUCT_LEN(16, virtchnl_phc_time);
+
+/*
+ * VIRTCHNL_OP_HQOS_READ_TREE
+ * VIRTCHNL_OP_HQOS_ELEM_ADD
+ * VIRTCHNL_OP_HQOS_ELEM_DEL
+ * VIRTCHNL_OP_HQOS_ELEM_BW_SET
+ * List with tc and queus HW QoS values
+ */
+struct virtchnl_hqos_cfg {
+#define VIRTCHNL_HQOS_ELEM_TYPE_NODE	0
+#define VIRTCHNL_HQOS_ELEM_TYPE_LEAF	1
+	u8 node_type;
+	u8 pad[7];
+	u32 teid;
+	u32 parent_teid;
+	u64 tx_max;
+	u64 tx_share;
+	u32 tx_priority;
+	u32 tx_weight;
+};
+VIRTCHNL_CHECK_STRUCT_LEN(40, virtchnl_hqos_cfg);
+
+struct virtchnl_hqos_cfg_list {
+	u16 num_elem;
+	u8 pad[6];
+	struct virtchnl_hqos_cfg cfg[1];
+};
+VIRTCHNL_CHECK_STRUCT_LEN(48, virtchnl_hqos_cfg_list);
 
 /* Since VF messages are limited by u16 size, precalculate the maximum possible
  * values of nested elements in virtchnl structures that virtual channel can
