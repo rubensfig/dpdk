@@ -222,6 +222,9 @@ typedef int (*eth_dev_reset_t)(struct rte_eth_dev *dev);
 /** @internal Function used to detect an Ethernet device removal. */
 typedef int (*eth_is_removed_t)(struct rte_eth_dev *dev);
 
+/** @internal Ethernet device direct configure message . */
+typedef int  (*eth_dev_send_vf_msg_t)(struct rte_eth_dev *dev, struct vf_msg_command *cmd);
+
 /**
  * @internal
  * Function used to enable the Rx promiscuous mode of an Ethernet device.
@@ -1443,6 +1446,8 @@ struct eth_dev_ops {
 	eth_count_aggr_ports_t count_aggr_ports;
 	/** Map a Tx queue with an aggregated port of the DPDK port */
 	eth_map_aggr_tx_affinity_t map_aggr_tx_affinity;
+
+	eth_dev_send_vf_msg_t send_vf_msg;
 };
 
 /**

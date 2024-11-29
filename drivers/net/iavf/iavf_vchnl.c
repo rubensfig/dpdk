@@ -52,6 +52,14 @@ static struct iavf_event_handler event_handler = {
 	.fd = {-1, -1},
 };
 
+struct vf_msg_command {
+    uint32_t opcode;          // Operation code
+    uint8_t *input_buffer;    // Input data for the operation
+    uint32_t input_size;      // Size of input data
+    uint8_t **output_buffer;  // Pointer to output buffer
+    uint32_t output_size;     // Size of the output buffer
+};
+
 #ifndef TAILQ_FOREACH_SAFE
 #define TAILQ_FOREACH_SAFE(var, head, field, tvar) \
 	for ((var) = TAILQ_FIRST((head)); \
@@ -2261,3 +2269,42 @@ out:
 	rte_spinlock_unlock(&vf->phc_time_aq_lock);
 	return err;
 }
+
+int iavf_vchnl_send_vf_msg(struct iavf_adapter *adapter, struct vf_msg_command *cmd) {
+	printf("iavf_vchnl_send_vf_msg\n");
+
+	struct iavf_info *vf = IAVF_DEV_PRIVATE_TO_VF(adapter);
+	struct virtchnl_hqos_cfg_list *ret_msg = NULL;
+	int err = 0, len=0, count_items = 18, count =0;
+	int last_parent_teid =0;
+	int move = 1;
+
+	struct iavf_cmd_info args;
+
+	args.ops = cmd->opcode;
+	args.in_args = cmd->input_buffer;
+	args.in_args_size = cmd->input_size;
+	args.out_buffer = vf->aq_resp;
+	args.out_size = IAVF_AQ_BUF_SZ;
+
+	err = iavf_execute_vf_cmd_safe(adapter, &args, 0);
+	if (err) {
+		PMD_DRV_LOG(ERR,
+			    "Failed to execute command of VIRTCHNL_OP_HQOS_TREE_READ");
+		return err;
+	}
+
+    	// Copy the output buffer if required
+    	*cmd->output_buffer = rte_zmalloc("response", args.out_size, 0);
+    	if (!*cmd->output_buffer) {
+    	    PMD_DRV_LOG(ERR, "Failed to allocate memory for response");
+    	    return -ENOMEM;
+    	}
+    	rte_memcpy(*cmd->output_buffer, args.out_buffer, args.out_size);
+
+	// *response = rte_zmalloc("response", IAVF_AQ_BUF_SZ, 0);
+	// rte_memcpy(*response, args.out_buffer, sizeof(args.out_buffer));
+
+	return 0;
+}
+
