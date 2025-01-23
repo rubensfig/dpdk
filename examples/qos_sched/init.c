@@ -163,11 +163,13 @@ app_init_port(uint16_t portid, struct rte_mempool *mp)
 	rte_eth_link_to_str(link_status_text, sizeof(link_status_text), &link);
 	printf("%s\n", link_status_text);
 
+	/*
 	ret = rte_eth_promiscuous_enable(portid);
 	if (ret != 0)
 		rte_exit(EXIT_FAILURE,
 			"rte_eth_promiscuous_enable: err=%s, port=%u\n",
 			rte_strerror(-ret), portid);
+	*/
 
 	/* mark port as initialized */
 	app_inited_port_mask |= 1u << portid;
