@@ -105,6 +105,8 @@ app_init_port(uint16_t portid, struct rte_mempool *mp)
 			"Error during getting device (port %u) info: %s\n",
 			portid, strerror(-ret));
 
+	local_port_conf.rxmode.offloads |=
+			RTE_ETH_RX_OFFLOAD_VLAN;
 	if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
 		local_port_conf.txmode.offloads |=
 			RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
@@ -204,6 +206,69 @@ static struct rte_sched_subport_profile_params
 };
 
 struct rte_sched_subport_params subport_params[MAX_SCHED_SUBPORTS] = {
+	{
+		.n_pipes_per_subport_enabled = 65536,
+		.qsize = {64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64},
+		.pipe_profiles = pipe_profiles,
+		.n_pipe_profiles = sizeof(pipe_profiles) /
+			sizeof(struct rte_sched_pipe_params),
+		.n_max_pipe_profiles = MAX_SCHED_PIPE_PROFILES,
+		.cman_params = NULL,
+	},
+	{
+		.n_pipes_per_subport_enabled = 65536,
+		.qsize = {64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64},
+		.pipe_profiles = pipe_profiles,
+		.n_pipe_profiles = sizeof(pipe_profiles) /
+			sizeof(struct rte_sched_pipe_params),
+		.n_max_pipe_profiles = MAX_SCHED_PIPE_PROFILES,
+		.cman_params = NULL,
+	},
+	{
+		.n_pipes_per_subport_enabled = 65536,
+		.qsize = {64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64},
+		.pipe_profiles = pipe_profiles,
+		.n_pipe_profiles = sizeof(pipe_profiles) /
+			sizeof(struct rte_sched_pipe_params),
+		.n_max_pipe_profiles = MAX_SCHED_PIPE_PROFILES,
+		.cman_params = NULL,
+	},
+	{
+		.n_pipes_per_subport_enabled = 65536,
+		.qsize = {64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64},
+		.pipe_profiles = pipe_profiles,
+		.n_pipe_profiles = sizeof(pipe_profiles) /
+			sizeof(struct rte_sched_pipe_params),
+		.n_max_pipe_profiles = MAX_SCHED_PIPE_PROFILES,
+		.cman_params = NULL,
+	},
+	{
+		.n_pipes_per_subport_enabled = 65536,
+		.qsize = {64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64},
+		.pipe_profiles = pipe_profiles,
+		.n_pipe_profiles = sizeof(pipe_profiles) /
+			sizeof(struct rte_sched_pipe_params),
+		.n_max_pipe_profiles = MAX_SCHED_PIPE_PROFILES,
+		.cman_params = NULL,
+	},
+	{
+		.n_pipes_per_subport_enabled = 65536,
+		.qsize = {64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64},
+		.pipe_profiles = pipe_profiles,
+		.n_pipe_profiles = sizeof(pipe_profiles) /
+			sizeof(struct rte_sched_pipe_params),
+		.n_max_pipe_profiles = MAX_SCHED_PIPE_PROFILES,
+		.cman_params = NULL,
+	},
+	{
+		.n_pipes_per_subport_enabled = 65536,
+		.qsize = {64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64},
+		.pipe_profiles = pipe_profiles,
+		.n_pipe_profiles = sizeof(pipe_profiles) /
+			sizeof(struct rte_sched_pipe_params),
+		.n_max_pipe_profiles = MAX_SCHED_PIPE_PROFILES,
+		.cman_params = NULL,
+	},
 	{
 		.n_pipes_per_subport_enabled = 65536,
 		.qsize = {64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64},
@@ -317,7 +382,10 @@ app_load_cfg_profile(const char *profile)
 	if (ret)
 		goto _app_load_cfg_profile_error_return;
 
+	return ret;
+
 _app_load_cfg_profile_error_return:
+	rte_exit(EXIT_FAILURE, "Cannot load configuration profile %s\n", profile);
 	rte_cfgfile_close(file);
 
 	return ret;

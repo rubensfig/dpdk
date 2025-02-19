@@ -23,13 +23,12 @@
  *		Destination IP host (0.0.0.XXX) defines queue
  * Values below define offset to each field from start of frame
  */
-#define SUBPORT_OFFSET	7
-#define PIPE_OFFSET	18
-#define QUEUE_OFFSET	9
+#define SUBPORT_OFFSET	5
+#define PIPE_OFFSET	12
+#define QUEUE_OFFSET	7
 #define COLOR_OFFSET	19
 
-static inline int
-get_pkt_sched(struct rte_mbuf *m, uint32_t *subport, uint32_t *pipe,
+static inline int get_pkt_sched(struct rte_mbuf *m, uint32_t *subport, uint32_t *pipe,
 			uint32_t *traffic_class, uint32_t *queue, uint32_t *color)
 {
 	uint16_t *pdata = rte_pktmbuf_mtod(m, uint16_t *);
@@ -39,13 +38,13 @@ get_pkt_sched(struct rte_mbuf *m, uint32_t *subport, uint32_t *pipe,
 
 	eth_hdr = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
 
- 	*subport = 0; 	
+ 	/* Outer VLAN ID*/
+	*subport = ((m->vlan_tci & 0xE000) >> 13) & (port_params.n_subports_per_port -1);
 
  	/* Dst Addr */
  	*pipe = (rte_be_to_cpu_16(pdata[PIPE_OFFSET]) & 0xFFFF);
 
 	pipe_queue = (rte_be_to_cpu_16(pdata[QUEUE_OFFSET]) & 0x00FF);
-	// printf("pdata[9]=%x\n", pdata[9] & 0xFF00);
 
  	/* Traffic class (TOS) */
  	*traffic_class = pipe_queue > RTE_SCHED_TRAFFIC_CLASS_BE ?
