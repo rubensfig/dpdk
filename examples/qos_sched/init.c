@@ -228,11 +228,14 @@ app_init_port(uint16_t portid, struct rte_mempool *mp)
       		if (ret < 0)
         		rte_exit(EXIT_FAILURE, "rte_eth_dev_stop() failed: %d\n", ret);
     		}
+            /*
     		if (portid == 0)
 			;
       			//port_init_dcf_tm_test(portid);
     		else
       			port_init_tm_test(portid);
+                TODO Add hook for pmdlink
+            */
   	}
 
 	/* Start device */
