@@ -52,7 +52,7 @@ int app_pipe_to_profile[MAX_SCHED_SUBPORTS][MAX_SCHED_PIPES];
 
 #define NUM_TCS 8
 #define NUM_VFS 8
-#define NUM_QP 8
+#define NUM_QP 1
 #define RSS_ENABLE 1
 
 static struct rte_eth_conf port_conf_dcf = {
@@ -161,7 +161,7 @@ app_init_port(uint16_t portid, struct rte_mempool *mp)
 			"Error during getting device (port %u) info: %s\n",
 			portid, strerror(-ret));
 
-	local_port_conf.rxmode.offloads |=
+	port_conf_default.rxmode.offloads |=
 			RTE_ETH_RX_OFFLOAD_VLAN;
 	if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
 		local_port_conf.txmode.offloads |=
@@ -176,10 +176,10 @@ app_init_port(uint16_t portid, struct rte_mempool *mp)
 	if ((NUM_QP > dev_info.max_rx_queues) || (NUM_QP > dev_info.max_tx_queues))
 		rte_exit(EXIT_FAILURE, "Wrong number of queues \n");
 
-  	if (portid == 0) // TODO: detect if the port is using DCF/ iavf driver
-		ret = rte_eth_dev_configure(portid, NUM_QP, NUM_QP, &port_conf_dcf);
-	else
-		ret = rte_eth_dev_configure(portid, NUM_QP, NUM_QP, &port_conf_default);
+  	// if (portid == 0) // TODO: detect if the port is using DCF/ iavf driver
+	// 	ret = rte_eth_dev_configure(portid, NUM_QP, NUM_QP, &port_conf_dcf);
+	// else
+	ret = rte_eth_dev_configure(portid, NUM_QP, NUM_QP, &port_conf_default);
 	if (ret < 0)
 		rte_exit(EXIT_FAILURE,
 			 "Cannot configure device: err=%d, port=%u\n",
@@ -622,11 +622,11 @@ int app_init(void)
 		struct rte_eth_link link = {0};
 		int retry_count = 100, retry_delay = 100; /* try every 100ms for 10 sec */
 
-		snprintf(ring_name, MAX_NAME_LEN, "ring-%u-%u", i, qos_conf[i].rx_core);
+		snprintf(ring_name, MAX_NAME_LEN, "ring-0");
 		ring = rte_ring_lookup(ring_name);
 		if (ring == NULL)
 			qos_conf[i].rx_ring = rte_ring_create(ring_name, ring_conf.ring_size,
-			 	socket, RING_F_SP_ENQ | RING_F_SC_DEQ);
+			 	socket, RING_F_MP_RTS_ENQ | RING_F_SC_DEQ);
 		else
 			qos_conf[i].rx_ring = ring;
 

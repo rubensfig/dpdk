@@ -94,7 +94,7 @@ app_rx_thread(struct thread_conf **confs)
 						(enum rte_color) color);
 			}
 
-			if (unlikely(rte_ring_sp_enqueue_bulk(conf->rx_ring,
+			if (unlikely(rte_ring_mp_enqueue_bulk(conf->rx_ring,
 					(void **)rx_mbufs, nb_rx, NULL) == 0)) {
 				for(i = 0; i < nb_rx; i++) {
 					rte_pktmbuf_free(rx_mbufs[i]);
@@ -145,6 +145,7 @@ app_worker_thread(struct thread_conf **confs)
 		/* Read packet from the ring */
 		nb_pkt = rte_ring_sc_dequeue_burst(conf->rx_ring, (void **)mbufs,
 					burst_conf.ring_burst, NULL);
+		/*
 		if (likely(nb_pkt)) {
 			int nb_sent = rte_sched_port_enqueue(conf->sched_port, mbufs,
 					nb_pkt);
@@ -155,6 +156,7 @@ app_worker_thread(struct thread_conf **confs)
 
 		nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs,
 					burst_conf.qos_dequeue);
+					*/
 		if (likely(nb_pkt > 0))
 			while (rte_ring_sp_enqueue_bulk(conf->tx_ring,
 					(void **)mbufs, nb_pkt, NULL) == 0)

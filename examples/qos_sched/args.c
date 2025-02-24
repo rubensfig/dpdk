@@ -19,7 +19,7 @@
 #include "main.h"
 
 #define APP_NAME "qos_sched"
-#define MAX_OPT_VALUES 8
+#define MAX_OPT_VALUES 16
 #define SYS_CPU_DIR "/sys/devices/system/cpu/cpu%u/topology/"
 
 static uint32_t app_main_core = 1;
@@ -169,12 +169,13 @@ static int
 app_parse_flow_conf(const char *conf_str)
 {
 	int ret;
-	uint32_t vals[7];
+	uint32_t vals[MAX_OPT_VALUES];
 	struct flow_conf *pconf;
 	uint64_t mask;
 
 	memset(vals, 0, sizeof(vals));
-	ret = app_parse_opt_vals(conf_str, ',', 7, vals);
+	ret = app_parse_opt_vals(conf_str, ',', 8, vals);
+	printf("%s\n", conf_str);
 	if (ret < 4 || ret > 8)
 		return ret;
 
@@ -182,14 +183,11 @@ app_parse_flow_conf(const char *conf_str)
 
 	pconf->rx_port = vals[0];
 	pconf->tx_port = vals[1];
+	pconf->rx_core = vals[2];
+	pconf->wt_core = vals[3];
+	pconf->tx_core = vals[4];
 	pconf->rx_queue = vals[5];
 	pconf->tx_queue = vals[6];
-	pconf->rx_core = (uint8_t)vals[2];
-	pconf->wt_core = (uint8_t)vals[3];
-	if (ret == 7)
-		pconf->tx_core = (uint8_t)vals[4];
-	else
-		pconf->tx_core = pconf->wt_core;
 
 	if (pconf->rx_core == pconf->wt_core) {
 		RTE_LOG(ERR, APP, "pfc %u: rx thread and worker thread cannot share same core\n", nb_pfc);

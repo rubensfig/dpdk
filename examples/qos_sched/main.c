@@ -51,7 +51,7 @@ app_main_loop(__rte_unused void *dummy)
 		struct flow_conf *flow = &qos_conf[i];
 
 		if (flow->rx_core == lcore_id) {
-			printf("rx core: port %d, queue %d\n", flow->rx_port, flow->rx_queue);
+			printf("lcore_id %d,rx core: port %d, queue %d\n", lcore_id,flow->rx_port, flow->rx_queue);
 
 			flow->rx_thread.rx_port = flow->rx_port;
 			flow->rx_thread.rx_ring =  flow->rx_ring;
@@ -63,7 +63,7 @@ app_main_loop(__rte_unused void *dummy)
 			mode |= APP_RX_MODE;
 		}
 		if (flow->tx_core == lcore_id) {
-			printf("tx core: port %d, queue %d\n", flow->tx_port, flow->tx_queue);
+			printf("lcore_id %d,tx core: port %d, queue %d\n", lcore_id,flow->tx_port, flow->tx_queue);
 
 			flow->tx_thread.tx_port = flow->tx_port;
 			flow->tx_thread.tx_ring =  flow->tx_ring;
@@ -74,7 +74,7 @@ app_main_loop(__rte_unused void *dummy)
 			mode |= APP_TX_MODE;
 		}
 		if (flow->wt_core == lcore_id) {
-			printf("worker core: port %d, queue %d\n", flow->tx_port, flow->tx_queue);
+			printf("lcore_id %d, worker core: port %d, queue %d\n", lcore_id, flow->tx_port, flow->tx_queue);
 
 			flow->wt_thread.rx_ring =  flow->rx_ring;
 			flow->wt_thread.tx_ring =  flow->tx_ring;
@@ -99,7 +99,7 @@ app_main_loop(__rte_unused void *dummy)
 		return -1;
 	}
 
-	RTE_LOG(INFO, APP, "entering main loop on lcore %u\n", lcore_id);
+	RTE_LOG(INFO, APP, "entering mode=%d loop on lcore %u\n", mode, lcore_id);
 	/* initialize mbuf memory */
 	if (mode == APP_RX_MODE) {
 		for (i = 0; i < rx_idx; i++) {
