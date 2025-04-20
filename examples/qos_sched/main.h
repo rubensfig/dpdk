@@ -142,6 +142,8 @@ extern struct rte_sched_port_params port_params;
 extern struct rte_sched_cman_params cman_params;
 extern struct rte_sched_subport_params subport_params[MAX_SCHED_SUBPORTS];
 
+extern struct rte_eth_dev_tx_buffer *tx_buffer[RTE_MAX_ETHPORTS];
+
 int app_parse_args(int argc, char **argv);
 int app_init(void);
 
