@@ -128,6 +128,12 @@ app_tx_thread(struct thread_conf **confs)
 	struct rte_eth_dev_tx_buffer *buffer;
 
 	while ((conf = confs[conf_idx])) {
+		for (int queue_id = 0; queue_id < 8; queue_id++) {
+			buffer = tx_buffer[queue_id];
+
+			rte_eth_tx_buffer_flush(conf->tx_port, queue_id, buffer);
+		}
+
 		nb_pkts = rte_ring_sc_dequeue_burst(conf->tx_ring, (void **)mbufs,
 					burst_conf.qos_dequeue, NULL);
 		uint16_t nb_tx = 0;
