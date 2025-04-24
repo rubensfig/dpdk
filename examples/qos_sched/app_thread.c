@@ -109,7 +109,7 @@ app_rx_thread(struct thread_conf **confs)
 					rte_pktmbuf_free(rx_mbufs[i]);
 
 					APP_STATS_ADD(conf->stat.nb_drop, 1);
-				}
+				} 
 			}
 		}
 		conf_idx++;
@@ -128,7 +128,7 @@ app_tx_thread(struct thread_conf **confs)
 	struct rte_eth_dev_tx_buffer *buffer;
 
 	while ((conf = confs[conf_idx])) {
-		for (int queue_id = 0; queue_id < 8; queue_id++) {
+		for (int queue_id = 0; queue_id < N_TX_QUEUES; queue_id++) {
 			buffer = tx_buffer[queue_id];
 
 			rte_eth_tx_buffer_flush(conf->tx_port, queue_id, buffer);
@@ -139,10 +139,16 @@ app_tx_thread(struct thread_conf **confs)
 		uint16_t nb_tx = 0;
 		if (likely(nb_pkts != 0)) {
 			for(int i = 0; i < nb_pkts; i++) {
-				int rx_queue = mbufs[i]->hash.sched.traffic_class;
+				int tx_queue = mbufs[i]->hash.sched.traffic_class;
 
-				buffer = tx_buffer[rx_queue];
-				nb_tx = rte_eth_tx_buffer(conf->tx_port, rx_queue, buffer, mbufs[i]);
+				if (tx_queue > N_TX_QUEUES) 
+					tx_queue = 1;
+
+				buffer = tx_buffer[tx_queue];
+				if (buffer == NULL) 
+					continue;
+
+				nb_tx = rte_eth_tx_buffer(conf->tx_port, tx_queue, buffer, mbufs[i]);
 			}
 
 			// nb_tx = rte_eth_tx_burst(conf->tx_port, 0, mbufs, nb_pkts);

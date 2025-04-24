@@ -56,6 +56,8 @@ extern "C" {
 #define APP_QAVG_NTIMES 10
 #define APP_QAVG_PERIOD 100
 
+#define N_TX_QUEUES 2
+
 struct thread_stat
 {
 	uint64_t nb_rx;

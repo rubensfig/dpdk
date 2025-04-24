@@ -111,7 +111,7 @@ app_init_port(uint16_t portid, struct rte_mempool *mp)
 	if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
 		local_port_conf.txmode.offloads |=
 			RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
-	ret = rte_eth_dev_configure(portid, 1, 8, &local_port_conf);
+	ret = rte_eth_dev_configure(portid, 1, N_TX_QUEUES, &local_port_conf);
 	if (ret < 0)
 		rte_exit(EXIT_FAILURE,
 			 "Cannot configure device: err=%d, port=%u\n",
@@ -139,13 +139,13 @@ app_init_port(uint16_t portid, struct rte_mempool *mp)
 
 	/* init one TX queue */
 	fflush(stdout);
-	for (int i = 0; i < 8; i++) {
+	for (int i = 0; i < N_TX_QUEUES; i++) {
 		tx_conf.offloads = local_port_conf.txmode.offloads;
 		ret = rte_eth_tx_queue_setup(portid, i,
 			(uint16_t)ring_conf.tx_size, rte_eth_dev_socket_id(portid), &tx_conf);
 
 		int burst = 1;
-		if (i != 0 )
+		if (i != 0)
 			burst = MAX_PKT_RX_BURST;
 
 		tx_buffer[i] = rte_zmalloc_socket("tx_buffer",
