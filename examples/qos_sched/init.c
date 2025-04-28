@@ -15,6 +15,7 @@
 #include <rte_cycles.h>
 #include <rte_string_fns.h>
 #include <rte_cfgfile.h>
+#include <rte_malloc.h>
 
 #include "main.h"
 #include "cfg_file.h"
@@ -110,7 +111,7 @@ app_init_port(uint16_t portid, struct rte_mempool *mp)
 	if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
 		local_port_conf.txmode.offloads |=
 			RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
-	ret = rte_eth_dev_configure(portid, 1, 1, &local_port_conf);
+	ret = rte_eth_dev_configure(portid, 1, N_TX_QUEUES, &local_port_conf);
 	if (ret < 0)
 		rte_exit(EXIT_FAILURE,
 			 "Cannot configure device: err=%d, port=%u\n",
@@ -138,13 +139,29 @@ app_init_port(uint16_t portid, struct rte_mempool *mp)
 
 	/* init one TX queue */
 	fflush(stdout);
-	tx_conf.offloads = local_port_conf.txmode.offloads;
-	ret = rte_eth_tx_queue_setup(portid, 0,
-		(uint16_t)ring_conf.tx_size, rte_eth_dev_socket_id(portid), &tx_conf);
-	if (ret < 0)
-		rte_exit(EXIT_FAILURE,
-			 "rte_eth_tx_queue_setup: err=%d, port=%u queue=%d\n",
-			 ret, portid, 0);
+	for (int i = 0; i < N_TX_QUEUES; i++) {
+		tx_conf.offloads = local_port_conf.txmode.offloads;
+		ret = rte_eth_tx_queue_setup(portid, i,
+			(uint16_t)ring_conf.tx_size, rte_eth_dev_socket_id(portid), &tx_conf);
+
+		int burst = 1;
+		if (i != 0)
+			burst = MAX_PKT_RX_BURST;
+
+		tx_buffer[i] = rte_zmalloc_socket("tx_buffer",
+				RTE_ETH_TX_BUFFER_SIZE(burst), 0,
+				rte_eth_dev_socket_id(portid));
+		if (tx_buffer[i] == NULL)
+			rte_exit(EXIT_FAILURE, "Cannot allocate buffer for tx on port %u\n",
+					portid);
+
+		rte_eth_tx_buffer_init(tx_buffer[i], burst);
+
+		if (ret < 0)
+			rte_exit(EXIT_FAILURE,
+				 "rte_eth_tx_queue_setup: err=%d, port=%u queue=%d\n",
+				 ret, portid, i);
+	}
 
 	/* Start device */
 	ret = rte_eth_dev_start(portid);

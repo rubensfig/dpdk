@@ -56,6 +56,8 @@ extern "C" {
 #define APP_QAVG_NTIMES 10
 #define APP_QAVG_PERIOD 100
 
+#define N_TX_QUEUES 2
+
 struct thread_stat
 {
 	uint64_t nb_rx;
@@ -141,6 +143,8 @@ extern uint32_t n_active_queues;
 extern struct rte_sched_port_params port_params;
 extern struct rte_sched_cman_params cman_params;
 extern struct rte_sched_subport_params subport_params[MAX_SCHED_SUBPORTS];
+
+extern struct rte_eth_dev_tx_buffer *tx_buffer[RTE_MAX_ETHPORTS];
 
 int app_parse_args(int argc, char **argv);
 int app_init(void);
