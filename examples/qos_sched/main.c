@@ -27,7 +27,7 @@ uint8_t interactive = APP_INTERACTIVE_DEFAULT;
 uint32_t qavg_period = APP_QAVG_PERIOD;
 uint32_t qavg_ntimes = APP_QAVG_NTIMES;
 
-struct rte_eth_dev_tx_buffer *tx_buffer[RTE_MAX_ETHPORTS] = { 0 };
+struct rte_eth_dev_tx_buffer *tx_buffer[RTE_MAX_ETHPORTS][N_TX_QUEUES] = { 0 };
 
 /* main processing loop */
 static int

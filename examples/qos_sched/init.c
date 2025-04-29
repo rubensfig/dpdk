@@ -148,14 +148,14 @@ app_init_port(uint16_t portid, struct rte_mempool *mp)
 		if (i != 0)
 			burst = MAX_PKT_RX_BURST;
 
-		tx_buffer[i] = rte_zmalloc_socket("tx_buffer",
+		tx_buffer[portid][i] = rte_zmalloc_socket("tx_buffer",
 				RTE_ETH_TX_BUFFER_SIZE(burst), 0,
 				rte_eth_dev_socket_id(portid));
-		if (tx_buffer[i] == NULL)
+		if (tx_buffer[portid][i] == NULL)
 			rte_exit(EXIT_FAILURE, "Cannot allocate buffer for tx on port %u\n",
 					portid);
 
-		rte_eth_tx_buffer_init(tx_buffer[i], burst);
+		rte_eth_tx_buffer_init(tx_buffer[portid][i], burst);
 
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE,
