@@ -129,7 +129,12 @@ app_tx_thread(struct thread_conf **confs)
 
 	while ((conf = confs[conf_idx])) {
 		for (int queue_id = 0; queue_id < N_TX_QUEUES; queue_id++) {
-			buffer = tx_buffer[queue_id][conf->tx_port];
+			buffer = tx_buffer[conf->tx_port][queue_id];
+
+			if (buffer == NULL) {
+				printf("port %d tx qeueu %d buf %x\n", conf->tx_port, queue_id, buffer);
+				continue;
+			}
 
 			rte_eth_tx_buffer_flush(conf->tx_port, queue_id, buffer);
 		}
