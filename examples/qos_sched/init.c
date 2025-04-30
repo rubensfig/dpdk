@@ -95,8 +95,7 @@ app_init_port(uint16_t portid, struct rte_mempool *mp)
 	tx_conf.tx_free_thresh = 0;
 	tx_conf.tx_rs_thresh = 0;
 	tx_conf.tx_deferred_start = 0;
-
-	/* init port */
+/* init port */
 	RTE_LOG(INFO, APP, "Initializing port %"PRIu16"... ", portid);
 	fflush(stdout);
 
