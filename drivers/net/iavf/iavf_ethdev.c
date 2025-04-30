@@ -32,6 +32,7 @@
 #include "iavf_generic_flow.h"
 #include "rte_pmd_iavf.h"
 #include "iavf_ipsec_crypto.h"
+#include "iavf_pmdlink.h"
 
 /* devargs */
 #define IAVF_PROTO_XTR_ARG         "proto_xtr"
@@ -234,6 +235,7 @@ static const struct eth_dev_ops iavf_eth_dev_ops = {
 	.tx_done_cleanup	    = iavf_dev_tx_done_cleanup,
 	.get_monitor_addr           = iavf_get_monitor_addr,
 	.tm_ops_get                 = iavf_tm_ops_get,
+	.send_vf_msg		    = iavf_pmdlink_send_vf_msg,
 };
 
 static int

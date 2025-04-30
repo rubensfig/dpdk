@@ -19,6 +19,7 @@
 
 #include "main.h"
 #include "cfg_file.h"
+#include "pmdlink.h"
 
 uint32_t app_numa_mask = 0;
 static uint32_t app_inited_port_mask = 0;
@@ -62,6 +63,98 @@ static struct rte_eth_conf port_conf = {
 		.mq_mode = RTE_ETH_MQ_TX_NONE,
 	},
 };
+
+
+typedef uint16_t port_t;
+typedef uint16_t teid_t;
+
+
+qos_node_t *pmdlink_read_topology(port_t port) {
+    struct vf_msg_command *cmd;
+    uint8_t *response = NULL;
+
+    cmd = rte_zmalloc("vf_msg_command", sizeof(struct vf_msg_command), 0);
+
+    cmd->opcode = VIRTCHNL_OP_HQOS_TREE_READ;
+    cmd->input_buffer = NULL;
+    cmd->input_size = 0;
+    cmd->output_size = 0;
+    cmd->output_buffer = &response;
+    rte_log(RTE_LOG_DEBUG, RTE_LOGTYPE_USER1, "Sending VIRTCHNL_OP_HQOS_TREE_READ, port=%d\n", port);
+    rte_eth_dev_send_vf_msg(port, cmd);
+
+    struct virtchnl_hqos_cfg_list *sched_cfg = (struct virtchnl_hqos_cfg_list *)response;
+
+    qos_node_t *rsp = rte_zmalloc("vf_msg_command", sizeof(qos_node_t) * (1 + sched_cfg->num_elem), 0);
+
+    for (int i = 0; i < sched_cfg->num_elem; i++) {
+        if (sched_cfg->cfg[i].teid == 0)
+            rte_exit(EXIT_FAILURE, "read_vf_qos_nodes() - zero teid assertion failed\n");
+
+        rsp[i] = (qos_node_t){
+            .teid = sched_cfg->cfg[i].teid,
+            .parent_teid = sched_cfg->cfg[i].parent_teid,
+            .tx_queue_id = sched_cfg->cfg[i].tx_queue_id,
+        };
+    }
+    // set an end marker, teid==0 is not legal/used (protected by previous assertion)
+    rsp[sched_cfg->num_elem] = (qos_node_t){
+        .teid = 0,
+    };
+    rte_free(cmd);
+    return rsp;
+}
+
+void pmdlink_node_priority(uint16_t port, uint16_t source_teid, uint16_t tx_priority) {
+    struct vf_msg_command *cmd;
+    cmd = rte_zmalloc("vf_msg_command", sizeof(struct vf_msg_command), 0);
+
+    uint8_t *response = NULL;
+
+    struct virtchnl_hqos_cfg_list *msg = NULL;
+    int len = sizeof(struct virtchnl_hqos_cfg_list *) + (6) * sizeof(struct virtchnl_hqos_cfg *);
+
+    cmd->opcode = VIRTCHNL_OP_HQOS_ELEMS_CONF;
+    cmd->input_size = len;
+    cmd->output_buffer = &response;
+    cmd->output_size = IAVF_AQ_BUF_SZ;
+
+    msg = rte_zmalloc("hqos", len, 0);
+
+    msg->num_elem = 1;
+    msg->cfg[0].teid = source_teid;
+    msg->cfg[0].tx_priority = tx_priority;
+
+    cmd->input_buffer = (uint8_t *)msg;
+
+    rte_log(RTE_LOG_DEBUG, RTE_LOGTYPE_USER1, "Sending VIRTCHNL_OP_HQOS_ELEMS_MOVE, port=%d, source_node=%d, prio=%d\n", port, source_teid, tx_priority);
+    rte_eth_dev_send_vf_msg(port, cmd);
+
+    rte_free(msg);
+    rte_free(cmd);
+}
+
+struct port_hqos_state *port_hqos_table[MAXPORTS];
+
+static void port_hqos_init(uint16_t port) {
+    struct port_hqos_state *pht = rte_zmalloc("user qos llapi", sizeof(struct port_hqos_state), 0);
+    port_hqos_table[port] = pht;
+
+    qos_node_t *qos_nodes = pmdlink_read_topology(port); // assumes read_vf_qos_nodes() cannot fail
+    pht->root = qos_nodes[0].teid;
+    pht->binding_count = 0;
+    pht->bindings[0] = (struct binding){0, 0}; // end marker set, for avoidance of doubt ;-)
+					       //
+    uint16_t q_0_teid = 0;
+    for (int i = 0; qos_nodes[i].teid != 0; i++) {
+    	printf("%d, is leaf?%d\n", qos_nodes[i].teid, qos_nodes[i].tx_queue_id);
+	if (qos_nodes[i].tx_queue_id != 0) {
+		q_0_teid = qos_nodes[i].teid;
+	}
+    }
+
+    pmdlink_node_priority(port, q_0_teid, 1);
+}
 
 static int
 app_init_port(uint16_t portid, struct rte_mempool *mp)
@@ -180,6 +273,8 @@ app_init_port(uint16_t portid, struct rte_mempool *mp)
 
 	rte_eth_link_to_str(link_status_text, sizeof(link_status_text), &link);
 	printf("%s\n", link_status_text);
+
+	port_hqos_init(portid);
 
 	/*
 	ret = rte_eth_promiscuous_enable(portid);
