@@ -128,34 +128,24 @@ app_tx_thread(struct thread_conf **confs)
 	struct rte_eth_dev_tx_buffer *buffer;
 
 	while ((conf = confs[conf_idx])) {
-		for (int queue_id = 0; queue_id < N_TX_QUEUES; queue_id++) {
-			buffer = tx_buffer[conf->tx_port][queue_id];
-
-			if (buffer == NULL) {
-				printf("port %d tx qeueu %d buf %x\n", conf->tx_port, queue_id, buffer);
-				continue;
-			}
-
-			rte_eth_tx_buffer_flush(conf->tx_port, queue_id, buffer);
-		}
-
 		nb_pkts = rte_ring_sc_dequeue_burst(conf->tx_ring, (void **)mbufs,
 					burst_conf.qos_dequeue, NULL);
 		uint16_t nb_tx = 0;
 		if (likely(nb_pkts != 0)) {
 			for(int i = 0; i < nb_pkts; i++) {
 				int tx_queue = mbufs[i]->hash.sched.traffic_class;
+				int tx_port = conf->tx_port;
 
-				if (tx_queue > N_TX_QUEUES) 
-					tx_queue = 1;
-
-				buffer = tx_buffer[conf->tx_port][tx_queue];
-				if (buffer == NULL) {
-					printf("port %d tx qeueu %d buf %x\n", conf->tx_port, tx_queue, buffer);
-					continue;
+				if (tx_queue > N_TX_QUEUES) {
+					tx_queue = 1;	
 				}
+
+				if (tx_queue == 1)
+					tx_port++;	
+
+				buffer = tx_buffer[tx_port][tx_queue];
 					
-				nb_tx = rte_eth_tx_buffer(conf->tx_port, tx_queue, buffer, mbufs[i]);
+				nb_tx = rte_eth_tx_buffer(tx_port, tx_queue, buffer, mbufs[i]);
 			}
 
 			// nb_tx = rte_eth_tx_burst(conf->tx_port, 0, mbufs, nb_pkts);

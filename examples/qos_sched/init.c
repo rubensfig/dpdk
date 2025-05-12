@@ -124,10 +124,41 @@ void pmdlink_node_priority(uint16_t port, uint16_t source_teid, uint16_t tx_prio
     msg->num_elem = 1;
     msg->cfg[0].teid = source_teid;
     msg->cfg[0].tx_priority = tx_priority;
+    // msg->cfg[0].tx_share = 8000000;
 
     cmd->input_buffer = (uint8_t *)msg;
 
-    rte_log(RTE_LOG_DEBUG, RTE_LOGTYPE_USER1, "Sending VIRTCHNL_OP_HQOS_ELEMS_MOVE, port=%d, source_node=%d, prio=%d\n", port, source_teid, tx_priority);
+    rte_log(RTE_LOG_INFO, RTE_LOGTYPE_USER1, "Sending VIRTCHNL_OP_HQOS_ELEMS_CONF, port=%d, source_node=%d, prio=%d\n", port, source_teid, tx_priority);
+    rte_eth_dev_send_vf_msg(port, cmd);
+
+    rte_free(msg);
+    rte_free(cmd);
+}
+
+void pmdlink_add_node(uint16_t port, uint16_t source_teid, uint16_t tx_priority) {
+    struct vf_msg_command *cmd;
+    cmd = rte_zmalloc("vf_msg_command", sizeof(struct vf_msg_command), 0);
+
+    uint8_t *response = NULL;
+
+    struct virtchnl_hqos_cfg_list *msg = NULL;
+    int len = sizeof(struct virtchnl_hqos_cfg_list *) + (6) * sizeof(struct virtchnl_hqos_cfg *);
+
+    cmd->opcode = VIRTCHNL_OP_HQOS_ELEMS_ADD;
+    cmd->input_size = len;
+    cmd->output_buffer = &response;
+    cmd->output_size = IAVF_AQ_BUF_SZ;
+
+    msg = rte_zmalloc("hqos", len, 0);
+
+    msg->num_elem = 1;
+    msg->cfg[0].teid = source_teid;
+    msg->cfg[0].tx_priority = tx_priority;
+    // msg->cfg[0].tx_share = 8000000;
+
+    cmd->input_buffer = (uint8_t *)msg;
+
+    rte_log(RTE_LOG_INFO, RTE_LOGTYPE_USER1, "Sending VIRTCHNL_OP_HQOS_ELEMS_ADD, port=%d, source_node=%d, prio=%d\n", port, source_teid, tx_priority);
     rte_eth_dev_send_vf_msg(port, cmd);
 
     rte_free(msg);
@@ -146,18 +177,19 @@ static void port_hqos_init(uint16_t port) {
     pht->bindings[0] = (struct binding){0, 0}; // end marker set, for avoidance of doubt ;-)
 					       //
     uint16_t q_0_teid = 0;
+    uint16_t prio = 7;
+
+    pmdlink_add_node(port, qos_nodes[0].teid, prio);
     for (int i = 0; qos_nodes[i].teid != 0; i++) {
     	printf("%d, is leaf?%d\n", qos_nodes[i].teid, qos_nodes[i].tx_queue_id);
 	if (qos_nodes[i].tx_queue_id != 0) {
-		q_0_teid = qos_nodes[i].teid;
+		pmdlink_node_priority(port, qos_nodes[i].teid, prio--);
 	}
     }
-
-    pmdlink_node_priority(port, q_0_teid, 1);
 }
 
 static int
-app_init_port(uint16_t portid, struct rte_mempool *mp)
+app_init_port(uint16_t portid, struct rte_mempool *mp, bool hqos_init)
 {
 	int ret;
 	struct rte_eth_link link;
@@ -237,8 +269,8 @@ app_init_port(uint16_t portid, struct rte_mempool *mp)
 			(uint16_t)ring_conf.tx_size, rte_eth_dev_socket_id(portid), &tx_conf);
 
 		int burst = 1;
-		if (i != 0)
-			burst = MAX_PKT_RX_BURST;
+		// if (i != 0)
+		// 	burst = 4;
 
 		tx_buffer[portid][i] = rte_zmalloc_socket("tx_buffer",
 				RTE_ETH_TX_BUFFER_SIZE(burst), 0,
@@ -274,7 +306,8 @@ app_init_port(uint16_t portid, struct rte_mempool *mp)
 	rte_eth_link_to_str(link_status_text, sizeof(link_status_text), &link);
 	printf("%s\n", link_status_text);
 
-	port_hqos_init(portid);
+	if (hqos_init)
+		port_hqos_init(portid);
 
 	/*
 	ret = rte_eth_promiscuous_enable(portid);
@@ -548,8 +581,10 @@ int app_init(void)
 		if (qos_conf[i].mbuf_pool == NULL)
 			rte_exit(EXIT_FAILURE, "Cannot init mbuf pool for socket %u\n", i);
 
-		app_init_port(qos_conf[i].rx_port, qos_conf[i].mbuf_pool);
-		app_init_port(qos_conf[i].tx_port, qos_conf[i].mbuf_pool);
+		app_init_port(qos_conf[i].rx_port, qos_conf[i].mbuf_pool, true);
+		app_init_port(qos_conf[i].tx_port, qos_conf[i].mbuf_pool, true);
+		int tx_port = qos_conf[i].tx_port + 1;
+		app_init_port(tx_port, qos_conf[i].mbuf_pool, false);
 
 		rte_eth_link_get(qos_conf[i].tx_port, &link);
 		if (link.link_status == 0)

@@ -27,7 +27,7 @@ typedef uint16_t teid_t;
 void pmdlink_move_node(port_t port, teid_t source_teid, teid_t new_parent_teid);
 void pmdlink_set_shaper(port_t port, teid_t teid, int tx_max, int tx_priority);
 void pmdlink_delete_node(port_t port, teid_t node_teid);
-int pmdlink_add_node(port_t port, teid_t new_parent_teid);
+// int pmdlink_add_node(port_t port, teid_t new_parent_teid);
 
 // qos_node_t and the function pmdlink_read_topology() are the bridge between the low and high level APIs
 
