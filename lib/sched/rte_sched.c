@@ -236,10 +236,6 @@ struct rte_sched_port {
 	struct rte_reciprocal inv_cycles_per_byte; /* CPU cycles per byte */
 	uint64_t cycles_per_byte;
 
-	/* Token bucket (TB) */
-	// uint64_t tb_time; /* time of last update */
-	uint64_t credits;
-
 	/* Grinders */
 	struct rte_mbuf **pkts_out;
 	uint32_t n_pkts_out;
