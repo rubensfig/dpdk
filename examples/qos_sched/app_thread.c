@@ -140,9 +140,6 @@ app_tx_thread(struct thread_conf **confs)
 					tx_queue = 1;	
 				}
 
-				if (tx_queue == 1)
-					tx_port++;	
-
 				buffer = tx_buffer[tx_port][tx_queue];
 					
 				nb_tx = rte_eth_tx_buffer(tx_port, tx_queue, buffer, mbufs[i]);

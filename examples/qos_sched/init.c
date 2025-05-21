@@ -105,6 +105,37 @@ qos_node_t *pmdlink_read_topology(port_t port) {
     return rsp;
 }
 
+void pmdlink_set_shaper(uint16_t port, uint16_t source_teid) {
+    struct vf_msg_command *cmd;
+    cmd = rte_zmalloc("vf_msg_command", sizeof(struct vf_msg_command), 0);
+
+    uint8_t *response = NULL;
+
+    struct virtchnl_hqos_cfg_list *msg = NULL;
+    int len = sizeof(struct virtchnl_hqos_cfg_list *) + (6) * sizeof(struct virtchnl_hqos_cfg *);
+
+    cmd->opcode = VIRTCHNL_OP_HQOS_ELEMS_CONF;
+    cmd->input_size = len;
+    cmd->output_buffer = &response;
+    cmd->output_size = IAVF_AQ_BUF_SZ;
+
+    msg = rte_zmalloc("hqos", len, 0);
+
+    msg->num_elem = 1;
+    msg->cfg[0].teid = source_teid;
+    // msg->cfg[0].tx_priority = tx_priority;
+    msg->cfg[0].tx_max = 10000000;
+
+    cmd->input_buffer = (uint8_t *)msg;
+
+    rte_log(RTE_LOG_INFO, RTE_LOGTYPE_USER1, "Sending VIRTCHNL_OP_HQOS_ELEMS_CONF, port=%d, source_node=%d, shaper=%d\n", port, source_teid, 10000000);
+    rte_eth_dev_send_vf_msg(port, cmd);
+
+    rte_free(msg);
+    rte_free(cmd);
+}
+
+
 void pmdlink_node_priority(uint16_t port, uint16_t source_teid, uint16_t tx_priority) {
     struct vf_msg_command *cmd;
     cmd = rte_zmalloc("vf_msg_command", sizeof(struct vf_msg_command), 0);
@@ -124,6 +155,7 @@ void pmdlink_node_priority(uint16_t port, uint16_t source_teid, uint16_t tx_prio
     msg->num_elem = 1;
     msg->cfg[0].teid = source_teid;
     msg->cfg[0].tx_priority = tx_priority;
+    // msg->cfg[0].tx_max = 1000000;
     // msg->cfg[0].tx_share = 8000000;
 
     cmd->input_buffer = (uint8_t *)msg;
@@ -176,12 +208,12 @@ static void port_hqos_init(uint16_t port) {
     pht->binding_count = 0;
     pht->bindings[0] = (struct binding){0, 0}; // end marker set, for avoidance of doubt ;-)
 					       //
-    uint16_t q_0_teid = 0;
     uint16_t prio = 7;
 
-    pmdlink_add_node(port, qos_nodes[0].teid, prio);
+    // pmdlink_add_node(port, qos_nodes[0].teid, prio);
+    pmdlink_set_shaper(port, qos_nodes[0].teid);
     for (int i = 0; qos_nodes[i].teid != 0; i++) {
-    	printf("%d, is leaf?%d\n", qos_nodes[i].teid, qos_nodes[i].tx_queue_id);
+    	printf("port=%d, teid=%d, parent_teid=%d, queue_id?%d\n",port, qos_nodes[i].teid, qos_nodes[i].parent_teid, qos_nodes[i].tx_queue_id);
 	if (qos_nodes[i].tx_queue_id != 0) {
 		pmdlink_node_priority(port, qos_nodes[i].teid, prio--);
 	}
@@ -583,8 +615,6 @@ int app_init(void)
 
 		app_init_port(qos_conf[i].rx_port, qos_conf[i].mbuf_pool, true);
 		app_init_port(qos_conf[i].tx_port, qos_conf[i].mbuf_pool, true);
-		int tx_port = qos_conf[i].tx_port + 1;
-		app_init_port(tx_port, qos_conf[i].mbuf_pool, false);
 
 		rte_eth_link_get(qos_conf[i].tx_port, &link);
 		if (link.link_status == 0)
@@ -614,6 +644,6 @@ int app_init(void)
 				 "TX (p = %hhu, h = %hhu, w = %hhu)\n",
 		rx_thresh.pthresh, rx_thresh.hthresh, rx_thresh.wthresh,
 		tx_thresh.pthresh, tx_thresh.hthresh, tx_thresh.wthresh);
-
+  
 	return 0;
 }

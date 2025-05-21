@@ -2290,7 +2290,7 @@ int iavf_vchnl_send_vf_msg(struct iavf_adapter *adapter, struct vf_msg_command *
 	err = iavf_execute_vf_cmd_safe(adapter, &args, 0);
 	if (err) {
 		PMD_DRV_LOG(ERR,
-			    "Failed to execute command of VIRTCHNL_OP_HQOS_TREE_READ");
+			    "Failed to execute command of cmd %d", cmd->opcode);
 		return err;
 	}
 
