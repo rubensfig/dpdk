@@ -150,6 +150,7 @@ void app_rx_thread(struct thread_conf **qconf);
 void app_tx_thread(struct thread_conf **qconf);
 void app_worker_thread(struct thread_conf **qconf);
 void app_mixed_thread(struct thread_conf **qconf);
+void app_single_thread(struct thread_conf **qconf);
 
 void app_stat(void);
 int subport_stat(uint16_t port_id, uint32_t subport_id);

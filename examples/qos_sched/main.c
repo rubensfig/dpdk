@@ -22,6 +22,7 @@
 #define APP_RX_MODE   1
 #define APP_WT_MODE   2
 #define APP_TX_MODE   4
+#define APP_SC_MODE   5
 
 uint8_t interactive = APP_INTERACTIVE_DEFAULT;
 uint32_t qavg_period = APP_QAVG_PERIOD;
@@ -51,7 +52,22 @@ app_main_loop(__rte_unused void *dummy)
 	for (i = 0; i < nb_pfc; i++) {
 		struct flow_conf *flow = &qos_conf[i];
 
-		if (flow->rx_core == lcore_id) {
+		if (flow->tx_core == 0)
+			mode |= APP_MODE_NONE;
+		if (flow->wt_core == 0 && flow->rx_core != 0)
+			mode |= APP_MODE_NONE;
+
+		if (flow->rx_core == lcore_id && flow->wt_core == 0) {
+			flow->rx_thread.rx_port = flow->rx_port;
+			flow->rx_thread.rx_queue = flow->rx_queue;
+			flow->rx_thread.sched_port = flow->sched_port;
+			flow->tx_thread.tx_port = flow->tx_port;
+			flow->tx_thread.tx_queue = flow->tx_queue;
+
+			rx_confs[rx_idx++] = &flow->rx_thread;
+
+			mode |= APP_SC_MODE;
+		} else if (flow->rx_core == lcore_id && flow->wt_core != 0) {
 			flow->rx_thread.rx_port = flow->rx_port;
 			flow->rx_thread.rx_ring =  flow->rx_ring;
 			flow->rx_thread.rx_queue = flow->rx_queue;
@@ -61,6 +77,7 @@ app_main_loop(__rte_unused void *dummy)
 
 			mode |= APP_RX_MODE;
 		}
+
 		if (flow->tx_core == lcore_id) {
 			flow->tx_thread.tx_port = flow->tx_port;
 			flow->tx_thread.tx_ring =  flow->tx_ring;
@@ -87,11 +104,13 @@ app_main_loop(__rte_unused void *dummy)
 		return -1;
 	}
 
-	if (mode == (APP_RX_MODE | APP_WT_MODE)) {
+	/*
+	if (mode == (APP_RX_MODE | APP_WT_MODE) ) {
 		RTE_LOG(INFO, APP, "lcore %u was configured for both RX and WT !!!\n",
 				 lcore_id);
 		return -1;
 	}
+	*/
 
 	RTE_LOG(INFO, APP, "entering main loop on lcore %u\n", lcore_id);
 	/* initialize mbuf memory */
@@ -127,6 +146,14 @@ app_main_loop(__rte_unused void *dummy)
 
 		app_worker_thread(wt_confs);
 	}
+	else if (mode == APP_SC_MODE){
+		for (i = 0; i < wt_idx; i++) {
+			RTE_LOG(INFO, APP, "flow %u lcoreid %u single core \n", i, lcore_id);
+		}
+
+		app_single_thread(rx_confs);
+	}
+
 
 	return 0;
 }

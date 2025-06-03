@@ -212,3 +212,47 @@ app_mixed_thread(struct thread_conf **confs)
 			conf_idx = 0;
 	}
 }
+
+
+void
+app_single_thread(struct thread_conf **confs)
+{
+	uint32_t i, nb_rx;
+	struct rte_mbuf *rx_mbufs[burst_conf.rx_burst] __rte_cache_aligned;
+	struct rte_mbuf *mbufs[burst_conf.ring_burst];
+	struct thread_conf *conf;
+	int conf_idx = 0;
+
+	uint32_t subport;
+	uint32_t pipe;
+	uint32_t traffic_class;
+	uint32_t queue;
+	uint32_t color;
+
+	while ((conf = confs[conf_idx])) {
+
+		    nb_rx = rte_eth_rx_burst(conf->rx_port, conf->rx_queue, rx_mbufs, burst_conf.rx_burst);
+
+		    if (likely(nb_rx > 0) ) {
+			APP_STATS_ADD(conf->stat.nb_rx, nb_rx);
+			
+			for (i = 0; i < nb_rx; i++) {
+				get_pkt_sched(rx_mbufs[i], &subport, &pipe, &traffic_class, &queue, &color);
+				rte_sched_port_pkt_write(conf->sched_port, rx_mbufs[i], 
+						subport, pipe, traffic_class, queue, (enum rte_color) color);
+			}
+
+			int nb_sent = rte_sched_port_enqueue(conf->sched_port, rx_mbufs, nb_rx);
+			APP_STATS_ADD(conf->stat.nb_drop, nb_rx - nb_sent);
+		    }
+		    uint32_t nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs, burst_conf.qos_dequeue);
+		    if (likely(nb_pkt > 0)) {
+			    uint16_t nb_tx = rte_eth_tx_burst(conf->tx_port, conf->tx_queue, mbufs, nb_pkt);
+			    if (nb_tx < nb_pkt) 
+				    rte_pktmbuf_free_bulk(&mbufs[nb_tx], nb_pkt - nb_tx);
+		    } conf_idx++;
+		    if (confs[conf_idx] == NULL)
+			    conf_idx = 0;
+       	}
+
+}

@@ -175,19 +175,27 @@ app_parse_flow_conf(const char *conf_str)
 
 	memset(vals, 0, sizeof(vals));
 	ret = app_parse_opt_vals(conf_str, ',', 6, vals);
-	if (ret < 4 || ret > 5)
+	if (ret < 3 || ret > 5)
 		return ret;
 
 	pconf = &qos_conf[nb_pfc];
 
-	pconf->rx_port = vals[0];
-	pconf->tx_port = vals[1];
-	pconf->rx_core = (uint8_t)vals[2];
-	pconf->wt_core = (uint8_t)vals[3];
-	if (ret == 5)
-		pconf->tx_core = (uint8_t)vals[4];
-	else
-		pconf->tx_core = pconf->wt_core;
+	if (ret == 3) {
+		pconf->rx_port = vals[0];
+		pconf->tx_port = vals[1];
+		pconf->rx_core = (uint8_t)vals[2];
+		pconf->wt_core = 0;
+		pconf->tx_core = 0;
+	} else {
+		pconf->rx_port = vals[0];
+		pconf->tx_port = vals[1];
+		pconf->rx_core = (uint8_t)vals[2];
+		pconf->wt_core = (uint8_t)vals[3];
+		if (ret == 5)
+			pconf->tx_core = (uint8_t)vals[4];
+		else
+			pconf->tx_core = pconf->wt_core;
+	}
 
 	if (pconf->rx_core == pconf->wt_core) {
 		RTE_LOG(ERR, APP, "pfc %u: rx thread and worker thread cannot share same core\n", nb_pfc);
@@ -398,7 +406,7 @@ app_parse_args(int argc, char **argv)
 		}
 		uint32_t rx_sock = rte_lcore_to_socket_id(qos_conf[i].rx_core);
 		uint32_t wt_sock = rte_lcore_to_socket_id(qos_conf[i].wt_core);
-		if (rx_sock != wt_sock) {
+		if (rx_sock != wt_sock && qos_conf[i].wt_core != 0) {
 			RTE_LOG(ERR, APP, "pfc %u: RX and WT must be on the same socket\n", i + 1);
 			return -1;
 		}
