@@ -58,6 +58,7 @@ extern "C" {
 #define APP_QAVG_PERIOD 100
 
 #define N_TX_QUEUES 2
+#define N_RING_TC 2
 
 struct thread_stat
 {
@@ -72,7 +73,7 @@ struct thread_conf
 	uint16_t tx_port;
 	uint16_t rx_queue;
 	uint16_t tx_queue;
-	struct rte_ring *rx_ring;
+	struct rte_ring *rx_ring[N_RING_TC];
 	struct rte_ring *tx_ring;
 	struct rte_sched_port *sched_port;
 
@@ -91,7 +92,7 @@ struct flow_conf
 	uint16_t tx_port;
 	uint16_t rx_queue;
 	uint16_t tx_queue;
-	struct rte_ring *rx_ring;
+	struct rte_ring *rx_ring[N_RING_TC];
 	struct rte_ring *tx_ring;
 	struct rte_sched_port *sched_port;
 	struct rte_mempool *mbuf_pool;

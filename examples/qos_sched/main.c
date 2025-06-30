@@ -55,7 +55,9 @@ app_main_loop(__rte_unused void *dummy)
 
 		if (flow->rx_core == lcore_id) {
 			flow->rx_thread.rx_port = flow->rx_port;
-			flow->rx_thread.rx_ring =  flow->rx_ring;
+			memcpy(flow->rx_thread.rx_ring, flow->rx_ring,
+					       sizeof(flow->rx_ring));
+			// flow->rx_thread.rx_ring =  flow->rx_ring;
 			flow->rx_thread.rx_queue = flow->rx_queue;
 			flow->rx_thread.sched_port = flow->sched_port;
 
@@ -73,7 +75,9 @@ app_main_loop(__rte_unused void *dummy)
 			mode |= APP_TX_MODE;
 		}
 		if (flow->wt_core == lcore_id) {
-			flow->wt_thread.rx_ring =  flow->rx_ring;
+			// flow->wt_thread.rx_ring =  flow->rx_ring;
+			memcpy(flow->wt_thread.rx_ring, flow->rx_ring,
+					       sizeof(flow->rx_ring));
 			flow->wt_thread.tx_ring =  flow->tx_ring;
 			flow->wt_thread.tx_port =  flow->tx_port;
 			flow->wt_thread.sched_port =  flow->sched_port;

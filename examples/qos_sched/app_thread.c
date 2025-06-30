@@ -101,15 +101,30 @@ app_rx_thread(struct thread_conf **confs)
 						subport, pipe,
 						traffic_class, queue,
 						(enum rte_color) color);
-			}
 
-			if (unlikely(rte_ring_sp_enqueue_bulk(conf->rx_ring,
+			/*
+			if (unlikely(rte_ring_sp_enqueue_bulk(conf->rx_ring[0],
 					(void **)rx_mbufs, nb_rx, NULL) == 0)) {
 				for(i = 0; i < nb_rx; i++) {
 					rte_pktmbuf_free(rx_mbufs[i]);
 
 					APP_STATS_ADD(conf->stat.nb_drop, 1);
 				} 
+			}
+			*/
+
+				// printf("sdadasd %d\n", queue);
+				int tc = 0; 
+				if (traffic_class != 0) {
+					tc = 1;
+				}
+
+				if (unlikely(rte_ring_sp_enqueue(conf->rx_ring[tc], (void*)rx_mbufs[i]))) {
+					rte_pktmbuf_free(rx_mbufs[i]);
+
+					if (tc == 0)
+						APP_STATS_ADD(conf->stat.nb_drop, 1);
+				}
 			}
 		}
 		conf_idx++;
@@ -169,14 +184,16 @@ app_worker_thread(struct thread_conf **confs)
 		uint32_t nb_pkt;
 
 		/* Read packet from the ring */
-		nb_pkt = rte_ring_sc_dequeue_burst(conf->rx_ring, (void **)mbufs,
+		for (int tc = 0; tc < N_RING_TC; tc++) {
+		nb_pkt = rte_ring_sc_dequeue_burst(conf->rx_ring[tc], (void **)mbufs,
 					burst_conf.ring_burst, NULL);
-		if (likely(nb_pkt)) {
-			int nb_sent = rte_sched_port_enqueue(conf->sched_port, mbufs,
-					nb_pkt);
+			if (likely(nb_pkt)) {
+				int nb_sent = rte_sched_port_enqueue(conf->sched_port, mbufs,
+						nb_pkt);
 
-			APP_STATS_ADD(conf->stat.nb_drop, nb_pkt - nb_sent);
-			APP_STATS_ADD(conf->stat.nb_rx, nb_pkt);
+				APP_STATS_ADD(conf->stat.nb_drop, nb_pkt - nb_sent);
+				APP_STATS_ADD(conf->stat.nb_rx, nb_pkt);
+			}
 		}
 
 		nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs,
@@ -205,7 +222,7 @@ app_mixed_thread(struct thread_conf **confs)
 		uint32_t nb_pkt;
 
 		/* Read packet from the ring */
-		nb_pkt = rte_ring_sc_dequeue_burst(conf->rx_ring, (void **)mbufs,
+		nb_pkt = rte_ring_sc_dequeue_burst(conf->rx_ring[0], (void **)mbufs,
 					burst_conf.ring_burst, NULL);
 		if (likely(nb_pkt)) {
 			int nb_sent = rte_sched_port_enqueue(conf->sched_port, mbufs,

@@ -211,7 +211,7 @@ static void port_hqos_init(uint16_t port) {
     uint16_t prio = 7;
 
     // pmdlink_add_node(port, qos_nodes[0].teid, prio);
-    pmdlink_set_shaper(port, qos_nodes[0].teid);
+    // pmdlink_set_shaper(port, qos_nodes[0].teid);
     for (int i = 0; qos_nodes[i].teid != 0; i++) {
     	printf("port=%d, teid=%d, parent_teid=%d, queue_id?%d\n",port, qos_nodes[i].teid, qos_nodes[i].parent_teid, qos_nodes[i].tx_queue_id);
 	if (qos_nodes[i].tx_queue_id != 0) {
@@ -587,13 +587,19 @@ int app_init(void)
 		struct rte_eth_link link = {0};
 		int retry_count = 100, retry_delay = 100; /* try every 100ms for 10 sec */
 
-		snprintf(ring_name, MAX_NAME_LEN, "ring-%u-%u", i, qos_conf[i].rx_core);
-		ring = rte_ring_lookup(ring_name);
-		if (ring == NULL)
-			qos_conf[i].rx_ring = rte_ring_create(ring_name, ring_conf.ring_size,
-			 	socket, RING_F_SP_ENQ | RING_F_SC_DEQ);
-		else
-			qos_conf[i].rx_ring = ring;
+		for (int tc = 0; tc < N_RING_TC; tc++) {
+			snprintf(ring_name, MAX_NAME_LEN, "ring-%u-%u-%u", i, qos_conf[i].rx_core, tc);
+			struct rte_ring *ring = rte_ring_lookup(ring_name);
+
+			if (ring == NULL) {
+				ring = rte_ring_create(ring_name, ring_conf.ring_size,
+						socket, RING_F_SP_ENQ | RING_F_SC_DEQ);
+				if (ring == NULL)
+					rte_exit(EXIT_FAILURE, "Failed to create RX ring %s\n", ring_name);
+			}
+
+			qos_conf[i].rx_ring[tc] = ring;
+		}
 
 		snprintf(ring_name, MAX_NAME_LEN, "ring-%u-%u", i, qos_conf[i].tx_core);
 		ring = rte_ring_lookup(ring_name);
