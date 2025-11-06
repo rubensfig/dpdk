@@ -24,17 +24,17 @@
  * Values below define offset to each field from start of frame
  */
 // VLAN offload ON {
-// #define SUBPORT_OFFSET	5
-// #define PIPE_OFFSET	16
-// #define QUEUE_OFFSET	7
-// #define COLOR_OFFSET	19
+#define SUBPORT_OFFSET	5
+#define PIPE_OFFSET	16
+#define QUEUE_OFFSET	7
+#define COLOR_OFFSET	19
 // }
 
 // Switchdev VLAN offload off {
-#define SUBPORT_OFFSET	7
-#define PIPE_OFFSET	18
-#define QUEUE_OFFSET	9
-#define COLOR_OFFSET	19
+// #define SUBPORT_OFFSET	7
+// #define PIPE_OFFSET	18
+// #define QUEUE_OFFSET	9
+// #define COLOR_OFFSET	19
 // }
 
 static inline int get_pkt_sched(struct rte_mbuf *m, uint32_t *subport, uint32_t *pipe,
