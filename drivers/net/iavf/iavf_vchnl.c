@@ -1717,6 +1717,52 @@ iavf_fdir_check(struct iavf_adapter *adapter,
 }
 
 int
+iavf_fdir_get_counter(struct iavf_adapter *adapter,
+		uint32_t flow_id)
+{
+	struct iavf_info *vf = IAVF_DEV_PRIVATE_TO_VF(adapter);
+	// struct virtchnl_fdir_add *fdir_ret;
+
+	struct iavf_cmd_info args;
+	int err;
+
+	// filter->add_fltr.vsi_id = vf->vsi_res->vsi_id;
+	// filter->add_fltr.validate_only = 1;
+
+	args.ops = VIRTCHNL_OP_GET_FDIR_COUNTER;
+	// args.in_args = (uint8_t *)(&filter->add_fltr);
+	args.in_args = NULL;
+	// args.in_args_size = sizeof(*(&filter->add_fltr));
+	args.in_args_size = NULL;
+	args.out_buffer = vf->aq_resp;
+	args.out_size = IAVF_AQ_BUF_SZ;
+
+	err = iavf_execute_vf_cmd_safe(adapter, &args, 0);
+	if (err) {
+		PMD_DRV_LOG(ERR, "fail to check flow director rule");
+		return err;
+	}
+
+	// fdir_ret = (struct virtchnl_fdir_add *)args.out_buffer;
+
+	// if (fdir_ret->status == VIRTCHNL_FDIR_SUCCESS) {
+	// 	PMD_DRV_LOG(INFO,
+	// 		"Succeed in checking rule request by PF");
+	// } else if (fdir_ret->status == VIRTCHNL_FDIR_FAILURE_RULE_INVALID) {
+	// 	PMD_DRV_LOG(ERR,
+	// 		"Failed to check rule request due to parameters validation"
+	// 		" or HW doesn't support");
+	// 	err = -1;
+	// } else {
+	// 	PMD_DRV_LOG(ERR,
+	// 		"Failed to check rule request due to other reasons");
+	// 	err =  -1;
+	// }
+
+	return err;
+}
+
+int
 iavf_flow_sub(struct iavf_adapter *adapter, struct iavf_fsub_conf *filter)
 {
 	struct iavf_info *vf = IAVF_DEV_PRIVATE_TO_VF(adapter);

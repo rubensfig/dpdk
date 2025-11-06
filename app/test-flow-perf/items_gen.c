@@ -56,8 +56,11 @@ add_ipv4(struct rte_flow_item *items,
 	static struct rte_flow_item_ipv4 ipv4_masks[RTE_MAX_LCORE] __rte_cache_aligned;
 	uint8_t ti = para.core_idx;
 
-	ipv4_specs[ti].hdr.src_addr = RTE_BE32(para.src_ip);
-	ipv4_masks[ti].hdr.src_addr = RTE_BE32(0xffffffff);
+	// ipv4_specs[ti].hdr.src_addr = RTE_BE32(para.src_ip);
+	// ipv4_masks[ti].hdr.src_addr = RTE_BE32(0xffffffff);
+	
+	ipv4_specs[ti].hdr.dst_addr = RTE_BE32(para.src_ip);
+	ipv4_masks[ti].hdr.dst_addr = RTE_BE32(0xffffffff);
 
 	items[items_counter].type = RTE_FLOW_ITEM_TYPE_IPV4;
 	items[items_counter].spec = &ipv4_specs[ti];
@@ -225,6 +228,22 @@ add_gtp(struct rte_flow_item *items,
 }
 
 static void
+add_gtp_psc(struct rte_flow_item *items,
+	uint8_t items_counter,
+	__rte_unused struct additional_para para)
+{
+	static struct rte_flow_item_gtp_psc gtp_spec = {
+		.hdr.qfi = RTE_BE32(2),
+	};
+	static struct rte_flow_item_gtp_psc gtp_mask = {
+		.hdr.qfi = RTE_BE32(0xffffffff),
+	};
+
+	items[items_counter].type = RTE_FLOW_ITEM_TYPE_GTP_PSC;
+	items[items_counter].spec = &gtp_spec;
+	items[items_counter].mask = &gtp_mask;
+}
+static void
 add_meta_data(struct rte_flow_item *items,
 	uint8_t items_counter,
 	__rte_unused struct additional_para para)
@@ -359,6 +378,10 @@ fill_items(struct rte_flow_item *items,
 		{
 			.mask = RTE_FLOW_ITEM_TYPE_GTP,
 			.funct = add_gtp,
+		},
+		{
+			.mask = RTE_FLOW_ITEM_TYPE_GTP_PSC,
+			.funct = add_gtp_psc,
 		},
 		{
 			.mask = RTE_FLOW_ITEM_TYPE_ICMP,

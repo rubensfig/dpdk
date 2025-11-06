@@ -5,7 +5,8 @@
 #define FLOW_ITEM_MASK(_x) (UINT64_C(1) << _x)
 #define FLOW_ACTION_MASK(_x) (UINT64_C(1) << _x)
 #define FLOW_ATTR_MASK(_x) (UINT64_C(1) << _x)
-#define GET_RSS_HF() (RTE_ETH_RSS_IP)
+// #define GET_RSS_HF() (RTE_ETH_RSS_IP)
+#define GET_RSS_HF() (0x3ffc)
 
 /* Configuration */
 #define RXQ_NUM 1

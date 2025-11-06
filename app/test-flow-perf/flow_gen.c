@@ -62,6 +62,10 @@ generate_flow(uint16_t port_id,
 	memset(actions, 0, sizeof(actions));
 	memset(&attr, 0, sizeof(struct rte_flow_attr));
 
+	uint32_t base_ip = 0xC0A80000; // 192.168.0.0 in big-endian
+	outer_ip_src = base_ip + outer_ip_src;              // i = 0..3999
+	// printf("%d\n",outer_ip_src);
+
 	fill_attributes(&attr, flow_attrs, group, max_priority);
 
 	fill_actions(actions, flow_actions,

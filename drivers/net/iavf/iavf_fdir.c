@@ -431,12 +431,20 @@ iavf_fdir_validation(struct iavf_adapter *ad,
 	return 0;
 };
 
+int iavf_fdir_query_stats(struct iavf_adapter *ad, uint32_t flow_id) {
+
+	struct iavf_fdir_conf *filter = NULL;
+	iavf_fdir_get_counter(ad, flow_id);
+	return 0;
+}
+
 static struct iavf_flow_engine iavf_fdir_engine = {
 	.init = iavf_fdir_init,
 	.uninit = iavf_fdir_uninit,
 	.create = iavf_fdir_create,
 	.destroy = iavf_fdir_destroy,
 	.validation = iavf_fdir_validation,
+	.query_count = iavf_fdir_query_stats,
 	.type = IAVF_FLOW_ENGINE_FDIR,
 };
 
@@ -514,6 +522,7 @@ iavf_fdir_parse_action(struct iavf_adapter *ad,
 	const struct rte_flow_action_mark *mark_spec = NULL;
 	uint32_t dest_num = 0;
 	uint32_t mark_num = 0;
+	uint32_t count_num = 0;
 	int ret;
 
 	int number = 0;
@@ -592,6 +601,15 @@ iavf_fdir_parse_action(struct iavf_adapter *ad,
 			filter->add_fltr.rule_cfg.action_set.count = ++number;
 			break;
 
+		case RTE_FLOW_ACTION_TYPE_COUNT:
+			count_num++;
+		
+			filter_action = &filter->add_fltr.rule_cfg.action_set.actions[number];
+			filter_action->type = VIRTCHNL_ACTION_COUNT;
+			filter_action->act_conf.count.id = 0;
+
+			break;
+
 		default:
 			rte_flow_error_set(error, EINVAL,
 					RTE_FLOW_ERROR_TYPE_ACTION, actions,
@@ -621,7 +639,7 @@ iavf_fdir_parse_action(struct iavf_adapter *ad,
 		return -rte_errno;
 	}
 
-	if (dest_num + mark_num == 0) {
+	if (dest_num + mark_num + count_num == 0) {
 		rte_flow_error_set(error, EINVAL,
 			RTE_FLOW_ERROR_TYPE_ACTION, actions,
 			"Empty action");

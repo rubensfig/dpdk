@@ -40,6 +40,7 @@
 #include "config.h"
 #include "actions_gen.h"
 #include "flow_gen.h"
+#include "macswap_sse.h"
 
 #define MAX_BATCHES_COUNT          100
 #define DEFAULT_RULES_COUNT    4000000
@@ -214,6 +215,12 @@ static const struct option_dict {
 	{
 		.str = "gtp",
 		.mask = FLOW_ITEM_MASK(RTE_FLOW_ITEM_TYPE_GTP),
+		.map = &flow_items[0],
+		.map_idx = &items_idx
+	},
+	{
+		.str = "gtppsc",
+		.mask = FLOW_ITEM_MASK(RTE_FLOW_ITEM_TYPE_GTP_PSC),
 		.map = &flow_items[0],
 		.map_idx = &items_idx
 	},
@@ -532,6 +539,7 @@ usage(char *progname)
 	printf("  --gre: add gre layer in flow items\n");
 	printf("  --geneve: add geneve layer in flow items\n");
 	printf("  --gtp: add gtp layer in flow items\n");
+	printf("  --gtppsc: add gtp psc layer in flow items\n");
 	printf("  --meta: add meta layer in flow items\n");
 	printf("  --tag: add tag layer in flow items\n");
 	printf("  --icmpv4: add icmpv4 layer in flow items\n");
@@ -688,6 +696,7 @@ args_parse(int argc, char **argv)
 		{ "gre",                        0, 0, 0 },
 		{ "geneve",                     0, 0, 0 },
 		{ "gtp",                        0, 0, 0 },
+		{ "gtppsc",                     0, 0, 0 },
 		{ "meta",                       0, 0, 0 },
 		{ "tag",                        0, 0, 0 },
 		{ "icmpv4",                     0, 0, 0 },
@@ -1680,6 +1689,9 @@ run_rte_flow_handler_cores(void *data __rte_unused)
 
 	mc_pool.rules_count = rules_count;
 
+        if (rules_count == 0)
+		return 0;
+
 	flows_handler(lcore_id);
 
 	/* Only main core to print total results. */
@@ -1726,8 +1738,10 @@ do_tx(struct lcore_info *li, uint16_t cnt, uint16_t tx_port,
 			uint16_t tx_queue)
 {
 	uint16_t nr_tx = 0;
+	struct rte_mbuf  *pkts_burst[MAX_PKT_BURST];
 	uint16_t i;
 
+	do_macswap(li->pkts, cnt, NULL);
 	nr_tx = rte_eth_tx_burst(tx_port, tx_queue, li->pkts, cnt);
 	li->tx_pkts  += nr_tx;
 	li->tx_drops += cnt - nr_tx;
@@ -2039,11 +2053,13 @@ init_port(void)
 		}
 
 		/* Catch all packets from traffic generator. */
+		/*
 		ret = rte_eth_promiscuous_enable(port_id);
 		if (ret != 0)
 			rte_exit(EXIT_FAILURE,
 				":: promiscuous mode enable failed: err=%s, port=%u\n",
 				rte_strerror(-ret), port_id);
+				*/
 
 		if (hairpin_queues_num != 0) {
 			/*

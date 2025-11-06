@@ -467,6 +467,8 @@ int iavf_fdir_add(struct iavf_adapter *adapter, struct iavf_fdir_conf *filter);
 int iavf_fdir_del(struct iavf_adapter *adapter, struct iavf_fdir_conf *filter);
 int iavf_fdir_check(struct iavf_adapter *adapter,
 		struct iavf_fdir_conf *filter);
+int iavf_fdir_get_counter(struct iavf_adapter *adapter,
+		uint32_t flow_id);
 int iavf_add_del_rss_cfg(struct iavf_adapter *adapter,
 			 struct virtchnl_rss_cfg *rss_cfg, bool add);
 int iavf_get_hena_caps(struct iavf_adapter *adapter, uint64_t *caps);
