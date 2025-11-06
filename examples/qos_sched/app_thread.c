@@ -109,7 +109,7 @@ app_rx_thread(struct thread_conf **confs)
 					rte_pktmbuf_free(rx_mbufs[i]);
 
 					APP_STATS_ADD(conf->stat.nb_drop, 1);
-				}
+				} 
 			}
 		}
 		conf_idx++;
@@ -125,14 +125,30 @@ app_tx_thread(struct thread_conf **confs)
 	struct thread_conf *conf;
 	int conf_idx = 0;
 	int nb_pkts;
+	struct rte_eth_dev_tx_buffer *buffer;
 
 	while ((conf = confs[conf_idx])) {
 		nb_pkts = rte_ring_sc_dequeue_burst(conf->tx_ring, (void **)mbufs,
 					burst_conf.qos_dequeue, NULL);
+		uint16_t nb_tx = 0;
 		if (likely(nb_pkts != 0)) {
-			uint16_t nb_tx = rte_eth_tx_burst(conf->tx_port, 0, mbufs, nb_pkts);
-			if (nb_pkts != nb_tx)
-				rte_pktmbuf_free_bulk(&mbufs[nb_tx], nb_pkts - nb_tx);
+			for(int i = 0; i < nb_pkts; i++) {
+				int tx_queue = mbufs[i]->hash.sched.traffic_class;
+				int tx_port = conf->tx_port;
+
+				if (tx_queue > N_TX_QUEUES) {
+					tx_queue = 1;	
+				}
+
+				buffer = tx_buffer[tx_port][tx_queue];
+					
+				nb_tx = rte_eth_tx_buffer(tx_port, tx_queue, buffer, mbufs[i]);
+			}
+
+			// nb_tx = rte_eth_tx_burst(conf->tx_port, 0, mbufs, nb_pkts);
+			
+			//  if (nb_pkts != nb_tx)
+			//  	rte_pktmbuf_free_bulk(&mbufs[nb_tx], nb_pkts - nb_tx);
 		}
 
 		conf_idx++;
@@ -165,6 +181,7 @@ app_worker_thread(struct thread_conf **confs)
 
 		nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs,
 					burst_conf.qos_dequeue);
+
 		if (likely(nb_pkt > 0))
 			while (rte_ring_sp_enqueue_bulk(conf->tx_ring,
 					(void **)mbufs, nb_pkt, NULL) == 0)

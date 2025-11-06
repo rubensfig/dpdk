@@ -2417,6 +2417,7 @@ grinder_credits_check_with_tc_ov(struct rte_sched_port *port,
 	struct rte_sched_pipe *pipe = grinder->pipe;
 	struct rte_mbuf *pkt = grinder->pkt;
 	uint32_t tc_index = grinder->tc_index;
+	uint32_t sp_tc_index = grinder->pindex >> 9;
 	uint64_t pkt_len = pkt->pkt_len + port->frame_overhead;
 	uint64_t subport_tb_credits = subport->tb_credits;
 	uint64_t subport_tc_credits = subport->tc_credits[tc_index];
