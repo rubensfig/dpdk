@@ -1738,10 +1738,8 @@ iavf_fdir_get_counter(struct iavf_adapter *adapter,
 	// filter->add_fltr.validate_only = 1;
 
 	args.ops = VIRTCHNL_OP_GET_FDIR_COUNTER;
-	// args.in_args = (uint8_t *)(&filter->add_fltr);
 	args.in_args = NULL;
-	// args.in_args_size = sizeof(*(&filter->add_fltr));
-	args.in_args_size = NULL;
+	args.in_args_size = 0;
 	args.out_buffer = vf->aq_resp;
 	args.out_size = IAVF_AQ_BUF_SZ;
 

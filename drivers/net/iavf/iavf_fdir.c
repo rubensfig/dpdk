@@ -606,7 +606,10 @@ iavf_fdir_parse_action(struct iavf_adapter *ad,
 		
 			filter_action = &filter->add_fltr.rule_cfg.action_set.actions[number];
 			filter_action->type = VIRTCHNL_ACTION_COUNT;
-			filter_action->act_conf.count.id = 0;
+			filter_action->act_conf.count.id = count_num;
+			filter_action->act_conf.count.shared = 1;
+
+			filter->add_fltr.rule_cfg.action_set.count = ++number;
 
 			break;
 
