@@ -1573,7 +1573,7 @@ ice_fdir_query_count(struct ice_adapter *ad,
 	struct ice_hw *hw = ICE_PF_TO_HW(pf);
 	struct ice_fdir_filter_conf *filter = flow->rule;
 	struct ice_fdir_counter *counter = filter->counter;
-	uint64_t hits_lo, hits_hi;
+	uint64_t hits_lo, hits_hi, size;
 
 	if (!counter) {
 		rte_flow_error_set(error, EINVAL,
@@ -1590,11 +1590,12 @@ ice_fdir_query_count(struct ice_adapter *ad,
 	 */
 	hits_lo = ICE_READ_REG(hw, GLSTAT_FD_CNT0L(counter->hw_index));
 	hits_hi = ICE_READ_REG(hw, GLSTAT_FD_CNT0H(counter->hw_index));
+	size = ICE_READ_REG(hw, GLQF_FD_CNT);
 
 	flow_stats->hits_set = 1;
 	flow_stats->hits = hits_lo | (hits_hi << 32);
 	flow_stats->bytes_set = 0;
-	flow_stats->bytes = 0;
+	flow_stats->bytes = size;
 
 	if (flow_stats->reset) {
 		/* reset statistic counter value */
