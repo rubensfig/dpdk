@@ -72,6 +72,37 @@ static inline int get_pkt_sched(struct rte_mbuf *m, uint32_t *subport, uint32_t 
 	return 0;
 }
 
+typedef struct {
+	uint64_t rate_bps;        // dynamically adjusted
+	uint64_t tokens;
+	uint64_t last_tsc;
+	uint64_t tsc_hz;
+} sw_shaper_t;
+
+
+static inline int sw_shaper_allow(sw_shaper_t *s, uint32_t pkt_len_bytes)
+{
+	uint64_t now = rte_rdtsc();
+	uint64_t elapsed = now - s->last_tsc;
+	s->last_tsc = now;
+	
+	// refill tokens: rate_bps / 8 bytes per second
+	uint64_t token_add = (elapsed * (s->rate_bps/8)) / s->tsc_hz;
+	s->tokens += token_add;
+	
+	// cap bucket
+	if (s->tokens > (s->rate_bps/8))
+	s->tokens = (s->rate_bps/8);
+	
+	// need pkt_len_bytes tokens to send
+	if (s->tokens >= pkt_len_bytes) {
+	s->tokens -= pkt_len_bytes;
+	return 1;
+	}
+	
+	return 0; // not enough tokens, drop or defer
+}
+
 /**
  * Update backpressure state based on packet drop rate
  * 
@@ -86,7 +117,7 @@ update_backpressure_state(uint16_t port)
 	uint64_t elapsed = now - stats->last_check_tsc;
 	
 	/* Check every 100us to avoid excessive overhead */
-	uint64_t check_interval = stats->tsc_hz / 100;
+	uint64_t check_interval = stats->tsc_hz / 10000;
 	if (elapsed < check_interval)
 		return;
 	
@@ -114,29 +145,28 @@ update_backpressure_state(uint16_t port)
 	/* Calculate total drops and TX over both windows */
 	uint64_t total_drops = stats->drop_window[0] + stats->drop_window[1];
 	uint64_t total_tx = __atomic_load_n(&stats->tx, __ATOMIC_RELAXED);
-
 	
 	/* Backpressure activation/deactivation logic with hysteresis */
 	if (!stats->backpressure_active) {
 		/* Activate backpressure if drop rate exceeds threshold */
 		if (total_tx > 1000) { /* Minimum sample size */
-			double drop_rate = ((double)total_drops / (double)total_tx)*100000;
-			if (drop_rate > 0.05) {
+			double drop_rate = (double)total_drops / (double)total_tx;
+			if (drop_rate > BP_THRESHOLD_RATIO) {
 				stats->backpressure_active = 1;
-				// printf("Port %u: Backpressure ACTIVE (drop rate: %.2f%%)\n",
-				//        port, drop_rate);
+				printf("Port %u: Backpressure ACTIVE (drop rate: %.2f%%)\n",
+				       port, drop_rate * 100);
 			}
 		}
 	} else {
 		/* Deactivate backpressure if drop rate falls below recovery threshold */
 		if (total_tx > 1000) {
-			double drop_rate = ((double)total_drops / (double)total_tx)*1000;
+			double drop_rate = (double)total_drops / (double)total_tx;
 			if (drop_rate < BP_RECOVERY_RATIO) {
 				stats->backpressure_active = 0;
 				stats->drop_window[0] = 0;
 				stats->drop_window[1] = 0;
-//				printf("Port %u: Backpressure RELEASED (drop rate: %.2f%%)\n",
-//				       port, drop_rate * 100);
+				printf("Port %u: Backpressure RELEASED (drop rate: %.2f%%)\n",
+				       port, drop_rate * 100);
 			}
 		}
 		
@@ -228,9 +258,6 @@ app_tx_thread(struct thread_conf **confs)
 			// 	APP_STATS_ADD(conf->stat.nb_drop, port_statistics[tx_port].dropped);
 			//   	rte_pktmbuf_free_bulk(&mbufs[nb_tx], nb_pkts - nb_tx);
 			// }
-       			if (likely(nb_tx > 0)) {
-				__atomic_add_fetch(&port_statistics[0].tx, nb_tx, __ATOMIC_RELAXED);
-			}
 		}
 
 		conf_idx++;
@@ -240,7 +267,6 @@ app_tx_thread(struct thread_conf **confs)
 }
 
 
-
 void
 app_worker_thread(struct thread_conf **confs)
 {
@@ -248,11 +274,9 @@ app_worker_thread(struct thread_conf **confs)
 	struct thread_conf *conf;
 	int conf_idx = 0;
 	uint16_t tx_port;
-	int bp = 0;
 
 	while ((conf = confs[conf_idx])) {
 		uint32_t nb_pkt;
-		tx_port = conf->tx_port;
 
 		/* Read packet from the ring */
 		nb_pkt = rte_ring_sc_dequeue_burst(conf->rx_ring, (void **)mbufs,
@@ -265,16 +289,16 @@ app_worker_thread(struct thread_conf **confs)
 			APP_STATS_ADD(conf->stat.nb_rx, nb_pkt);
 		}
 
-		update_backpressure_state(tx_port);
-		// printf("tx_port %d %d\n", tx_port, port_statistics[tx_port].backpressure_active);
-		nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs,
-					burst_conf.qos_dequeue, bp);
++		if (likely(!port_statistics[tx_port].backpressure_active)) {
+			nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs,
+						burst_conf.qos_dequeue);
 
-		if (likely(nb_pkt > 0))
-			while (rte_ring_sp_enqueue_bulk(conf->tx_ring,
-					(void **)mbufs, nb_pkt, NULL) == 0)
-				; /* empty body */
+			if (likely(nb_pkt > 0))
+				while (rte_ring_sp_enqueue_bulk(conf->tx_ring,
+						(void **)mbufs, nb_pkt, NULL) == 0)
+					; /* empty body */
 
+		}
 		conf_idx++;
 		if (confs[conf_idx] == NULL)
 			conf_idx = 0;
@@ -288,7 +312,6 @@ app_mixed_thread(struct thread_conf **confs)
 	struct rte_mbuf *mbufs[burst_conf.ring_burst];
 	struct thread_conf *conf;
 	int conf_idx = 0;
-	uint16_t tx_port;
 
 	while ((conf = confs[conf_idx])) {
 		uint32_t nb_pkt;
@@ -306,7 +329,7 @@ app_mixed_thread(struct thread_conf **confs)
 
 
 		nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs,
-					burst_conf.qos_dequeue, true);
+					burst_conf.qos_dequeue);
 		if (likely(nb_pkt > 0)) {
 			uint16_t nb_tx = rte_eth_tx_burst(conf->tx_port, 0, mbufs, nb_pkt);
 			if (nb_tx != nb_pkt)

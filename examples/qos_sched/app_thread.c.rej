@@ -1,0 +1,69 @@
+--- examples/qos_sched/app_thread.c
++++ examples/qos_sched/app_thread.c
+@@ -201,15 +276,16 @@ app_tx_thread(struct thread_conf **confs)
+ 	int conf_idx = 0;
+ 	int nb_pkts;
+ 	struct rte_eth_dev_tx_buffer *buffer;
++	int tx_port;
+ 
+ 	while ((conf = confs[conf_idx])) {
+ 		nb_pkts = rte_ring_sc_dequeue_burst(conf->tx_ring, (void **)mbufs,
+ 					burst_conf.qos_dequeue, NULL);
+ 		uint16_t nb_tx = 0;
++		tx_port = conf->tx_port;
+ 		if (likely(nb_pkts != 0)) {
+ 			for(int i = 0; i < nb_pkts; i++) {
+ 				int tx_queue = mbufs[i]->hash.sched.traffic_class;
+-				int tx_port = conf->tx_port;
+ 
+ 				if (tx_queue > N_TX_QUEUES) {
+ 					tx_queue = 1;	
+@@ -217,13 +293,13 @@ app_tx_thread(struct thread_conf **confs)
+ 
+ 				buffer = tx_buffer[tx_port][tx_queue];
+ 					
+-				nb_tx = rte_eth_tx_buffer(tx_port, tx_queue, buffer, mbufs[i]);
++				nb_tx += rte_eth_tx_buffer(tx_port, tx_queue, buffer, mbufs[i]);
+ 			}
+-
+-			// nb_tx = rte_eth_tx_burst(conf->tx_port, 0, mbufs, nb_pkts);
+-			
+-			//  if (nb_pkts != nb_tx)
+-			//  	rte_pktmbuf_free_bulk(&mbufs[nb_tx], nb_pkts - nb_tx);
++			
++			/* Update successful TX counter for backpressure calculation */
++			if (likely(nb_tx > 0)) {
++				__atomic_add_fetch(&port_statistics[tx_port].tx, nb_tx, __ATOMIC_RELAXED);
++			}
+ 		}
+ 
+ 		conf_idx++;
+@@ -255,14 +332,22 @@ app_worker_thread(struct thread_conf **confs)
+ 			APP_STATS_ADD(conf->stat.nb_rx, nb_pkt);
+ 		}
+ 
+-		nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs,
+-					burst_conf.qos_dequeue);
++		/* Get TX port and update backpressure state */
++		tx_port = conf->tx_port;
++		update_backpressure_state(tx_port);
++		
++		/* Only dequeue from scheduler if backpressure is not active */
++		if (likely(!port_statistics[tx_port].backpressure_active)) {
++			nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs,
++						burst_conf.qos_dequeue);
+ 
+-		if (likely(nb_pkt > 0))
+-			while (rte_ring_sp_enqueue_bulk(conf->tx_ring,
+-					(void **)mbufs, nb_pkt, NULL) == 0)
+-				; /* empty body */
++			if (likely(nb_pkt > 0)) {
++				while (rte_ring_sp_enqueue_bulk(conf->tx_ring,
++						(void **)mbufs, nb_pkt, NULL) == 0)
++					; /* retry until success */
++			}
+ 
++		}
+ 		conf_idx++;
+ 		if (confs[conf_idx] == NULL)
+ 			conf_idx = 0;

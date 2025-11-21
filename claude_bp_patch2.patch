@@ -1,0 +1,297 @@
+diff --git a/examples/qos_sched/app_thread.c b/examples/qos_sched/app_thread.c
+index 5b8e932a19..8f9a3c5d12 100644
+--- a/examples/qos_sched/app_thread.c
++++ b/examples/qos_sched/app_thread.c
+@@ -72,6 +72,81 @@ static inline int get_pkt_sched(struct rte_mbuf *m, uint32_t *subport, uint32_t
+ 	return 0;
+ }
+ 
++/**
++ * Update backpressure state based on packet drop rate
++ * 
++ * This function monitors the TX drop rate and activates/deactivates
++ * backpressure to prevent overwhelming the NIC TX capacity.
++ */
++static inline void
++update_backpressure_state(uint16_t port)
++{
++	struct rte_port_statistics *stats = &port_statistics[port];
++	uint64_t now = rte_get_tsc_cycles();
++	uint64_t elapsed = now - stats->last_check_tsc;
++	
++	/* Check every 100us to avoid excessive overhead */
++	uint64_t check_interval = stats->tsc_hz / 10000;
++	if (elapsed < check_interval)
++		return;
++	
++	stats->last_check_tsc = now;
++	
++	/* Calculate drops since last check */
++	uint64_t current_dropped = __atomic_load_n(&stats->dropped, __ATOMIC_RELAXED);
++	uint64_t new_drops = current_dropped - stats->last_dropped;
++	stats->last_dropped = current_dropped;
++	
++	/* Sliding window management (2 windows for smoothing) */
++	uint64_t window_elapsed = now - stats->window_start_tsc;
++	uint64_t window_duration = stats->tsc_hz / 1000; /* 1ms windows */
++	
++	if (window_elapsed >= window_duration) {
++		/* Shift window */
++		stats->drop_window[0] = stats->drop_window[1];
++		stats->drop_window[1] = new_drops;
++		stats->window_start_tsc = now;
++	} else {
++		/* Accumulate in current window */
++		stats->drop_window[1] += new_drops;
++	}
++	
++	/* Calculate total drops and TX over both windows */
++	uint64_t total_drops = stats->drop_window[0] + stats->drop_window[1];
++	uint64_t total_tx = __atomic_load_n(&stats->tx, __ATOMIC_RELAXED);
++	
++	/* Backpressure activation/deactivation logic with hysteresis */
++	if (!stats->backpressure_active) {
++		/* Activate backpressure if drop rate exceeds threshold */
++		if (total_tx > 1000) { /* Minimum sample size */
++			double drop_rate = (double)total_drops / (double)total_tx;
++			if (drop_rate > BP_THRESHOLD_RATIO) {
++				stats->backpressure_active = 1;
++				printf("Port %u: Backpressure ACTIVE (drop rate: %.2f%%)\n",
++				       port, drop_rate * 100);
++			}
++		}
++	} else {
++		/* Deactivate backpressure if drop rate falls below recovery threshold */
++		if (total_tx > 1000) {
++			double drop_rate = (double)total_drops / (double)total_tx;
++			if (drop_rate < BP_RECOVERY_RATIO) {
++				stats->backpressure_active = 0;
++				stats->drop_window[0] = 0;
++				stats->drop_window[1] = 0;
++				printf("Port %u: Backpressure RELEASED (drop rate: %.2f%%)\n",
++				       port, drop_rate * 100);
++			}
++		}
++		
++		/* Also recover if no drops for extended period (2+ windows) */
++		if (total_drops == 0 && window_elapsed > window_duration * 2) {
++			stats->backpressure_active = 0;
++			printf("Port %u: Backpressure RELEASED (no drops)\n", port);
++		}
++	}
++}
++
+ void
+ app_rx_thread(struct thread_conf **confs)
+ {
+@@ -126,15 +201,16 @@ app_tx_thread(struct thread_conf **confs)
+ 	int conf_idx = 0;
+ 	int nb_pkts;
+ 	struct rte_eth_dev_tx_buffer *buffer;
++	int tx_port;
+ 
+ 	while ((conf = confs[conf_idx])) {
+ 		nb_pkts = rte_ring_sc_dequeue_burst(conf->tx_ring, (void **)mbufs,
+ 					burst_conf.qos_dequeue, NULL);
+ 		uint16_t nb_tx = 0;
++		tx_port = conf->tx_port;
+ 		if (likely(nb_pkts != 0)) {
+ 			for(int i = 0; i < nb_pkts; i++) {
+ 				int tx_queue = mbufs[i]->hash.sched.traffic_class;
+-				int tx_port = conf->tx_port;
+ 
+ 				if (tx_queue > N_TX_QUEUES) {
+ 					tx_queue = 1;	
+@@ -142,13 +218,13 @@ app_tx_thread(struct thread_conf **confs)
+ 
+ 				buffer = tx_buffer[tx_port][tx_queue];
+ 					
+-				nb_tx = rte_eth_tx_buffer(tx_port, tx_queue, buffer, mbufs[i]);
++				nb_tx += rte_eth_tx_buffer(tx_port, tx_queue, buffer, mbufs[i]);
+ 			}
+-
+-			// nb_tx = rte_eth_tx_burst(conf->tx_port, 0, mbufs, nb_pkts);
+-			
+-			//  if (nb_pkts != nb_tx)
+-			//  	rte_pktmbuf_free_bulk(&mbufs[nb_tx], nb_pkts - nb_tx);
++			
++			/* Update successful TX counter for backpressure calculation */
++			if (likely(nb_tx > 0)) {
++				__atomic_add_fetch(&port_statistics[tx_port].tx, nb_tx, __ATOMIC_RELAXED);
++			}
+ 		}
+ 
+ 		conf_idx++;
+@@ -162,6 +238,7 @@ app_worker_thread(struct thread_conf **confs)
+ 	struct rte_mbuf *mbufs[burst_conf.ring_burst];
+ 	struct thread_conf *conf;
+ 	int conf_idx = 0;
++	uint16_t tx_port;
+ 
+ 	while ((conf = confs[conf_idx])) {
+ 		nb_pkt = rte_eth_rx_burst(conf->rx_port, conf->rx_queue,
+@@ -179,14 +256,22 @@ app_worker_thread(struct thread_conf **confs)
+ 			APP_STATS_ADD(conf->stat.nb_rx, nb_pkt);
+ 		}
+ 
+-		nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs,
+-					burst_conf.qos_dequeue);
++		/* Get TX port and update backpressure state */
++		tx_port = conf->tx_port;
++		update_backpressure_state(tx_port);
++		
++		/* Only dequeue from scheduler if backpressure is not active */
++		if (likely(!port_statistics[tx_port].backpressure_active)) {
++			nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs,
++						burst_conf.qos_dequeue);
+ 
+-		if (likely(nb_pkt > 0))
+-			while (rte_ring_sp_enqueue_bulk(conf->tx_ring,
+-					(void **)mbufs, nb_pkt, NULL) == 0)
+-				; /* empty body */
++			if (likely(nb_pkt > 0)) {
++				while (rte_ring_sp_enqueue_bulk(conf->tx_ring,
++						(void **)mbufs, nb_pkt, NULL) == 0)
++					; /* retry until success */
++			}
+ 
++		}
+ 		conf_idx++;
+ 		if (confs[conf_idx] == NULL)
+ 			conf_idx = 0;
+diff --git a/examples/qos_sched/init.c b/examples/qos_sched/init.c
+index 33045d0a47..2a8c8c0a9e 100644
+--- a/examples/qos_sched/init.c
++++ b/examples/qos_sched/init.c
+@@ -26,6 +26,8 @@ static uint32_t app_inited_port_mask = 0;
+ 
+ int app_pipe_to_profile[MAX_SCHED_SUBPORTS][MAX_SCHED_PIPES];
+ 
++struct rte_port_statistics port_statistics[RTE_MAX_ETHPORTS];
++
+ #define MAX_NAME_LEN 32
+ 
+ struct ring_conf ring_conf = {
+@@ -211,7 +213,7 @@ static void port_hqos_init(uint16_t port) {
+     uint16_t prio = 7;
+ 
+     // pmdlink_add_node(port, qos_nodes[0].teid, prio);
+-    pmdlink_set_shaper(port, qos_nodes[0].teid);
++    // pmdlink_set_shaper(port, qos_nodes[0].teid);
+     for (int i = 0; qos_nodes[i].teid != 0; i++) {
+     	printf("port=%d, teid=%d, parent_teid=%d, queue_id?%d\n",port, qos_nodes[i].teid, qos_nodes[i].parent_teid, qos_nodes[i].tx_queue_id);
+ 	if (qos_nodes[i].tx_queue_id != 0) {
+@@ -220,6 +222,23 @@ static void port_hqos_init(uint16_t port) {
+     }
+ }
+ 
++/**
++ * Callback for TX buffer errors (unsent packets)
++ * Counts dropped packets and frees mbufs
++ */
++void
++tx_buffer_count_callback(struct rte_mbuf **pkts, uint16_t unsent,
++				void *userdata)
++{
++	struct rte_port_statistics *stats = (struct rte_port_statistics *)userdata;
++	
++	/* Atomically increment drop counter */
++	__atomic_add_fetch(&stats->dropped, unsent, __ATOMIC_RELAXED);
++	
++	/* Free unsent packets */
++	for (uint16_t i = 0; i < unsent; i++)
++		rte_pktmbuf_free(pkts[i]);
++}
++
+ static int
+ app_init_port(uint16_t portid, struct rte_mempool *mp, bool hqos_init)
+ {
+@@ -311,14 +330,31 @@ app_init_port(uint16_t portid, struct rte_mempool *mp, bool hqos_init)
+ 				 ret, portid, i);
+ 		}
+ 
++		/* Initialize TX buffer */
+ 		rte_eth_tx_buffer_init(tx_buffer[portid][i], burst);
+ 
++		/* Set error callback to count dropped packets */
++		ret = rte_eth_tx_buffer_set_err_callback(tx_buffer[portid][i], 
++				tx_buffer_count_callback, 
++				&port_statistics[portid]);
++
+ 		if (ret < 0)
+ 			rte_exit(EXIT_FAILURE,
+-				 "rte_eth_tx_queue_setup: err=%d, port=%u queue=%d\n",
++				 "rte_eth_tx_buffer_set_err_callback: err=%d, port=%u queue=%d\n",
+ 				 ret, portid, i);
+ 	}
+ 
++	/* Initialize port statistics for backpressure */
++	memset(&port_statistics[portid], 0, sizeof(port_statistics[portid]));
++	port_statistics[portid].tsc_hz = rte_get_tsc_hz();
++	port_statistics[portid].last_check_tsc = rte_get_tsc_cycles();
++	port_statistics[portid].window_start_tsc = rte_get_tsc_cycles();
++	port_statistics[portid].backpressure_active = 0;
++	port_statistics[portid].drop_window[0] = 0;
++	port_statistics[portid].drop_window[1] = 0;
++	
++	printf("Port %u: Backpressure initialized (threshold=%.1f%%, recovery=%.1f%%)\n",
++	       portid, BP_THRESHOLD_RATIO * 100, BP_RECOVERY_RATIO * 100);
++
+ 	/* Start device */
+ 	ret = rte_eth_dev_start(portid);
+ 	if (ret < 0)
+diff --git a/examples/qos_sched/main.c b/examples/qos_sched/main.c
+index b74a3c1d3c..2cf7afa1ae 100644
+--- a/examples/qos_sched/main.c
++++ b/examples/qos_sched/main.c
+@@ -156,10 +156,14 @@ app_stat(void)
+ 		memcpy(&rx_stats[i], &stats, sizeof(stats));
+ 
+ 		rte_eth_stats_get(flow->tx_port, &stats);
+-		printf("TX port %"PRIu16": tx: %" PRIu64 " err: %" PRIu64 "\n",
++		printf("TX port %"PRIu16": tx: %" PRIu64 " err: %" PRIu64 
++		       " dropped: %" PRIu64 " BP: %s\n",
+ 				flow->tx_port,
+ 				stats.opackets - tx_stats[i].opackets,
+-				stats.oerrors - tx_stats[i].oerrors);
++				stats.oerrors - tx_stats[i].oerrors,
++				port_statistics[i].dropped,
++				port_statistics[i].backpressure_active ? 
++					"ACTIVE" : "inactive");
+ 		memcpy(&tx_stats[i], &stats, sizeof(stats));
+ 
+ #if APP_COLLECT_STAT
+diff --git a/examples/qos_sched/main.h b/examples/qos_sched/main.h
+index c20eb3db81..5f37896b03 100644
+--- a/examples/qos_sched/main.h
++++ b/examples/qos_sched/main.h
+@@ -65,6 +65,28 @@ struct thread_stat
+ 	uint64_t nb_drop;
+ };
+ 
++/* Backpressure tuning parameters */
++#define BP_THRESHOLD_RATIO 0.05    /* Activate at 5% drop rate */
++#define BP_RECOVERY_RATIO  0.01    /* Recover at 1% drop rate */
++
++/* Per-port statistics struct for backpressure mechanism */
++struct __rte_cache_aligned rte_port_statistics {
++	uint64_t tx;                   /* Total packets transmitted */
++	uint64_t rx;                   /* Total packets received (unused currently) */
++	uint64_t dropped;              /* Total packets dropped by TX buffer */
++	uint64_t last_dropped;         /* Dropped count at last check */
++	uint64_t last_check_tsc;       /* TSC at last backpressure check */
++	uint64_t tsc_hz;               /* TSC frequency for timing */
++	uint64_t drop_window[2];       /* Sliding window: [old_drops, recent_drops] */
++	uint64_t window_start_tsc;     /* When current window started */
++	uint8_t  backpressure_active;  /* 1 if backpressure is currently active */
++	uint8_t  pad[7];               /* Padding for alignment */
++};
++
++/* Global array of port statistics */
++extern struct rte_port_statistics port_statistics[RTE_MAX_ETHPORTS];
++
++/* TX buffer error callback */
++void tx_buffer_count_callback(struct rte_mbuf **pkts, uint16_t unsent, void *userdata);
+ 
+ struct thread_conf
+ {

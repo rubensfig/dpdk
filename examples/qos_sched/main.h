@@ -66,6 +66,25 @@ struct thread_stat
 };
 
 
+/* Backpressure tuning parameters */
+#define BP_THRESHOLD_RATIO 0.005    /* Activate at 5% drop rate */
+#define BP_RECOVERY_RATIO  0.01    /* Recover at 1% drop rate */
+
+/* Per-port statistics struct for backpressure mechanism */
+struct __rte_cache_aligned rte_port_statistics {
+		uint64_t tx;                   /* Total packets transmitted */
+		uint64_t rx;                   /* Total packets received (unused currently) */
+		uint64_t dropped;              /* Total packets dropped by TX buffer */
+		uint64_t last_dropped;         /* Dropped count at last check */
+		uint64_t last_check_tsc;       /* TSC at last backpressure check */
+		uint64_t tsc_hz;               /* TSC frequency for timing */
+		uint64_t drop_window[2];       /* Sliding window: [old_drops, recent_drops] */
+		uint64_t window_start_tsc;     /* When current window started */
+		uint8_t  backpressure_active;  /* 1 if backpressure is currently active */
+		uint8_t  pad[7];               /* Padding for alignment */
+	};
+extern struct rte_port_statistics port_statistics[RTE_MAX_ETHPORTS];
+
 struct thread_conf
 {
 	uint16_t rx_port;

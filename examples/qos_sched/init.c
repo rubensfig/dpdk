@@ -26,6 +26,9 @@ static uint32_t app_inited_port_mask = 0;
 
 int app_pipe_to_profile[MAX_SCHED_SUBPORTS][MAX_SCHED_PIPES];
 
+struct rte_port_statistics port_statistics[RTE_MAX_ETHPORTS];
+
+
 #define MAX_NAME_LEN 32
 
 struct ring_conf ring_conf = {
@@ -211,13 +214,27 @@ static void port_hqos_init(uint16_t port) {
     uint16_t prio = 7;
 
     // pmdlink_add_node(port, qos_nodes[0].teid, prio);
-    pmdlink_set_shaper(port, qos_nodes[0].teid);
+    // pmdlink_set_shaper(port, qos_nodes[0].teid);
     for (int i = 0; qos_nodes[i].teid != 0; i++) {
     	printf("port=%d, teid=%d, parent_teid=%d, queue_id?%d\n",port, qos_nodes[i].teid, qos_nodes[i].parent_teid, qos_nodes[i].tx_queue_id);
 	if (qos_nodes[i].tx_queue_id != 0) {
 		pmdlink_node_priority(port, qos_nodes[i].teid, prio--);
 	}
     }
+}
+
+void
+tx_buffer_count_callback(struct rte_mbuf **pkts, uint16_t unsent,
+				void *userdata)
+{
+	struct rte_port_statistics *stats = (struct rte_port_statistics *)userdata;
+	
+	/* Atomically increment drop counter */
+	__atomic_add_fetch(&stats->dropped, unsent, __ATOMIC_RELAXED);
+	
+	/* Free unsent packets */
+	for (uint16_t i = 0; i < unsent; i++)
+		rte_pktmbuf_free(pkts[i]);
 }
 
 static int
@@ -313,11 +330,26 @@ app_init_port(uint16_t portid, struct rte_mempool *mp, bool hqos_init)
 
 		rte_eth_tx_buffer_init(tx_buffer[portid][i], burst);
 
+		ret = rte_eth_tx_buffer_set_err_callback(tx_buffer[portid][i], 
+				tx_buffer_count_callback, 
+				&port_statistics[portid]);
+
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE,
 				 "rte_eth_tx_queue_setup: err=%d, port=%u queue=%d\n",
 				 ret, portid, i);
 	}
+
+	memset(&port_statistics[portid], 0, sizeof(port_statistics[portid]));
+	port_statistics[portid].tsc_hz = rte_get_tsc_hz();
+	port_statistics[portid].last_check_tsc = rte_get_tsc_cycles();
+	port_statistics[portid].window_start_tsc = rte_get_tsc_cycles();
+	port_statistics[portid].backpressure_active = 0;
+	port_statistics[portid].drop_window[0] = 0;
+	port_statistics[portid].drop_window[1] = 0;
+	
+	printf("Port %u: Backpressure initialized (threshold=%.1f%%, recovery=%.1f%%)\n",
+	       portid, BP_THRESHOLD_RATIO * 100, BP_RECOVERY_RATIO * 100);
 
 	/* Start device */
 	ret = rte_eth_dev_start(portid);
