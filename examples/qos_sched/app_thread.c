@@ -140,11 +140,11 @@ update_backpressure_state(uint16_t port)
 			}
 		}
 		
-		/* Also recover if no drops for extended period (2+ windows) */
+		/* Also recover if no drops for extended period (2+ windows)
 		if (total_drops == 0 && window_elapsed > window_duration * 2) {
 			stats->backpressure_active = 0;
 			printf("Port %u: Backpressure RELEASED (no drops)\n", port);
-		}
+		} */
 	}
 }
 
@@ -268,7 +268,8 @@ app_worker_thread(struct thread_conf **confs)
 		update_backpressure_state(tx_port);
 		// printf("tx_port %d %d\n", tx_port, port_statistics[tx_port].backpressure_active);
 		nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs,
-					burst_conf.qos_dequeue, bp);
+					burst_conf.qos_dequeue, port_statistics[tx_port].backpressure_active);
+					// burst_conf.qos_dequeue, bp);
 
 		if (likely(nb_pkt > 0))
 			while (rte_ring_sp_enqueue_bulk(conf->tx_ring,
