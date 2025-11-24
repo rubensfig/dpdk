@@ -26,6 +26,10 @@ static uint32_t app_inited_port_mask = 0;
 
 int app_pipe_to_profile[MAX_SCHED_SUBPORTS][MAX_SCHED_PIPES];
 
+struct rte_port_statistics port_statistics[RTE_MAX_ETHPORTS];
+struct tc_statistics tc_stats;
+struct tx_callback_ctx tx_ctx[RTE_MAX_ETHPORTS][N_TX_QUEUES];
+
 #define MAX_NAME_LEN 32
 
 struct ring_conf ring_conf = {
@@ -63,7 +67,6 @@ static struct rte_eth_conf port_conf = {
 		.mq_mode = RTE_ETH_MQ_TX_NONE,
 	},
 };
-
 
 typedef uint16_t port_t;
 typedef uint16_t teid_t;
@@ -211,13 +214,33 @@ static void port_hqos_init(uint16_t port) {
     uint16_t prio = 7;
 
     // pmdlink_add_node(port, qos_nodes[0].teid, prio);
-    pmdlink_set_shaper(port, qos_nodes[0].teid);
+    // pmdlink_set_shaper(port, qos_nodes[0].teid);
     for (int i = 0; qos_nodes[i].teid != 0; i++) {
     	printf("port=%d, teid=%d, parent_teid=%d, queue_id?%d\n",port, qos_nodes[i].teid, qos_nodes[i].parent_teid, qos_nodes[i].tx_queue_id);
 	if (qos_nodes[i].tx_queue_id != 0) {
 		pmdlink_node_priority(port, qos_nodes[i].teid, prio--);
 	}
     }
+}
+
+void
+tx_buffer_count_callback(struct rte_mbuf **pkts, uint16_t unsent,
+				void *userdata)
+{
+	struct tx_callback_ctx *ctx = (struct tx_callback_ctx *)userdata;
+	
+	__atomic_add_fetch(&port_statistics[ctx->portid].dropped[ctx->tc_id], unsent, __ATOMIC_RELEASE);
+//% 	/* NEW: Immediately activate BP when drops occur */
+//% 	__atomic_store_n(&port_statistics[ctx->portid].bp_active[ctx->tc_id], 
+//% 						true, __ATOMIC_RELEASE);
+//		
+//	/* Record when this TC last saw drops */
+//	__atomic_store_n(&port_statistics[ctx->portid].last_drop_tsc[ctx->tc_id],
+//						rte_get_tsc_cycles(), __ATOMIC_RELEASE);
+//	
+	/* Free unsent packets */
+	for (uint16_t i = 0; i < unsent; i++)
+		rte_pktmbuf_free(pkts[i]);
 }
 
 static int
@@ -313,11 +336,29 @@ app_init_port(uint16_t portid, struct rte_mempool *mp, bool hqos_init)
 
 		rte_eth_tx_buffer_init(tx_buffer[portid][i], burst);
 
+		/* Setup context: queue i maps to TC i */
+	    	tx_ctx[portid][i].portid = portid;
+		tx_ctx[portid][i].tc_id = i;
+		    
+		ret = rte_eth_tx_buffer_set_err_callback(tx_buffer[portid][i], 
+				tx_buffer_count_callback, 
+				&tx_ctx[portid][i]);
+
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE,
 				 "rte_eth_tx_queue_setup: err=%d, port=%u queue=%d\n",
 				 ret, portid, i);
 	}
+
+	/* Initialize port statistics and backpressure state */
+	memset(&port_statistics[portid], 0, sizeof(struct rte_port_statistics));
+	port_statistics[portid].tsc_hz = rte_get_tsc_hz();
+	port_statistics[portid].last_check_tsc = rte_get_tsc_cycles();
+	
+	RTE_LOG(INFO, APP, "Port %u: Backpressure mechanism initialized\n", portid);
+	RTE_LOG(INFO, APP, "  Check interval: %u us\n", BP_CHECK_INTERVAL_US);
+	RTE_LOG(INFO, APP, "  Activation threshold: %u drops\n", BP_THRESHOLD_RATE);
+	RTE_LOG(INFO, APP, "  Recovery threshold: %u drops\n", BP_RECOVERY_RATE);
 
 	/* Start device */
 	ret = rte_eth_dev_start(portid);

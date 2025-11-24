@@ -72,6 +72,59 @@ static inline int get_pkt_sched(struct rte_mbuf *m, uint32_t *subport, uint32_t 
 	return 0;
 }
 
+/* Track when BP was activated (for time-based recovery) */
+static uint64_t bp_activation_time[RTE_MAX_ETHPORTS][N_TC] = {0};
+#define BP_RECOVERY_TIME_US   1500000
+#define BP_DROP_SILENCE_US 100000  /* Deactivate after 100ms with no drops */
+
+static inline void
+update_backpressure_state(uint16_t port)
+{
+	struct rte_port_statistics *stats = &port_statistics[port];
+	uint64_t now = rte_get_tsc_cycles();
+	uint64_t elapsed = now - stats->last_check_tsc;
+	uint64_t check_interval = (stats->tsc_hz * BP_CHECK_INTERVAL_US) / 1000000;
+	
+	if (elapsed < check_interval)
+		return;
+	
+	stats->last_check_tsc = now;
+	
+	uint64_t rx_now = stats->rx;
+	uint64_t rx_delta = rx_now - stats->last_rx;
+	stats->last_rx = rx_now;
+	
+	for (int tc = 0; tc < N_TC; tc++) {
+		uint64_t dropped = __atomic_load_n(&stats->dropped[tc], __ATOMIC_ACQUIRE);
+		uint64_t last = stats->last_dropped[tc];
+		uint64_t new_drops = (dropped >= last) ? (dropped - last) : dropped;
+		stats->last_dropped[tc] = dropped;
+		
+		double drop_rate = (rx_delta > 0) ? (double)new_drops / (double)rx_delta : 0.0;
+		
+		if (!stats->bp_active[tc]) {
+			// Inactive: activate on high drop rate
+			if (drop_rate >= BP_THRESHOLD_RATE) {
+				stats->bp_active[tc] = true;
+				bp_activation_time[port][tc] = now;
+				RTE_LOG(INFO, APP, 
+				"Port %u TC %d: Backpressure ACTIVATED (drop_rate=%.4f)\n",
+					port, tc, drop_rate);
+				}
+			} else {
+				// Active: deactivate after minimum hold time expires 
+				uint64_t held_cycles = now - bp_activation_time[port][tc];
+				uint64_t min_hold_cycles = (stats->tsc_hz * BP_RECOVERY_TIME_US) / 1000000;
+				
+				if (held_cycles >= min_hold_cycles) {
+				stats->bp_active[tc] = false;
+				RTE_LOG(INFO, APP, "Port %u TC %d: Backpressure DEACTIVATED (held for %luus)\n", port, tc, BP_RECOVERY_TIME_US);
+			}
+			// else: still within minimum hold time, keep BP active
+		}
+	}
+}
+
 void
 app_rx_thread(struct thread_conf **confs)
 {
@@ -111,6 +164,10 @@ app_rx_thread(struct thread_conf **confs)
 					APP_STATS_ADD(conf->stat.nb_drop, 1);
 				} 
 			}
+
+       			if (likely(nb_rx > 0)) {
+				__atomic_add_fetch(&port_statistics[conf->rx_port].rx, nb_rx, __ATOMIC_RELAXED);
+			}
 		}
 		conf_idx++;
 		if (confs[conf_idx] == NULL)
@@ -126,15 +183,16 @@ app_tx_thread(struct thread_conf **confs)
 	int conf_idx = 0;
 	int nb_pkts;
 	struct rte_eth_dev_tx_buffer *buffer;
+	int tx_port;
 
 	while ((conf = confs[conf_idx])) {
 		nb_pkts = rte_ring_sc_dequeue_burst(conf->tx_ring, (void **)mbufs,
 					burst_conf.qos_dequeue, NULL);
 		uint16_t nb_tx = 0;
+		tx_port = conf->tx_port;
 		if (likely(nb_pkts != 0)) {
 			for(int i = 0; i < nb_pkts; i++) {
 				int tx_queue = mbufs[i]->hash.sched.traffic_class;
-				int tx_port = conf->tx_port;
 
 				if (tx_queue > N_TX_QUEUES) {
 					tx_queue = 1;	
@@ -142,13 +200,15 @@ app_tx_thread(struct thread_conf **confs)
 
 				buffer = tx_buffer[tx_port][tx_queue];
 					
-				nb_tx = rte_eth_tx_buffer(tx_port, tx_queue, buffer, mbufs[i]);
+				nb_tx += rte_eth_tx_buffer(tx_port, tx_queue, buffer, mbufs[i]);
 			}
 
 			// nb_tx = rte_eth_tx_burst(conf->tx_port, 0, mbufs, nb_pkts);
 			
-			//  if (nb_pkts != nb_tx)
-			//  	rte_pktmbuf_free_bulk(&mbufs[nb_tx], nb_pkts - nb_tx);
+			// if (nb_pkts != nb_tx) {
+			// 	APP_STATS_ADD(conf->stat.nb_drop, port_statistics[tx_port].dropped);
+			//   	rte_pktmbuf_free_bulk(&mbufs[nb_tx], nb_pkts - nb_tx);
+			// }
 		}
 
 		conf_idx++;
@@ -157,16 +217,18 @@ app_tx_thread(struct thread_conf **confs)
 	}
 }
 
-
 void
 app_worker_thread(struct thread_conf **confs)
 {
 	struct rte_mbuf *mbufs[burst_conf.ring_burst];
 	struct thread_conf *conf;
 	int conf_idx = 0;
+	uint16_t tx_port;
+	int bp = 0;
 
 	while ((conf = confs[conf_idx])) {
 		uint32_t nb_pkt;
+		tx_port = conf->tx_port;
 
 		/* Read packet from the ring */
 		nb_pkt = rte_ring_sc_dequeue_burst(conf->rx_ring, (void **)mbufs,
@@ -179,8 +241,11 @@ app_worker_thread(struct thread_conf **confs)
 			APP_STATS_ADD(conf->stat.nb_rx, nb_pkt);
 		}
 
+		update_backpressure_state(tx_port);
+		// printf("tx_port %d %d\n", tx_port, port_statistics[tx_port].backpressure_active);
 		nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs,
-					burst_conf.qos_dequeue);
+					burst_conf.qos_dequeue, port_statistics[tx_port].bp_active);
+					// burst_conf.qos_dequeue, bp);
 
 		if (likely(nb_pkt > 0))
 			while (rte_ring_sp_enqueue_bulk(conf->tx_ring,
@@ -200,6 +265,7 @@ app_mixed_thread(struct thread_conf **confs)
 	struct rte_mbuf *mbufs[burst_conf.ring_burst];
 	struct thread_conf *conf;
 	int conf_idx = 0;
+	uint16_t tx_port;
 
 	while ((conf = confs[conf_idx])) {
 		uint32_t nb_pkt;
@@ -217,7 +283,7 @@ app_mixed_thread(struct thread_conf **confs)
 
 
 		nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs,
-					burst_conf.qos_dequeue);
+					burst_conf.qos_dequeue, true);
 		if (likely(nb_pkt > 0)) {
 			uint16_t nb_tx = rte_eth_tx_burst(conf->tx_port, 0, mbufs, nb_pkt);
 			if (nb_tx != nb_pkt)

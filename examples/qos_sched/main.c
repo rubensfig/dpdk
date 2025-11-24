@@ -55,6 +55,7 @@ app_main_loop(__rte_unused void *dummy)
 
 		if (flow->rx_core == lcore_id) {
 			flow->rx_thread.rx_port = flow->rx_port;
+			flow->rx_thread.tx_port = flow->tx_port;
 			flow->rx_thread.rx_ring =  flow->rx_ring;
 			flow->rx_thread.rx_queue = flow->rx_queue;
 			flow->rx_thread.sched_port = flow->sched_port;
@@ -64,6 +65,7 @@ app_main_loop(__rte_unused void *dummy)
 			mode |= APP_RX_MODE;
 		}
 		if (flow->tx_core == lcore_id) {
+			flow->tx_thread.rx_port = flow->rx_port;
 			flow->tx_thread.tx_port = flow->tx_port;
 			flow->tx_thread.tx_ring =  flow->tx_ring;
 			flow->tx_thread.tx_queue = flow->tx_queue;
@@ -156,10 +158,11 @@ app_stat(void)
 		memcpy(&rx_stats[i], &stats, sizeof(stats));
 
 		rte_eth_stats_get(flow->tx_port, &stats);
-		printf("TX port %"PRIu16": tx: %" PRIu64 " err: %" PRIu64 "\n",
+		printf("TX port %"PRIu16": tx: %" PRIu64 " err: %" PRIu64 " dropped: %" PRIu64 "\n",
 				flow->tx_port,
 				stats.opackets - tx_stats[i].opackets,
-				stats.oerrors - tx_stats[i].oerrors);
+				stats.oerrors - tx_stats[i].oerrors,
+				port_statistics[flow->tx_port].dropped[1]);
 		memcpy(&tx_stats[i], &stats, sizeof(stats));
 
 #if APP_COLLECT_STAT

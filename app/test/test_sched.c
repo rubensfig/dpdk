@@ -174,7 +174,7 @@ test_sched(void)
 	err = rte_sched_port_enqueue(port, in_mbufs, 10);
 	TEST_ASSERT_EQUAL(err, 10, "Wrong enqueue, err=%d\n", err);
 
-	err = rte_sched_port_dequeue(port, out_mbufs, 10);
+	err = rte_sched_port_dequeue(port, out_mbufs, 10, true);
 	TEST_ASSERT_EQUAL(err, 10, "Wrong dequeue, err=%d\n", err);
 
 	for (i = 0; i < 10; i++) {

@@ -64,7 +64,7 @@ rte_port_sched_reader_rx(void *port, struct rte_mbuf **pkts, uint32_t n_pkts)
 	struct rte_port_sched_reader *p = port;
 	uint32_t nb_rx;
 
-	nb_rx = rte_sched_port_dequeue(p->sched, pkts, n_pkts);
+	nb_rx = rte_sched_port_dequeue(p->sched, pkts, n_pkts, true);
 	RTE_PORT_SCHED_READER_PKTS_IN_ADD(p, nb_rx);
 
 	return nb_rx;

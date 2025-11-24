@@ -58,12 +58,61 @@ extern "C" {
 #define APP_QAVG_PERIOD 100
 
 #define N_TX_QUEUES 2
+#define N_TC 2
 
 struct thread_stat
 {
 	uint64_t nb_rx;
 	uint64_t nb_drop;
 };
+
+/* Backpressure tuning parameters */
+#define BP_CHECK_INTERVAL_US 100
+#define BP_THRESHOLD_RATE 0.01    /* Activate at 5% drop rate */
+#define BP_RECOVERY_RATE  0.15    /* Recover at 1% drop rate */
+
+
+/* Global per-TC drop counters (aggregated across all ports) */
+struct tc_statistics {
+	uint64_t dropped[N_TC];  /* Atomically updated drop counts per TC */
+} __rte_cache_aligned;
+
+extern struct tc_statistics tc_stats;
+
+/* Per-port statistics for backpressure mechanism */
+struct rte_port_statistics {
+	/* Drop tracking */
+	uint64_t last_dropped[N_TC];   /* Previous dropped count per TC */
+	uint64_t dropped[N_TC];  /* Atomically updated drop counts per TC */
+
+	/* Statistics */
+	uint64_t last_tx[N_TC];
+	uint64_t tx[N_TC];
+	uint64_t last_rx;
+	uint64_t rx;
+
+	
+	/* Timing */
+	uint64_t last_check_tsc;       /* TSC of last BP check */
+	uint64_t tsc_hz;               /* TSC frequency */
+	
+	/* Backpressure state per TC */
+	bool bp_active[N_TC];          /* true if BP currently active for this TC */
+
+	uint64_t last_drop_tsc[N_TC];  /* TSC when this TC last had drops */
+
+} __rte_cache_aligned;
+
+/* TX buffer callback context with TC information */
+struct tx_callback_ctx {
+	uint16_t portid;  /* Port ID for logging/debugging */
+	uint8_t tc_id;    /* Traffic class ID (maps to queue ID) */
+};
+
+extern struct tx_callback_ctx tx_ctx[RTE_MAX_ETHPORTS][N_TX_QUEUES];
+extern struct rte_port_statistics port_statistics[RTE_MAX_ETHPORTS];
+
+void tx_buffer_count_callback(struct rte_mbuf **pkts, uint16_t unsent, void *userdata);
 
 
 struct thread_conf
