@@ -162,7 +162,7 @@ app_stat(void)
 				flow->tx_port,
 				stats.opackets - tx_stats[i].opackets,
 				stats.oerrors - tx_stats[i].oerrors,
-				port_statistics[flow->tx_port].dropped[1]);
+				port_statistics[flow->tx_port].dropped_retry[1]);
 		memcpy(&tx_stats[i], &stats, sizeof(stats));
 
 #if APP_COLLECT_STAT

@@ -229,19 +229,48 @@ tx_buffer_count_callback(struct rte_mbuf **pkts, uint16_t unsent,
 {
 	struct tx_callback_ctx *ctx = (struct tx_callback_ctx *)userdata;
 	
-	__atomic_add_fetch(&port_statistics[ctx->portid].dropped[ctx->tc_id], unsent, __ATOMIC_RELEASE);
-//% 	/* NEW: Immediately activate BP when drops occur */
-//% 	__atomic_store_n(&port_statistics[ctx->portid].bp_active[ctx->tc_id], 
-//% 						true, __ATOMIC_RELEASE);
-//		
-//	/* Record when this TC last saw drops */
-//	__atomic_store_n(&port_statistics[ctx->portid].last_drop_tsc[ctx->tc_id],
-//						rte_get_tsc_cycles(), __ATOMIC_RELEASE);
-//	
-	/* Free unsent packets */
-	for (uint16_t i = 0; i < unsent; i++)
-		rte_pktmbuf_free(pkts[i]);
+	if (unsent == 0)
+		return;
+	
+	/* --- 1. Count tentative drops --- */
+	__atomic_add_fetch(&port_statistics[ctx->portid].dropped[ctx->tc_id],
+					   unsent, __ATOMIC_RELEASE);
+
+	/* --- 3. Retry immediately (main loop will now stop sending more) --- */
+	uint16_t remaining = unsent;
+
+	uint16_t sent = rte_eth_tx_burst( ctx->portid, ctx->tc_id, pkts, remaining);
+	remaining -= sent;
+
+	__atomic_add_fetch(&port_statistics[ctx->portid].dropped_retry[ctx->tc_id],
+					   remaining, __ATOMIC_RELEASE);
+
+	/* --- 4. Free whatever still remains --- */
+       for (uint16_t i = 0; i < remaining; i++)
+		rte_pktmbuf_free(pkts[sent + i]);
 }
+
+static void initialize_port_statistics(uint16_t port)
+{
+	struct rte_port_statistics *stats = &port_statistics[port];
+	uint64_t hz = rte_get_tsc_hz();
+	
+	for (int tc = 0; tc < N_TC; tc++) {
+		stats->dropped[tc] = 0;
+		stats->last_dropped[tc] = 0;
+		stats->tx[tc] = 0;
+		stats->last_tx[tc] = 0;
+		stats->subport_capacity[tc] = 100;
+		stats->bp_active[tc] = false;
+		stats->last_drop_tsc[tc] = 0;
+	}
+	
+	stats->rx = 0;
+	stats->last_rx = 0;
+	stats->tsc_hz = hz;
+	stats->last_check_tsc = rte_get_tsc_cycles();
+}
+
 
 static int
 app_init_port(uint16_t portid, struct rte_mempool *mp, bool hqos_init)
@@ -350,15 +379,12 @@ app_init_port(uint16_t portid, struct rte_mempool *mp, bool hqos_init)
 				 ret, portid, i);
 	}
 
-	/* Initialize port statistics and backpressure state */
-	memset(&port_statistics[portid], 0, sizeof(struct rte_port_statistics));
-	port_statistics[portid].tsc_hz = rte_get_tsc_hz();
-	port_statistics[portid].last_check_tsc = rte_get_tsc_cycles();
+	initialize_port_statistics(portid);
 	
-	RTE_LOG(INFO, APP, "Port %u: Backpressure mechanism initialized\n", portid);
-	RTE_LOG(INFO, APP, "  Check interval: %u us\n", BP_CHECK_INTERVAL_US);
-	RTE_LOG(INFO, APP, "  Activation threshold: %u drops\n", BP_THRESHOLD_RATE);
-	RTE_LOG(INFO, APP, "  Recovery threshold: %u drops\n", BP_RECOVERY_RATE);
+	// RTE_LOG(INFO, APP, "Port %u: Backpressure mechanism initialized\n", portid);
+	// RTE_LOG(INFO, APP, "  Check interval: %u us\n", BP_CHECK_INTERVAL_US);
+	// RTE_LOG(INFO, APP, "  Activation threshold: %u drops\n", BP_THRESHOLD_RATE);
+	// RTE_LOG(INFO, APP, "  Recovery threshold: %u drops\n", BP_RECOVERY_RATE);
 
 	/* Start device */
 	ret = rte_eth_dev_start(portid);

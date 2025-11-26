@@ -67,10 +67,17 @@ struct thread_stat
 };
 
 /* Backpressure tuning parameters */
-#define BP_CHECK_INTERVAL_US 100
-#define BP_THRESHOLD_RATE 0.01    /* Activate at 5% drop rate */
-#define BP_RECOVERY_RATE  0.15    /* Recover at 1% drop rate */
+/* Backpressure tuning parameters */
+#define BP_CHECK_INTERVAL_US        10          /* Check frequency */
+#define BP_ACTIVATE_THRESHOLD       0.001       /* 0.1% to activate */
+#define BP_ZERO_DROP_WINDOW_US      100000      /* 100ms zero-drop window before recovery */
+#define BP_RECOVERY_TIME_US         1000000     /* 1s hold time before recovery starts */
 
+#define BP_ABSOLUTE_MIN_PCT         50          /* Never reduce below 20% */
+#define BP_RECOVERY_STEP_PCT        2           /* Slow recovery: +2% per interval */
+
+/* Derived from existing constants, kept for compatibility */
+#define BP_CAPACITY_MIN_PCT         30          /* Used if needed for safe recovery min */
 
 /* Global per-TC drop counters (aggregated across all ports) */
 struct tc_statistics {
@@ -79,27 +86,30 @@ struct tc_statistics {
 
 extern struct tc_statistics tc_stats;
 
+typedef enum {
+	BP_INACTIVE,      /* Normal operation, full capacity */
+	BP_REDUCING,      /* Actively reducing capacity due to drops */
+	BP_HOLDING,       /* Reduced capacity, waiting for stability */
+	BP_RECOVERING     /* Gradually increasing capacity back */
+} bp_state_t;
+
 /* Per-port statistics for backpressure mechanism */
 struct rte_port_statistics {
-	/* Drop tracking */
-	uint64_t last_dropped[N_TC];   /* Previous dropped count per TC */
-	uint64_t dropped[N_TC];  /* Atomically updated drop counts per TC */
-
-	/* Statistics */
+	uint64_t last_dropped[N_TC];
+	uint64_t dropped[N_TC];
+	uint64_t dropped_retry[N_TC];
 	uint64_t last_tx[N_TC];
 	uint64_t tx[N_TC];
 	uint64_t last_rx;
 	uint64_t rx;
-
-	
-	/* Timing */
-	uint64_t last_check_tsc;       /* TSC of last BP check */
-	uint64_t tsc_hz;               /* TSC frequency */
-	
-	/* Backpressure state per TC */
-	bool bp_active[N_TC];          /* true if BP currently active for this TC */
-
-	uint64_t last_drop_tsc[N_TC];  /* TSC when this TC last had drops */
+	uint64_t last_check_tsc;
+	uint64_t tsc_hz;
+	bool bp_active[N_TC];
+	uint32_t subport_capacity[N_TC];
+	uint64_t last_drop_tsc[N_TC];
+	uint64_t state_enter_time[N_TC];
+	bp_state_t bp_state[N_TC];
+	uint64_t zero_drop_start_time[N_TC];
 
 } __rte_cache_aligned;
 

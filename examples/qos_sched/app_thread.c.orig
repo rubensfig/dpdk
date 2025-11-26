@@ -72,118 +72,111 @@ static inline int get_pkt_sched(struct rte_mbuf *m, uint32_t *subport, uint32_t 
 	return 0;
 }
 
-/* Track when BP was activated (for time-based recovery) */
-static uint64_t bp_activation_time[RTE_MAX_ETHPORTS][N_TC] = {0};
+typedef struct {
+	uint64_t rate_bps;        // dynamically adjusted
+	uint64_t tokens;
+	uint64_t last_tsc;
+	uint64_t tsc_hz;
+} sw_shaper_t;
 
-static inline void update_backpressure_state(uint16_t port) {
+
+static inline int sw_shaper_allow(sw_shaper_t *s, uint32_t pkt_len_bytes)
+{
+	uint64_t now = rte_rdtsc();
+	uint64_t elapsed = now - s->last_tsc;
+	s->last_tsc = now;
+	
+	// refill tokens: rate_bps / 8 bytes per second
+	uint64_t token_add = (elapsed * (s->rate_bps/8)) / s->tsc_hz;
+	s->tokens += token_add;
+	
+	// cap bucket
+	if (s->tokens > (s->rate_bps/8))
+	s->tokens = (s->rate_bps/8);
+	
+	// need pkt_len_bytes tokens to send
+	if (s->tokens >= pkt_len_bytes) {
+	s->tokens -= pkt_len_bytes;
+	return 1;
+	}
+	
+	return 0; // not enough tokens, drop or defer
+}
+
+/**
+ * Update backpressure state based on packet drop rate
+ * 
+ * This function monitors the TX drop rate and activates/deactivates
+ * backpressure to prevent overwhelming the NIC TX capacity.
+ */
+static inline void
+update_backpressure_state(uint16_t port)
+{
 	struct rte_port_statistics *stats = &port_statistics[port];
 	uint64_t now = rte_get_tsc_cycles();
 	uint64_t elapsed = now - stats->last_check_tsc;
-	uint64_t check_interval = (stats->tsc_hz * BP_CHECK_INTERVAL_US) / 1000000;
 	
+	/* Check every 100us to avoid excessive overhead */
+	uint64_t check_interval = stats->tsc_hz / 10000;
 	if (elapsed < check_interval)
-	return;
+		return;
 	
 	stats->last_check_tsc = now;
 	
-	/* Calculate RX delta */
-	uint64_t rx_now = stats->rx;
-	uint64_t rx_delta = rx_now - stats->last_rx;
-	stats->last_rx = rx_now;
+	/* Calculate drops since last check */
+	uint64_t current_dropped = __atomic_load_n(&stats->dropped, __ATOMIC_RELAXED);
+	uint64_t new_drops = current_dropped - stats->last_dropped;
+	stats->last_dropped = current_dropped;
 	
-	for (int tc = 0; tc < N_TC; tc++) {
-		uint64_t dropped = __atomic_load_n(&stats->dropped[tc], __ATOMIC_ACQUIRE);
-		uint64_t new_drops = (dropped >= stats->last_dropped[tc]) ? (dropped - stats->last_dropped[tc]) : dropped;
-		stats->last_dropped[tc] = dropped;
-		
-		double drop_rate = (rx_delta > 0) ? (double)new_drops / (double)rx_delta : 0.0;
-		double drop_rate_pct = drop_rate * 100.0;
-		
-		switch (stats->bp_state[tc]) {
-		case BP_INACTIVE:
-			/* Monitor for drop threshold */
-			if (drop_rate >= BP_ACTIVATE_THRESHOLD) {
-				RTE_LOG(INFO, APP, "Port %u TC %d: BP ACTIVATED (%.4f%% drops)\n", 
-				port, tc, drop_rate_pct);
-				stats->bp_state[tc] = BP_REDUCING;
-				stats->state_enter_time[tc] = now;
-				stats->subport_capacity[tc] = 90;  /* Start at 90% */
-				stats->zero_drop_start_time[tc] = 0;
-				}
-		break;
-		
-		case BP_REDUCING:
-			/* Aggressively reduce capacity on any drops */
-			// if (new_drops > 0) {
-			if (true) {
-				uint32_t reduction = RTE_MIN(10, (uint32_t)(drop_rate_pct * 2 + 2));
-
-				stats->subport_capacity[tc] -= reduction;
-				if (stats->subport_capacity[tc] < BP_ABSOLUTE_MIN_PCT)
-					stats->subport_capacity[tc] = BP_ABSOLUTE_MIN_PCT;
-
-				// RTE_LOG(INFO, APP, "Port %u TC %d: Reducing to %u%% (%u drops, %.4f%% rate)\n", port, tc, stats->subport_capacity[tc], (uint32_t)new_drops, drop_rate_pct);
-				stats->zero_drop_start_time[tc] = 0;  /* Reset stability window */
-
-				} else {
-					/* No drops detected, start tracking stability */
-					if (stats->zero_drop_start_time[tc] == 0) {
-					stats->zero_drop_start_time[tc] = now;
-					}
-				
-					uint64_t stable_duration = now - stats->zero_drop_start_time[tc];
-					uint64_t min_stable = (stats->tsc_hz * BP_ZERO_DROP_WINDOW_US) / 1000000;
-					
-					if (stable_duration >= min_stable) {
-						RTE_LOG(INFO, APP, "Port %u TC %d: Transitioning to HOLDING\n", port, tc);
-						stats->bp_state[tc] = BP_HOLDING;
-						stats->state_enter_time[tc] = now;
-					}
+	/* Sliding window management (2 windows for smoothing) */
+	uint64_t window_elapsed = now - stats->window_start_tsc;
+	uint64_t window_duration = stats->tsc_hz / 1000; /* 1ms windows */
+	
+	if (window_elapsed >= window_duration) {
+		/* Shift window */
+		stats->drop_window[0] = stats->drop_window[1];
+		stats->drop_window[1] = new_drops;
+		stats->window_start_tsc = now;
+	} else {
+		/* Accumulate in current window */
+		stats->drop_window[1] += new_drops;
+	}
+	
+	/* Calculate total drops and TX over both windows */
+	uint64_t total_drops = stats->drop_window[0] + stats->drop_window[1];
+	uint64_t total_tx = __atomic_load_n(&stats->tx, __ATOMIC_RELAXED);
+	
+	/* Backpressure activation/deactivation logic with hysteresis */
+	if (!stats->backpressure_active) {
+		/* Activate backpressure if drop rate exceeds threshold */
+		if (total_tx > 1000) { /* Minimum sample size */
+			double drop_rate = (double)total_drops / (double)total_tx;
+			if (drop_rate > BP_THRESHOLD_RATIO) {
+				stats->backpressure_active = 1;
+				printf("Port %u: Backpressure ACTIVE (drop rate: %.2f%%)\n",
+				       port, drop_rate * 100);
 			}
-		break;
+		}
+	} else {
+		/* Deactivate backpressure if drop rate falls below recovery threshold */
+		if (total_tx > 1000) {
+			double drop_rate = (double)total_drops / (double)total_tx;
+			if (drop_rate < BP_RECOVERY_RATIO) {
+				stats->backpressure_active = 0;
+				stats->drop_window[0] = 0;
+				stats->drop_window[1] = 0;
+				printf("Port %u: Backpressure RELEASED (drop rate: %.2f%%)\n",
+				       port, drop_rate * 100);
+			}
+		}
 		
-		case BP_HOLDING:
-			/* Hold reduced capacity to confirm stability */
-			if (new_drops > 0) {
-				/* Drops during hold period, go back to aggressive reduction */
-				RTE_LOG(INFO, APP, "Port %u TC %d: Drops during hold, back to REDUCING\n", port, tc);
-				stats->bp_state[tc] = BP_REDUCING;
-				stats->state_enter_time[tc] = now;
-				stats->zero_drop_start_time[tc] = 0;
-			} else {
-				uint64_t held_duration = now - stats->state_enter_time[tc];
-				uint64_t min_hold = (stats->tsc_hz * BP_RECOVERY_TIME_US) / 1000000;
-				
-				if (held_duration >= min_hold) {
-					RTE_LOG(INFO, APP, "Port %u TC %d: Transitioning to RECOVERING (capacity %u%%)\n", 
-					port, tc, stats->subport_capacity[tc]);
-					stats->bp_state[tc] = BP_RECOVERING;
-					stats->state_enter_time[tc] = now;
-				}
-			}
-		break;
-		
-		case BP_RECOVERING:
-			if (new_drops > 0) {
-			/* Drops during recovery, go back to reduction */
-			RTE_LOG(INFO, APP, "Port %u TC %d: Drops during recovery, back to REDUCING\n", port, tc);
-			stats->bp_state[tc] = BP_REDUCING;
-			stats->state_enter_time[tc] = now;
-			stats->zero_drop_start_time[tc] = 0;
-			} else {
-			/* Gradually recover capacity */
-			stats->subport_capacity[tc] += BP_RECOVERY_STEP_PCT;
-			if (stats->subport_capacity[tc] >= 100) {
-			stats->subport_capacity[tc] = 100;
-			stats->bp_state[tc] = BP_INACTIVE;
-			RTE_LOG(INFO, APP, "Port %u TC %d: BP DEACTIVATED (recovered to 100%%)\n", port, tc);
-					}
-			}
-		break;
-			}
+		/* Also recover if no drops for extended period (2+ windows) */
+		if (total_drops == 0 && window_elapsed > window_duration * 2) {
+			stats->backpressure_active = 0;
+			printf("Port %u: Backpressure RELEASED (no drops)\n", port);
+		}
 	}
 }
-
 
 void
 app_rx_thread(struct thread_conf **confs)
@@ -223,10 +216,6 @@ app_rx_thread(struct thread_conf **confs)
 
 					APP_STATS_ADD(conf->stat.nb_drop, 1);
 				} 
-			}
-
-       			if (likely(nb_rx > 0)) {
-				__atomic_add_fetch(&port_statistics[conf->rx_port].rx, nb_rx, __ATOMIC_RELAXED);
 			}
 		}
 		conf_idx++;
@@ -277,6 +266,7 @@ app_tx_thread(struct thread_conf **confs)
 	}
 }
 
+
 void
 app_worker_thread(struct thread_conf **confs)
 {
@@ -284,11 +274,9 @@ app_worker_thread(struct thread_conf **confs)
 	struct thread_conf *conf;
 	int conf_idx = 0;
 	uint16_t tx_port;
-	int bp = 0;
 
 	while ((conf = confs[conf_idx])) {
 		uint32_t nb_pkt;
-		tx_port = conf->tx_port;
 
 		/* Read packet from the ring */
 		nb_pkt = rte_ring_sc_dequeue_burst(conf->rx_ring, (void **)mbufs,
@@ -301,17 +289,16 @@ app_worker_thread(struct thread_conf **confs)
 			APP_STATS_ADD(conf->stat.nb_rx, nb_pkt);
 		}
 
-		update_backpressure_state(tx_port);
-		// printf("tx_port %d %d\n", tx_port, port_statistics[tx_port].backpressure_active);
-		nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs,
-					burst_conf.qos_dequeue, port_statistics[tx_port].subport_capacity);
-					// burst_conf.qos_dequeue, bp);
++		if (likely(!port_statistics[tx_port].backpressure_active)) {
+			nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs,
+						burst_conf.qos_dequeue);
 
-		if (likely(nb_pkt > 0))
-			while (rte_ring_sp_enqueue_bulk(conf->tx_ring,
-					(void **)mbufs, nb_pkt, NULL) == 0)
-				; /* empty body */
+			if (likely(nb_pkt > 0))
+				while (rte_ring_sp_enqueue_bulk(conf->tx_ring,
+						(void **)mbufs, nb_pkt, NULL) == 0)
+					; /* empty body */
 
+		}
 		conf_idx++;
 		if (confs[conf_idx] == NULL)
 			conf_idx = 0;
@@ -325,7 +312,6 @@ app_mixed_thread(struct thread_conf **confs)
 	struct rte_mbuf *mbufs[burst_conf.ring_burst];
 	struct thread_conf *conf;
 	int conf_idx = 0;
-	uint16_t tx_port;
 
 	while ((conf = confs[conf_idx])) {
 		uint32_t nb_pkt;
@@ -343,7 +329,7 @@ app_mixed_thread(struct thread_conf **confs)
 
 
 		nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs,
-					burst_conf.qos_dequeue, true);
+					burst_conf.qos_dequeue);
 		if (likely(nb_pkt > 0)) {
 			uint16_t nb_tx = rte_eth_tx_burst(conf->tx_port, 0, mbufs, nb_pkt);
 			if (nb_tx != nb_pkt)

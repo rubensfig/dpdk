@@ -2328,7 +2328,7 @@ grinder_credits_update(struct rte_sched_port *port,
 
 static inline void
 grinder_credits_update_with_tc_ov(struct rte_sched_port *port,
-	struct rte_sched_subport *subport, uint32_t pos)
+	struct rte_sched_subport *subport, uint32_t pos, uint32_t *capacity_pct)
 {
 	struct rte_sched_grinder *grinder = subport->grinder + pos;
 	struct rte_sched_pipe *pipe = grinder->pipe;
@@ -2354,8 +2354,16 @@ grinder_credits_update_with_tc_ov(struct rte_sched_port *port,
 		subport->tc_ov_wm =
 			grinder_tc_ov_credits_update(port, subport, pos);
 
-		for (i = 0; i < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; i++)
-			subport->tc_credits[i] = sp->tc_credits_per_period[i];
+		for (i = 0; i < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; i++) {
+		    uint64_t base_credits = sp->tc_credits_per_period[i];
+
+		    /* Apply backpressure capacity reduction to TC credits */
+		    if (capacity_pct && capacity_pct[i] < 100) {
+			base_credits = (base_credits * capacity_pct[i]) / 100;
+		    }
+			    
+		    subport->tc_credits[i] = base_credits;
+		}
 
 		subport->tc_time = port->time + sp->tc_period;
 		subport->tc_ov_period_id++;
@@ -2378,7 +2386,7 @@ grinder_credits_update_with_tc_ov(struct rte_sched_port *port,
 
 static inline int
 grinder_credits_check(struct rte_sched_port *port,
-	struct rte_sched_subport *subport, uint32_t pos, bool *bp)
+	struct rte_sched_subport *subport, uint32_t pos, uint32_t *capacity_pct)
 {
 	struct rte_sched_grinder *grinder = subport->grinder + pos;
 	struct rte_sched_pipe *pipe = grinder->pipe;
@@ -2400,8 +2408,12 @@ grinder_credits_check(struct rte_sched_port *port,
 	if (!enough_credits)
 		return 0;
 
-	if (bp[tc_index] == true)
-		return 0;
+	if (capacity_pct) {
+		uint32_t cap = capacity_pct[tc_index];
+		if (cap < 100 && (rte_rand() % 100) >= cap) {
+			return 0;
+		}
+	}
 
 	/* Update pipe and subport credits */
 	subport->tb_credits -= pkt_len;
@@ -2414,7 +2426,7 @@ grinder_credits_check(struct rte_sched_port *port,
 
 static inline int
 grinder_credits_check_with_tc_ov(struct rte_sched_port *port,
-	struct rte_sched_subport *subport, uint32_t pos, bool *bp)
+	struct rte_sched_subport *subport, uint32_t pos, uint32_t *capacity_pct)
 {
 	struct rte_sched_grinder *grinder = subport->grinder + pos;
 	struct rte_sched_pipe *pipe = grinder->pipe;
@@ -2448,8 +2460,14 @@ grinder_credits_check_with_tc_ov(struct rte_sched_port *port,
 	if (!enough_credits)
 		return 0;
 
-	if (bp[tc_index] == true)
-		subport->tc_credits[tc_index] -= 100000000;
+	/*
+	if (capacity_pct) {
+		uint32_t cap = capacity_pct[tc_index];
+		if (cap < 100 && (rte_rand() % 100) >= cap) {
+			return 0;
+		}
+	}
+	*/
 
 	/* Update pipe and subport credits */
 	subport->tb_credits -= pkt_len;
@@ -2464,7 +2482,7 @@ grinder_credits_check_with_tc_ov(struct rte_sched_port *port,
 
 static inline int
 grinder_schedule(struct rte_sched_port *port,
-	struct rte_sched_subport *subport, uint32_t pos, bool *bp)
+	struct rte_sched_subport *subport, uint32_t pos, uint32_t *capacity_pct)
 {
 	struct rte_sched_grinder *grinder = subport->grinder + pos;
 	struct rte_sched_queue *queue = grinder->queue[grinder->qpos];
@@ -2474,10 +2492,10 @@ grinder_schedule(struct rte_sched_port *port,
 	uint32_t be_tc_active;
 
 	if (subport->tc_ov_enabled) {
-		if (!grinder_credits_check_with_tc_ov(port, subport, pos, bp))
+		if (!grinder_credits_check_with_tc_ov(port, subport, pos, capacity_pct))
 			return 0;
 	} else {
-		if (!grinder_credits_check(port, subport, pos, bp))
+		if (!grinder_credits_check(port, subport, pos, capacity_pct))
 			return 0;
 	}
 
@@ -2818,7 +2836,7 @@ grinder_prefetch_mbuf(struct rte_sched_subport *subport, uint32_t pos)
 
 static inline uint32_t
 grinder_handle(struct rte_sched_port *port,
-	struct rte_sched_subport *subport, uint32_t pos, bool *bp)
+	struct rte_sched_subport *subport, uint32_t pos, uint32_t *capacity_pct)
 {
 	struct rte_sched_grinder *grinder = subport->grinder + pos;
 
@@ -2847,7 +2865,7 @@ grinder_handle(struct rte_sched_port *port,
 		grinder_prefetch_tc_queue_arrays(subport, pos);
 
 		if (subport->tc_ov_enabled)
-			grinder_credits_update_with_tc_ov(port, subport, pos);
+			grinder_credits_update_with_tc_ov(port, subport, pos, capacity_pct);
 		else
 			grinder_credits_update(port, subport, pos);
 
@@ -2867,7 +2885,7 @@ grinder_handle(struct rte_sched_port *port,
 	{
 		uint32_t wrr_active, result = 0;
 
-		result = grinder_schedule(port, subport, pos, bp);
+		result = grinder_schedule(port, subport, pos, capacity_pct);
 
 		wrr_active = (grinder->tc_index == RTE_SCHED_TRAFFIC_CLASS_BE);
 
@@ -2963,7 +2981,7 @@ rte_sched_port_exceptions(struct rte_sched_subport *subport, int second_pass)
 }
 
 int
-rte_sched_port_dequeue(struct rte_sched_port *port, struct rte_mbuf **pkts, uint32_t n_pkts, bool *bp)
+rte_sched_port_dequeue(struct rte_sched_port *port, struct rte_mbuf **pkts, uint32_t n_pkts, uint32_t *capacity_pct)
 {
 	struct rte_sched_subport *subport;
 	uint32_t subport_id = port->subport_id;
@@ -2979,7 +2997,7 @@ rte_sched_port_dequeue(struct rte_sched_port *port, struct rte_mbuf **pkts, uint
 		subport = port->subports[subport_id];
 
 		count += grinder_handle(port, subport,
-				i & (RTE_SCHED_PORT_N_GRINDERS - 1), bp);
+				i & (RTE_SCHED_PORT_N_GRINDERS - 1), capacity_pct);
 
 		if (count == n_pkts) {
 			subport_id++;
