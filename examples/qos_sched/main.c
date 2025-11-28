@@ -147,6 +147,8 @@ app_stat(void)
 	for(i = 0; i < nb_pfc; i++) {
 		struct flow_conf *flow = &qos_conf[i];
 
+		uint64_t dropped = __atomic_load_n( &port_statistics[flow->tx_port].dropped[1], __ATOMIC_RELAXED);
+
 		rte_eth_stats_get(flow->rx_port, &stats);
 		printf("\nRX port %"PRIu16": rx: %"PRIu64 " err: %"PRIu64
 				" no_mbuf: %"PRIu64 " missed: %"PRIu64 "\n",
@@ -162,7 +164,7 @@ app_stat(void)
 				flow->tx_port,
 				stats.opackets - tx_stats[i].opackets,
 				stats.oerrors - tx_stats[i].oerrors,
-				port_statistics[flow->tx_port].dropped_retry[1]);
+				dropped);
 		memcpy(&tx_stats[i], &stats, sizeof(stats));
 
 #if APP_COLLECT_STAT

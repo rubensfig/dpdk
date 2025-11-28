@@ -1,8 +1,11 @@
 /* SPDX-License-Identifier: BSD-3-Clause
  * Copyright(c) 2010-2014 Intel Corporation
+ * Modified for Load-Aware Backpressure Control
  */
 
 #include <stdint.h>
+#include <time.h>
+#include <string.h>
 
 #include <rte_log.h>
 #include <rte_mbuf.h>
@@ -13,31 +16,146 @@
 #include <rte_byteorder.h>
 #include <rte_branch_prediction.h>
 #include <rte_sched.h>
+#include <rte_ring.h>
 
 #include "main.h"
 
-/*
- * QoS parameters are encoded as follows:
- *		Outer VLAN ID defines subport
- *		Inner VLAN ID defines pipe
- *		Destination IP host (0.0.0.XXX) defines queue
- * Values below define offset to each field from start of frame
- */
-// VLAN offload ON {
+/* Backpressure configuration */
+#define HIGH_WATER_MARK 60      /* Queue occupancy threshold (%) */
+#define LOW_WATER_MARK 20       /* Queue occupancy for recovery (%) */
+#define CAPACITY_REDUCTION_STEP 10  /* Reduce by 10% per step */
+#define MIN_CAPACITY 50         /* Minimum capacity: 30% */
+
+/* VLAN offsets */
 #define SUBPORT_OFFSET	5
-#define PIPE_OFFSET	16
+#define PIPE_OFFSET	12
 #define QUEUE_OFFSET	7
 #define COLOR_OFFSET	19
-// }
 
-// Switchdev VLAN offload off {
-// #define SUBPORT_OFFSET	7
-// #define PIPE_OFFSET	18
-// #define QUEUE_OFFSET	9
-// #define COLOR_OFFSET	19
-// }
 
-static inline int get_pkt_sched(struct rte_mbuf *m, uint32_t *subport, uint32_t *pipe,
+/* Global array of port statistics */
+static uint32_t num_ports = 0;
+
+/**
+ * update_backpressure_state()
+ * 
+ * Monitor thread load and manage backpressure capacity.
+ * Calculates load from packets processed between enqueue/dequeue.
+ * Updates subport_capacity for rte_sched dequeue control.
+ * 
+ * Parameters:
+ *   tx_port: Output port to control
+ * 
+ * Returns: void
+ * 
+ * Thread load calculation:
+ *   load = packets_dequeued / packets_enqueued
+ *   if load > 0.8: entering overload
+ *   if load < 0.3: exiting overload (recovery)
+ */
+
+static inline void
+update_backpressure_state(uint32_t tx_port)
+{
+	port_statistics_t *port_stats = &port_statistics[tx_port];
+	thread_load_stats_t *load = &port_stats->load_stats;
+	// port_backpressure_state_t *bp = &port_stats->backpressure;
+	
+	uint64_t current_time = rte_get_timer_cycles();
+	uint64_t hz = rte_get_timer_hz();
+	uint64_t time_delta_us =
+	((current_time - load->last_update_time) * 1000000) / hz;
+	
+	if (time_delta_us < BP_CHECK_INTERVAL_US)
+		return;
+	
+	/* ---------------------------------------------------------- */
+	/*    TRUE PER-TC LOAD CALCULATION                            */
+	/*    load_tc = bytes_out[tc] / packets_in                    */
+	/* ---------------------------------------------------------- */
+	for (int tc = 0; tc < N_TC; tc++) {
+		double load_tc = 0.0;
+		
+		if (load->packets_in[tc] > 0)
+			load_tc = (double)load->packets_out[tc] / (double)load->packets_in[tc];
+
+		// load->load_tc[tc] = load_tc;
+		
+		/* CURRENT TC STATE */
+		port_backpressure_state_t *bp = &port_stats->backpressure[tc];
+		uint8_t state = bp->state;
+		uint8_t lvl   = bp->reduction_level;
+		uint32_t cap  = bp->capacity_pct;
+		
+		/* -------------------------------------------------- */
+		/*          PER-TC STATE MACHINE                     */
+		/* -------------------------------------------------- */
+		
+		/* ------------------ OVERLOAD --------------------- */
+		if (load_tc > 0.8) {
+			if (state == 0) {
+				bp->state = 1;
+				bp->last_state_change = current_time;
+				
+				RTE_LOG(INFO, APP, "Port %u TC %d: OVERLOAD (load=%.2f)\n", tx_port, tc, load_tc);
+			}
+			
+			if (lvl < 7) {
+				lvl++;
+				bp->reduction_level = lvl;
+				
+				cap = 100 - (lvl * CAPACITY_REDUCTION_STEP);
+				if (cap < MIN_CAPACITY) 
+					cap = MIN_CAPACITY;
+					
+				bp->capacity_pct = cap;
+				
+				RTE_LOG(INFO, APP, "Port %u TC %d: Reduce capacity to %u%% (level=%u)\n", tx_port, tc, cap, lvl);
+			}
+		}
+		
+		/* ------------------ RECOVERY ---------------------- */
+		else if (load_tc < 0.3) {
+			if (state == 1) {
+				bp->state = 0;
+				bp->last_state_change = current_time;
+				
+				RTE_LOG(INFO, APP, "Port %u TC %d: NORMAL (load=%.2f)\n", tx_port, tc, load_tc);
+			}
+			
+			if (lvl > 0) {
+				lvl--;
+				bp->reduction_level = lvl;
+				
+				cap = 100 - (lvl * CAPACITY_REDUCTION_STEP);
+
+				if (cap > 100)
+					cap = 100;
+				
+				bp->capacity_pct = cap;
+				
+				RTE_LOG(INFO, APP, "Port %u TC %d: Recover capacity to %u%% (level=%u)\n", tx_port, tc, cap, lvl);
+			}
+		}
+		
+		/* Output: set per-TC scheduler capacity */
+		port_stats->subport_capacity[tc] = bp->capacity_pct;
+
+	/* ---------------------------------------------------------- */
+	/* Reset stats for next interval                             */
+	/* ---------------------------------------------------------- */
+	load->packets_in[tc] = 0;
+	load->packets_out[tc] = 0;
+	load->bytes_out[tc] = 0;
+	}
+	
+	load->last_update_time = current_time;
+}
+
+
+
+static inline int
+get_pkt_sched(struct rte_mbuf *m, uint32_t *subport, uint32_t *pipe,
 			uint32_t *traffic_class, uint32_t *queue, uint32_t *color)
 {
 	uint16_t *pdata = rte_pktmbuf_mtod(m, uint16_t *);
@@ -47,23 +165,24 @@ static inline int get_pkt_sched(struct rte_mbuf *m, uint32_t *subport, uint32_t 
 
 	eth_hdr = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
 
- 	/* Outer VLAN ID*/
-	*subport = ((m->vlan_tci & 0xE000) >> 13) & (port_params.n_subports_per_port -1);
+	/* Outer VLAN ID */
+	*subport = ((m->vlan_tci & 0xE000) >> 13) & 
+		(port_params.n_subports_per_port - 1);
 
- 	/* Dst Addr */
- 	*pipe = (rte_be_to_cpu_16(pdata[PIPE_OFFSET]) & 0xFFFF);
+	/* Dst Addr */
+	*pipe = (rte_be_to_cpu_16(pdata[PIPE_OFFSET]) & 0xFFFF);
 
 	pipe_queue = (rte_be_to_cpu_16(pdata[QUEUE_OFFSET]) & 0x00FF);
 
- 	/* Traffic class (TOS) */
- 	*traffic_class = pipe_queue > RTE_SCHED_TRAFFIC_CLASS_BE ?
- 			RTE_SCHED_TRAFFIC_CLASS_BE : pipe_queue;
+	/* Traffic class (TOS) */
+	*traffic_class = pipe_queue > RTE_SCHED_TRAFFIC_CLASS_BE ?
+			RTE_SCHED_TRAFFIC_CLASS_BE : pipe_queue;
 
- 	/* Traffic class queue (TOS) */
- 	*queue = pipe_queue - *traffic_class;
- 	
- 	/* Color */
- 	*color = 0;
+	/* Traffic class queue (TOS) */
+	*queue = pipe_queue - *traffic_class;
+
+	/* Color */
+	*color = 0;
 
 	rte_ether_addr_copy(&eth_hdr->dst_addr, &addr);
 	rte_ether_addr_copy(&eth_hdr->src_addr, &eth_hdr->dst_addr);
@@ -71,119 +190,6 @@ static inline int get_pkt_sched(struct rte_mbuf *m, uint32_t *subport, uint32_t 
 
 	return 0;
 }
-
-/* Track when BP was activated (for time-based recovery) */
-static uint64_t bp_activation_time[RTE_MAX_ETHPORTS][N_TC] = {0};
-
-static inline void update_backpressure_state(uint16_t port) {
-	struct rte_port_statistics *stats = &port_statistics[port];
-	uint64_t now = rte_get_tsc_cycles();
-	uint64_t elapsed = now - stats->last_check_tsc;
-	uint64_t check_interval = (stats->tsc_hz * BP_CHECK_INTERVAL_US) / 1000000;
-	
-	if (elapsed < check_interval)
-	return;
-	
-	stats->last_check_tsc = now;
-	
-	/* Calculate RX delta */
-	uint64_t rx_now = stats->rx;
-	uint64_t rx_delta = rx_now - stats->last_rx;
-	stats->last_rx = rx_now;
-	
-	for (int tc = 0; tc < N_TC; tc++) {
-		uint64_t dropped = __atomic_load_n(&stats->dropped[tc], __ATOMIC_ACQUIRE);
-		uint64_t new_drops = (dropped >= stats->last_dropped[tc]) ? (dropped - stats->last_dropped[tc]) : dropped;
-		stats->last_dropped[tc] = dropped;
-		
-		double drop_rate = (rx_delta > 0) ? (double)new_drops / (double)rx_delta : 0.0;
-		double drop_rate_pct = drop_rate * 100.0;
-		
-		switch (stats->bp_state[tc]) {
-		case BP_INACTIVE:
-			/* Monitor for drop threshold */
-			if (drop_rate >= BP_ACTIVATE_THRESHOLD) {
-				RTE_LOG(INFO, APP, "Port %u TC %d: BP ACTIVATED (%.4f%% drops)\n", 
-				port, tc, drop_rate_pct);
-				stats->bp_state[tc] = BP_REDUCING;
-				stats->state_enter_time[tc] = now;
-				stats->subport_capacity[tc] = 90;  /* Start at 90% */
-				stats->zero_drop_start_time[tc] = 0;
-				}
-		break;
-		
-		case BP_REDUCING:
-			/* Aggressively reduce capacity on any drops */
-			// if (new_drops > 0) {
-			if (true) {
-				uint32_t reduction = RTE_MIN(10, (uint32_t)(drop_rate_pct * 2 + 2));
-
-				stats->subport_capacity[tc] -= reduction;
-				if (stats->subport_capacity[tc] < BP_ABSOLUTE_MIN_PCT)
-					stats->subport_capacity[tc] = BP_ABSOLUTE_MIN_PCT;
-
-				// RTE_LOG(INFO, APP, "Port %u TC %d: Reducing to %u%% (%u drops, %.4f%% rate)\n", port, tc, stats->subport_capacity[tc], (uint32_t)new_drops, drop_rate_pct);
-				stats->zero_drop_start_time[tc] = 0;  /* Reset stability window */
-
-				} else {
-					/* No drops detected, start tracking stability */
-					if (stats->zero_drop_start_time[tc] == 0) {
-					stats->zero_drop_start_time[tc] = now;
-					}
-				
-					uint64_t stable_duration = now - stats->zero_drop_start_time[tc];
-					uint64_t min_stable = (stats->tsc_hz * BP_ZERO_DROP_WINDOW_US) / 1000000;
-					
-					if (stable_duration >= min_stable) {
-						RTE_LOG(INFO, APP, "Port %u TC %d: Transitioning to HOLDING\n", port, tc);
-						stats->bp_state[tc] = BP_HOLDING;
-						stats->state_enter_time[tc] = now;
-					}
-			}
-		break;
-		
-		case BP_HOLDING:
-			/* Hold reduced capacity to confirm stability */
-			if (new_drops > 0) {
-				/* Drops during hold period, go back to aggressive reduction */
-				RTE_LOG(INFO, APP, "Port %u TC %d: Drops during hold, back to REDUCING\n", port, tc);
-				stats->bp_state[tc] = BP_REDUCING;
-				stats->state_enter_time[tc] = now;
-				stats->zero_drop_start_time[tc] = 0;
-			} else {
-				uint64_t held_duration = now - stats->state_enter_time[tc];
-				uint64_t min_hold = (stats->tsc_hz * BP_RECOVERY_TIME_US) / 1000000;
-				
-				if (held_duration >= min_hold) {
-					RTE_LOG(INFO, APP, "Port %u TC %d: Transitioning to RECOVERING (capacity %u%%)\n", 
-					port, tc, stats->subport_capacity[tc]);
-					stats->bp_state[tc] = BP_RECOVERING;
-					stats->state_enter_time[tc] = now;
-				}
-			}
-		break;
-		
-		case BP_RECOVERING:
-			if (new_drops > 0) {
-			/* Drops during recovery, go back to reduction */
-			RTE_LOG(INFO, APP, "Port %u TC %d: Drops during recovery, back to REDUCING\n", port, tc);
-			stats->bp_state[tc] = BP_REDUCING;
-			stats->state_enter_time[tc] = now;
-			stats->zero_drop_start_time[tc] = 0;
-			} else {
-			/* Gradually recover capacity */
-			stats->subport_capacity[tc] += BP_RECOVERY_STEP_PCT;
-			if (stats->subport_capacity[tc] >= 100) {
-			stats->subport_capacity[tc] = 100;
-			stats->bp_state[tc] = BP_INACTIVE;
-			RTE_LOG(INFO, APP, "Port %u TC %d: BP DEACTIVATED (recovered to 100%%)\n", port, tc);
-					}
-			}
-		break;
-			}
-	}
-}
-
 
 void
 app_rx_thread(struct thread_conf **confs)
@@ -200,40 +206,59 @@ app_rx_thread(struct thread_conf **confs)
 	uint32_t color;
 
 	while ((conf = confs[conf_idx])) {
-		nb_rx = rte_eth_rx_burst(conf->rx_port, conf->rx_queue, rx_mbufs,
-				burst_conf.rx_burst);
+		nb_rx = rte_eth_rx_burst(conf->rx_port, conf->rx_queue, rx_mbufs, burst_conf.rx_burst);
 
 		if (likely(nb_rx != 0)) {
 			APP_STATS_ADD(conf->stat.nb_rx, nb_rx);
 
-			for(i = 0; i < nb_rx; i++) {
-				get_pkt_sched(rx_mbufs[i],
-						&subport, &pipe, &traffic_class, &queue, &color);
+			for (i = 0; i < nb_rx; i++) {
+				get_pkt_sched(rx_mbufs[i], &subport, &pipe, &traffic_class, &queue, &color);
+				
 				rte_sched_port_pkt_write(conf->sched_port,
-						rx_mbufs[i],
-						subport, pipe,
-						traffic_class, queue,
-						(enum rte_color) color);
-			}
+					rx_mbufs[i],
+					subport, pipe,
+					traffic_class, queue,
+					(enum rte_color) color);
 
-			if (unlikely(rte_ring_sp_enqueue_bulk(conf->rx_ring,
-					(void **)rx_mbufs, nb_rx, NULL) == 0)) {
-				for(i = 0; i < nb_rx; i++) {
+				if (unlikely(rte_ring_sp_enqueue(conf->rx_ring, (void *)rx_mbufs[i]))) {
 					rte_pktmbuf_free(rx_mbufs[i]);
 
 					APP_STATS_ADD(conf->stat.nb_drop, 1);
-				} 
-			}
-
-       			if (likely(nb_rx > 0)) {
-				__atomic_add_fetch(&port_statistics[conf->rx_port].rx, nb_rx, __ATOMIC_RELAXED);
+				}
 			}
 		}
+		
 		conf_idx++;
 		if (confs[conf_idx] == NULL)
 			conf_idx = 0;
 	}
 }
+
+/*
+void
+app_tx_thread(struct thread_conf **confs)
+{
+	struct rte_mbuf *mbufs[burst_conf.qos_dequeue];
+	struct thread_conf *conf;
+	int conf_idx = 0;
+	int nb_pkts;
+	
+	while ((conf = confs[conf_idx])) {
+		nb_pkts = rte_ring_sc_dequeue_burst(conf->tx_ring, (void **)mbufs, burst_conf.qos_dequeue, NULL);
+
+		if (likely(nb_pkts != 0)) {
+			uint16_t nb_tx = rte_eth_tx_burst(conf->tx_port, 0, mbufs, nb_pkts);
+			if (nb_pkts != nb_tx)
+			rte_pktmbuf_free_bulk(&mbufs[nb_tx], nb_pkts - nb_tx);
+		}
+		
+		conf_idx++;
+		if (confs[conf_idx] == NULL)
+			conf_idx = 0;
+	}
+}
+*/
+
 
 void
 app_tx_thread(struct thread_conf **confs)
@@ -243,34 +268,30 @@ app_tx_thread(struct thread_conf **confs)
 	int conf_idx = 0;
 	int nb_pkts;
 	struct rte_eth_dev_tx_buffer *buffer;
-	int tx_port;
 
 	while ((conf = confs[conf_idx])) {
-		nb_pkts = rte_ring_sc_dequeue_burst(conf->tx_ring, (void **)mbufs,
-					burst_conf.qos_dequeue, NULL);
-		uint16_t nb_tx = 0;
-		tx_port = conf->tx_port;
-		if (likely(nb_pkts != 0)) {
-			for(int i = 0; i < nb_pkts; i++) {
-				int tx_queue = mbufs[i]->hash.sched.traffic_class;
+		uint32_t tx_port = conf->tx_port;
+		nb_pkts = rte_ring_sc_dequeue_burst(conf->tx_ring, (void **)mbufs, burst_conf.qos_dequeue, NULL);
 
-				if (tx_queue > N_TX_QUEUES) {
-					tx_queue = 1;	
-				}
+		if (likely(nb_pkts > 0)) {
+			
+			for (int i = 0; i < nb_pkts; i++) {
+				/* TRACK THREAD LOAD: packets dequeued */
+				
+				int tx_queue = mbufs[i]->hash.sched.traffic_class;
+				if (tx_queue != 0)
+					tx_queue = 1;
+
+				port_statistics[tx_port].load_stats.packets_out[tx_queue] += nb_pkts;
+				port_statistics[tx_port].load_stats.bytes_out[tx_queue] += mbufs[i]->pkt_len;
 
 				buffer = tx_buffer[tx_port][tx_queue];
-					
-				nb_tx += rte_eth_tx_buffer(tx_port, tx_queue, buffer, mbufs[i]);
+				
+				/* Transmit packet */
+				rte_eth_tx_buffer(tx_port, tx_queue, buffer, mbufs[i]);
 			}
-
-			// nb_tx = rte_eth_tx_burst(conf->tx_port, 0, mbufs, nb_pkts);
-			
-			// if (nb_pkts != nb_tx) {
-			// 	APP_STATS_ADD(conf->stat.nb_drop, port_statistics[tx_port].dropped);
-			//   	rte_pktmbuf_free_bulk(&mbufs[nb_tx], nb_pkts - nb_tx);
-			// }
 		}
-
+		
 		conf_idx++;
 		if (confs[conf_idx] == NULL)
 			conf_idx = 0;
@@ -283,34 +304,37 @@ app_worker_thread(struct thread_conf **confs)
 	struct rte_mbuf *mbufs[burst_conf.ring_burst];
 	struct thread_conf *conf;
 	int conf_idx = 0;
-	uint16_t tx_port;
-	int bp = 0;
 
 	while ((conf = confs[conf_idx])) {
 		uint32_t nb_pkt;
-		tx_port = conf->tx_port;
+		uint32_t tx_port = conf->tx_port;
 
-		/* Read packet from the ring */
-		nb_pkt = rte_ring_sc_dequeue_burst(conf->rx_ring, (void **)mbufs,
-					burst_conf.ring_burst, NULL);
+		nb_pkt = rte_ring_sc_dequeue_burst(conf->rx_ring, (void **)mbufs, burst_conf.ring_burst, NULL);
+
 		if (likely(nb_pkt)) {
-			int nb_sent = rte_sched_port_enqueue(conf->sched_port, mbufs,
-					nb_pkt);
+			int nb_sent = rte_sched_port_enqueue( conf->sched_port, mbufs, nb_pkt);
+			
+			/* TRACK THREAD LOAD: packets enqueued */
+			for (int i = 0; i < nb_sent; i++) {
+				int tx_queue = mbufs[i]->hash.sched.traffic_class;
+				if (tx_queue != 0)
+					tx_queue = 1;
+				port_statistics[conf->tx_port].load_stats.packets_in[tx_queue] += nb_sent;
+			}
 
 			APP_STATS_ADD(conf->stat.nb_drop, nb_pkt - nb_sent);
 			APP_STATS_ADD(conf->stat.nb_rx, nb_pkt);
 		}
 
+		/* UPDATE BACKPRESSURE STATE - CRITICAL */
 		update_backpressure_state(tx_port);
-		// printf("tx_port %d %d\n", tx_port, port_statistics[tx_port].backpressure_active);
-		nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs,
-					burst_conf.qos_dequeue, port_statistics[tx_port].subport_capacity);
-					// burst_conf.qos_dequeue, bp);
+		nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs, burst_conf.qos_dequeue, port_statistics[tx_port].subport_capacity);
 
-		if (likely(nb_pkt > 0))
+		// nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs, burst_conf.qos_dequeue, NULL);
+		if (likely(nb_pkt > 0)) 
 			while (rte_ring_sp_enqueue_bulk(conf->tx_ring,
-					(void **)mbufs, nb_pkt, NULL) == 0)
-				; /* empty body */
+				(void **)mbufs, nb_pkt, NULL) == 0) 
+				; 
 
 		conf_idx++;
 		if (confs[conf_idx] == NULL)
@@ -318,40 +342,54 @@ app_worker_thread(struct thread_conf **confs)
 	}
 }
 
-
 void
 app_mixed_thread(struct thread_conf **confs)
 {
+	/*
 	struct rte_mbuf *mbufs[burst_conf.ring_burst];
 	struct thread_conf *conf;
 	int conf_idx = 0;
-	uint16_t tx_port;
 
 	while ((conf = confs[conf_idx])) {
 		uint32_t nb_pkt;
+		uint32_t tx_port = conf->tx_port;
 
-		/* Read packet from the ring */
-		nb_pkt = rte_ring_sc_dequeue_burst(conf->rx_ring, (void **)mbufs,
-					burst_conf.ring_burst, NULL);
+		nb_pkt = rte_ring_sc_dequeue_burst(conf->rx_ring,
+			(void **)mbufs, burst_conf.ring_burst, NULL);
+		
 		if (likely(nb_pkt)) {
-			int nb_sent = rte_sched_port_enqueue(conf->sched_port, mbufs,
-					nb_pkt);
+			int nb_sent = rte_sched_port_enqueue(conf->sched_port, mbufs, nb_pkt);
+			
+			port_statistics[tx_port].load_stats.packets_in += nb_sent;
 
 			APP_STATS_ADD(conf->stat.nb_drop, nb_pkt - nb_sent);
 			APP_STATS_ADD(conf->stat.nb_rx, nb_pkt);
 		}
 
+		update_backpressure_state(tx_port);
 
-		nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs,
-					burst_conf.qos_dequeue, true);
+		nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs, burst_conf.qos_dequeue, port_statistics[tx_port].subport_capacity);
+
 		if (likely(nb_pkt > 0)) {
-			uint16_t nb_tx = rte_eth_tx_burst(conf->tx_port, 0, mbufs, nb_pkt);
-			if (nb_tx != nb_pkt)
-				rte_pktmbuf_free_bulk(&mbufs[nb_tx], nb_pkt - nb_tx);
+			port_statistics[tx_port].load_stats.packets_out += nb_pkt;
+			
+			uint16_t nb_tx = rte_eth_tx_burst(conf->tx_port, 0,
+				mbufs, nb_pkt);
+			
+			for (uint16_t i = 0; i < nb_pkt; i++) {
+				port_statistics[tx_port].load_stats.bytes_out +=
+					mbufs[i]->pkt_len;
+			}
+
+			if (nb_tx != nb_pkt) {
+				rte_pktmbuf_free_bulk(&mbufs[nb_tx],
+					nb_pkt - nb_tx);
+			}
 		}
 
 		conf_idx++;
 		if (confs[conf_idx] == NULL)
 			conf_idx = 0;
 	}
+	*/
 }

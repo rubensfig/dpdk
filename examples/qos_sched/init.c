@@ -26,8 +26,8 @@ static uint32_t app_inited_port_mask = 0;
 
 int app_pipe_to_profile[MAX_SCHED_SUBPORTS][MAX_SCHED_PIPES];
 
-struct rte_port_statistics port_statistics[RTE_MAX_ETHPORTS];
-struct tc_statistics tc_stats;
+struct port_statistics_t port_statistics[RTE_MAX_ETHPORTS];
+// struct tc_statistics tc_stats;
 struct tx_callback_ctx tx_ctx[RTE_MAX_ETHPORTS][N_TX_QUEUES];
 
 #define MAX_NAME_LEN 32
@@ -229,48 +229,27 @@ tx_buffer_count_callback(struct rte_mbuf **pkts, uint16_t unsent,
 {
 	struct tx_callback_ctx *ctx = (struct tx_callback_ctx *)userdata;
 	
-	if (unsent == 0)
-		return;
-	
-	/* --- 1. Count tentative drops --- */
 	__atomic_add_fetch(&port_statistics[ctx->portid].dropped[ctx->tc_id],
-					   unsent, __ATOMIC_RELEASE);
+					   unsent, __ATOMIC_RELAXED);
 
-	/* --- 3. Retry immediately (main loop will now stop sending more) --- */
-	uint16_t remaining = unsent;
-
-	uint16_t sent = rte_eth_tx_burst( ctx->portid, ctx->tc_id, pkts, remaining);
-	remaining -= sent;
-
-	__atomic_add_fetch(&port_statistics[ctx->portid].dropped_retry[ctx->tc_id],
-					   remaining, __ATOMIC_RELEASE);
-
-	/* --- 4. Free whatever still remains --- */
-       for (uint16_t i = 0; i < remaining; i++)
-		rte_pktmbuf_free(pkts[sent + i]);
+	for (uint16_t i = 0; i < unsent; i++)
+		rte_pktmbuf_free(pkts[i]);
 }
 
 static void initialize_port_statistics(uint16_t port)
 {
-	struct rte_port_statistics *stats = &port_statistics[port];
+	struct port_statistics_t *stats = &port_statistics[port];
 	uint64_t hz = rte_get_tsc_hz();
 	
-	for (int tc = 0; tc < N_TC; tc++) {
-		stats->dropped[tc] = 0;
-		stats->last_dropped[tc] = 0;
-		stats->tx[tc] = 0;
-		stats->last_tx[tc] = 0;
+	stats->tx_port = port;
+	for (int tc = 0; tc < N_TC; tc++)
 		stats->subport_capacity[tc] = 100;
-		stats->bp_active[tc] = false;
-		stats->last_drop_tsc[tc] = 0;
-	}
-	
-	stats->rx = 0;
-	stats->last_rx = 0;
-	stats->tsc_hz = hz;
-	stats->last_check_tsc = rte_get_tsc_cycles();
+	stats->backpressure->capacity_pct = 100;
+	stats->backpressure->state = 0;
+	stats->backpressure->reduction_level = 0;
+	stats->backpressure->last_state_change = rte_get_timer_cycles();
+	stats->load_stats.last_update_time = rte_get_timer_cycles();
 }
-
 
 static int
 app_init_port(uint16_t portid, struct rte_mempool *mp, bool hqos_init)

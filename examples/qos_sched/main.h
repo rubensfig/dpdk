@@ -68,50 +68,47 @@ struct thread_stat
 
 /* Backpressure tuning parameters */
 /* Backpressure tuning parameters */
-#define BP_CHECK_INTERVAL_US        10          /* Check frequency */
-#define BP_ACTIVATE_THRESHOLD       0.001       /* 0.1% to activate */
+#define BP_CHECK_INTERVAL_US        1000          /* Check frequency */
 #define BP_ZERO_DROP_WINDOW_US      100000      /* 100ms zero-drop window before recovery */
-#define BP_RECOVERY_TIME_US         1000000     /* 1s hold time before recovery starts */
-
+#define BP_RECOVERY_TIME_US         10000000     /* 1s hold time before recovery starts */
 #define BP_ABSOLUTE_MIN_PCT         50          /* Never reduce below 20% */
-#define BP_RECOVERY_STEP_PCT        2           /* Slow recovery: +2% per interval */
+#define BP_RECOVERY_STEP_PCT        1           /* Slow recovery: +2% per interval */
 
 /* Derived from existing constants, kept for compatibility */
-#define BP_CAPACITY_MIN_PCT         30          /* Used if needed for safe recovery min */
+#define BP_EWMA_ALPHA             0.20    /* smoothing factor */
+#define BP_THRESHOLD_RATE	    0.5
+#define BP_PERSISTENT_THRESH      (BP_THRESHOLD_RATE * 0.5) /* trigger even if inst drops==0 */
 
-/* Global per-TC drop counters (aggregated across all ports) */
-struct tc_statistics {
-	uint64_t dropped[N_TC];  /* Atomically updated drop counts per TC */
+/* Thread load statistics structure */
+struct thread_load_stats_t {
+	uint64_t packets_in[N_TC];        /* Packets enqueued to scheduler */
+	uint64_t packets_out[N_TC];       /* Packets dequeued from scheduler */
+	uint64_t bytes_out[N_TC];         /* Bytes dequeued */
+	uint64_t last_update_time;  /* Last time stats were collected */
+	double load;                /* Current load estimate */
 } __rte_cache_aligned;
+typedef struct thread_load_stats_t thread_load_stats_t;
 
-extern struct tc_statistics tc_stats;
+/* Per-port backpressure state */
+struct port_backpressure_state_t {
+	uint32_t capacity_pct;      /* Current capacity: 30-100% */
+	volatile int state;         /* 0=normal, 1=overload */
+	uint32_t reduction_level;   /* 0-7 steps */
+	uint64_t last_state_change; /* Timestamp */
+} __rte_cache_aligned;
+typedef struct port_backpressure_state_t port_backpressure_state_t;
 
-typedef enum {
-	BP_INACTIVE,      /* Normal operation, full capacity */
-	BP_REDUCING,      /* Actively reducing capacity due to drops */
-	BP_HOLDING,       /* Reduced capacity, waiting for stability */
-	BP_RECOVERING     /* Gradually increasing capacity back */
-} bp_state_t;
-
-/* Per-port statistics for backpressure mechanism */
-struct rte_port_statistics {
-	uint64_t last_dropped[N_TC];
-	uint64_t dropped[N_TC];
+/* Global port statistics with backpressure */
+struct  port_statistics_t {
+	uint32_t tx_port;
+	uint32_t subport_capacity[N_TC];  /* Output to rte_sched dequeue */
 	uint64_t dropped_retry[N_TC];
-	uint64_t last_tx[N_TC];
-	uint64_t tx[N_TC];
-	uint64_t last_rx;
-	uint64_t rx;
-	uint64_t last_check_tsc;
-	uint64_t tsc_hz;
-	bool bp_active[N_TC];
-	uint32_t subport_capacity[N_TC];
-	uint64_t last_drop_tsc[N_TC];
-	uint64_t state_enter_time[N_TC];
-	bp_state_t bp_state[N_TC];
-	uint64_t zero_drop_start_time[N_TC];
-
+	uint64_t dropped[N_TC];
+	port_backpressure_state_t backpressure[N_TC];
+	thread_load_stats_t load_stats;
 } __rte_cache_aligned;
+typedef struct port_statistics_t port_statistics_t;
+
 
 /* TX buffer callback context with TC information */
 struct tx_callback_ctx {
@@ -120,7 +117,7 @@ struct tx_callback_ctx {
 };
 
 extern struct tx_callback_ctx tx_ctx[RTE_MAX_ETHPORTS][N_TX_QUEUES];
-extern struct rte_port_statistics port_statistics[RTE_MAX_ETHPORTS];
+extern struct port_statistics_t port_statistics[RTE_MAX_ETHPORTS];
 
 void tx_buffer_count_callback(struct rte_mbuf **pkts, uint16_t unsent, void *userdata);
 
