@@ -107,20 +107,20 @@ prepare_pkt(struct rte_sched_port *port, struct rte_mbuf *mbuf)
 	struct rte_ipv4_hdr *ip_hdr;
 
 	/* Simulate a classifier */
-	eth_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
-	vlan1 = (struct rte_vlan_hdr *)(&eth_hdr->ether_type);
-	vlan2 = (struct rte_vlan_hdr *)(
-		(uintptr_t)&eth_hdr->ether_type + sizeof(struct rte_vlan_hdr));
-	eth_hdr = (struct rte_ether_hdr *)(
-		(uintptr_t)&eth_hdr->ether_type +
-		2 * sizeof(struct rte_vlan_hdr));
-	ip_hdr = (struct rte_ipv4_hdr *)(
-		(uintptr_t)eth_hdr + sizeof(eth_hdr->ether_type));
+	// eth_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
+	// vlan1 = (struct rte_vlan_hdr *)(&eth_hdr->ether_type);
+	// vlan2 = (struct rte_vlan_hdr *)(
+	// 	(uintptr_t)&eth_hdr->ether_type + sizeof(struct rte_vlan_hdr));
+	// eth_hdr = (struct rte_ether_hdr *)(
+	// 	(uintptr_t)&eth_hdr->ether_type +
+	// 	2 * sizeof(struct rte_vlan_hdr));
+	// ip_hdr = (struct rte_ipv4_hdr *)(
+	// 	(uintptr_t)eth_hdr + sizeof(eth_hdr->ether_type));
 
-	vlan1->vlan_tci = rte_cpu_to_be_16(SUBPORT);
-	vlan2->vlan_tci = rte_cpu_to_be_16(PIPE);
-	eth_hdr->ether_type =  rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
-	ip_hdr->dst_addr = RTE_IPV4(0,0,TC,QUEUE);
+	// vlan1->vlan_tci = rte_cpu_to_be_16(SUBPORT);
+	// vlan2->vlan_tci = rte_cpu_to_be_16(PIPE);
+	// eth_hdr->ether_type =  rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+	// ip_hdr->dst_addr = RTE_IPV4(0,0,TC,QUEUE);
 
 
 	rte_sched_port_pkt_write(port, mbuf, SUBPORT, PIPE, TC, QUEUE,

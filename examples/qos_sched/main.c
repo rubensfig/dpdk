@@ -78,6 +78,7 @@ app_main_loop(__rte_unused void *dummy)
 			flow->wt_thread.rx_ring =  flow->rx_ring;
 			flow->wt_thread.tx_ring =  flow->tx_ring;
 			flow->wt_thread.tx_port =  flow->tx_port;
+			flow->tx_thread.tx_queue = flow->tx_queue;
 			flow->wt_thread.sched_port =  flow->sched_port;
 
 			wt_confs[wt_idx++] = &flow->wt_thread;
@@ -163,8 +164,7 @@ app_stat(void)
 		printf("TX port %"PRIu16": tx: %" PRIu64 " err: %" PRIu64 " dropped: %" PRIu64 "\n",
 				flow->tx_port,
 				stats.opackets - tx_stats[i].opackets,
-				stats.oerrors - tx_stats[i].oerrors,
-				dropped);
+				stats.oerrors - tx_stats[i].oerrors,dropped);
 		memcpy(&tx_stats[i], &stats, sizeof(stats));
 
 #if APP_COLLECT_STAT

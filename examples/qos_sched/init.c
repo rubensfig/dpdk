@@ -332,8 +332,8 @@ app_init_port(uint16_t portid, struct rte_mempool *mp, bool hqos_init)
 			(uint16_t)ring_conf.tx_size, rte_eth_dev_socket_id(portid), &tx_conf);
 
 		int burst = 1;
-		// if (i != 0)
-		// 	burst = 4;
+		if (i != 0)
+			burst = 4;
 
 		tx_buffer[portid][i] = rte_zmalloc_socket("tx_buffer",
 				RTE_ETH_TX_BUFFER_SIZE(burst), 0,
@@ -344,7 +344,6 @@ app_init_port(uint16_t portid, struct rte_mempool *mp, bool hqos_init)
 
 		rte_eth_tx_buffer_init(tx_buffer[portid][i], burst);
 
-		/* Setup context: queue i maps to TC i */
 	    	tx_ctx[portid][i].portid = portid;
 		tx_ctx[portid][i].tc_id = i;
 		    
@@ -356,9 +355,10 @@ app_init_port(uint16_t portid, struct rte_mempool *mp, bool hqos_init)
 			rte_exit(EXIT_FAILURE,
 				 "rte_eth_tx_queue_setup: err=%d, port=%u queue=%d\n",
 				 ret, portid, i);
+		 // Setup context: queue i maps to TC i 
 	}
 
-	initialize_port_statistics(portid);
+	// initialize_port_statistics(portid);
 	
 	// RTE_LOG(INFO, APP, "Port %u: Backpressure mechanism initialized\n", portid);
 	// RTE_LOG(INFO, APP, "  Check interval: %u us\n", BP_CHECK_INTERVAL_US);
@@ -659,8 +659,8 @@ int app_init(void)
 		if (qos_conf[i].mbuf_pool == NULL)
 			rte_exit(EXIT_FAILURE, "Cannot init mbuf pool for socket %u\n", i);
 
-		app_init_port(qos_conf[i].rx_port, qos_conf[i].mbuf_pool, true);
-		app_init_port(qos_conf[i].tx_port, qos_conf[i].mbuf_pool, true);
+		app_init_port(qos_conf[i].rx_port, qos_conf[i].mbuf_pool, false);
+		app_init_port(qos_conf[i].tx_port, qos_conf[i].mbuf_pool, false);
 
 		rte_eth_link_get(qos_conf[i].tx_port, &link);
 		if (link.link_status == 0)

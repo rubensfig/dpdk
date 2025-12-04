@@ -576,9 +576,7 @@ rte_sched_port_enqueue(struct rte_sched_port *port, struct rte_mbuf **pkts, uint
  *   Number of packets successfully dequeued and placed in the pkts array
  */
 int
-rte_sched_port_dequeue(struct rte_sched_port *port, struct rte_mbuf ***pkts, uint32_t n_pkts, uint32_t *capacity_pct);
-int
-rte_sched_port_dequeue_tc(struct rte_sched_port *port, struct rte_mbuf ***pkts, uint32_t n_pkts, uint32_t *capacity_pct, uint32_t *tc_counts);
+rte_sched_port_dequeue(struct rte_sched_port *port, struct rte_mbuf **pkts, uint32_t n_pkts, uint32_t *capacity_pct);
 
 /**
  * Hierarchical scheduler subport traffic class
