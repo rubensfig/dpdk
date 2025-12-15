@@ -2455,14 +2455,12 @@ grinder_credits_check_with_tc_ov(struct rte_sched_port *port,
 	if (!enough_credits)
 		return 0;
 
-	/*
 	if (capacity_pct) {
 		uint32_t cap = capacity_pct[tc_index];
 		if (cap == 1) {
 			return 0;
 		}
 	}
-	*/
 
 	/* Update pipe and subport credits */
 	subport->tb_credits -= pkt_len;
@@ -2495,11 +2493,13 @@ grinder_schedule(struct rte_sched_port *port,
 			return 0;
 	}
 
+	/*
 	if (capacity_pct && !((port->n_pkts_out - capacity_pct[tc]) > 0))
 		return 0;
 
 	if (capacity_pct)
 		--capacity_pct[tc];
+		*/
 
 	/* Advance port time */
 	port->time += pkt_len;

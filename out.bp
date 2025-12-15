@@ -1,0 +1,127 @@
+diff --git a/drivers/net/ice/base/ice_fdir.c b/drivers/net/ice/base/ice_fdir.c
+index c742c77ac6..eb681423c2 100644
+--- a/drivers/net/ice/base/ice_fdir.c
++++ b/drivers/net/ice/base/ice_fdir.c
+@@ -3363,7 +3363,8 @@ static void ice_set_dflt_val_fd_desc(struct ice_fd_fltr_desc_ctx *fd_fltr_ctx)
+ {
+ 	fd_fltr_ctx->comp_q = ICE_FXD_FLTR_QW0_COMP_Q_ZERO;
+ 	fd_fltr_ctx->comp_report = ICE_FXD_FLTR_QW0_COMP_REPORT_SW_FAIL;
+-	fd_fltr_ctx->fd_space = ICE_FXD_FLTR_QW0_FD_SPACE_GUAR_BEST;
++	// fd_fltr_ctx->fd_space = ICE_FXD_FLTR_QW0_FD_SPACE_GUAR_BEST;
++	fd_fltr_ctx->fd_space = ICE_FXD_FLTR_QW0_FD_SPACE_BEST_EFFORT;
+ 	fd_fltr_ctx->cnt_ena = ICE_FXD_FLTR_QW0_STAT_ENA_PKTS;
+ 	fd_fltr_ctx->evict_ena = ICE_FXD_FLTR_QW0_EVICT_ENA_TRUE;
+ 	fd_fltr_ctx->toq = ICE_FXD_FLTR_QW0_TO_Q_EQUALS_QINDEX;
+diff --git a/drivers/net/ice/ice_fdir_filter.c b/drivers/net/ice/ice_fdir_filter.c
+index e8842bc242..4239082529 100644
+--- a/drivers/net/ice/ice_fdir_filter.c
++++ b/drivers/net/ice/ice_fdir_filter.c
+@@ -1573,7 +1573,7 @@ ice_fdir_query_count(struct ice_adapter *ad,
+ 	struct ice_hw *hw = ICE_PF_TO_HW(pf);
+ 	struct ice_fdir_filter_conf *filter = flow->rule;
+ 	struct ice_fdir_counter *counter = filter->counter;
+-	uint64_t hits_lo, hits_hi;
++	uint64_t hits_lo, hits_hi, size;
+ 
+ 	if (!counter) {
+ 		rte_flow_error_set(error, EINVAL,
+@@ -1590,11 +1590,12 @@ ice_fdir_query_count(struct ice_adapter *ad,
+ 	 */
+ 	hits_lo = ICE_READ_REG(hw, GLSTAT_FD_CNT0L(counter->hw_index));
+ 	hits_hi = ICE_READ_REG(hw, GLSTAT_FD_CNT0H(counter->hw_index));
++	size = ICE_READ_REG(hw, GLQF_FD_CNT);
+ 
+ 	flow_stats->hits_set = 1;
+ 	flow_stats->hits = hits_lo | (hits_hi << 32);
+ 	flow_stats->bytes_set = 0;
+-	flow_stats->bytes = 0;
++	flow_stats->bytes = size;
+ 
+ 	if (flow_stats->reset) {
+ 		/* reset statistic counter value */
+diff --git a/examples/qos_sched/profile_100gb_unlimited.cfg.orig b/examples/qos_sched/profile_100gb_unlimited.cfg.orig
+index 756978b58b..e5e883519f 100644
+--- a/examples/qos_sched/profile_100gb_unlimited.cfg.orig
++++ b/examples/qos_sched/profile_100gb_unlimited.cfg.orig
+@@ -5,19 +5,19 @@ number of subports per port = 1
+ 
+ ; Subport configuration
+ [subport 0]
+-<<<<<<< Updated upstream
+-number of pipes per subport = 65536
++number of pipes per subport = 4096
++<<<<<<< HEAD
+ queue sizes = 64 64 64 64 64 64 64 64 64 64 64 64 64
+ 
+ # pipe 0 - 16383 = 0               ; These pipes are configured with pipe profile 0
+-pipe 0 - 65535 = 0               ; These pipes are configured with pipe profile 0
++pipe 0 - 4095  = 0               ; These pipes are configured with pipe profile 0
+ =======
+-number of pipes per subport = 4096
++# number of pipes per subport = 16384
+ queue sizes = 64 64 64 64 64 64 64 64 64 64 64 64 64
+ 
+ # pipe 0 - 16383 = 0               ; These pipes are configured with pipe profile 0
+-pipe 0 - 4095  = 0               ; These pipes are configured with pipe profile 0
+->>>>>>> Stashed changes
++pipe 0 - 4095 = 0               ; These pipes are configured with pipe profile 0
++>>>>>>> mq_pmdlink
+ 
+ [subport profile 0]
+ tb rate = 12500000000           ; Bytes per second
+diff --git a/examples/qos_sched/scenario1_10gbolt_10gbpon.cfg.orig b/examples/qos_sched/scenario1_10gbolt_10gbpon.cfg.orig
+index 656a099663..060f200113 100644
+--- a/examples/qos_sched/scenario1_10gbolt_10gbpon.cfg.orig
++++ b/examples/qos_sched/scenario1_10gbolt_10gbpon.cfg.orig
+@@ -11,7 +11,11 @@ queue sizes = 64 64 64 64 64 64 64 64 64 64 64 64 64
+ pipe 0 - 4095 = 0               ; These pipes are configured with pipe profile 0
+ 
+ [subport profile 0]
++<<<<<<< HEAD
+ tb rate = 1350000000          ; OLT Layer
++=======
++tb rate = 1250000000          ; OLT Layer
++>>>>>>> mq_pmdlink
+ tb size = 1000000000          ; Bytes
+ 
+ ; tc 0 rate = 312500000         ; Pon Layer
+@@ -28,6 +32,7 @@ tb size = 1000000000          ; Bytes
+ ; tc 11 rate = 312500000        ; Pon Layer
+ ; tc 12 rate = 312500000        ; Pon Layer
+ 
++<<<<<<< HEAD
+ tc 0 rate = 1350000000         ; Pon Layer
+ tc 1 rate = 1350000000         ; Pon Layer
+ tc 2 rate = 1350000000         ; Pon Layer
+@@ -38,6 +43,18 @@ tc 6 rate = 1350000000         ; Pon Layer
+ tc 7 rate = 1350000000         ; Pon Layer
+ tc 8 rate = 1350000000         ; Pon Layer
+ tc 9 rate = 1350000000         ; Pon Layer
++=======
++tc 0 rate = 1250000000         ; Pon Layer
++tc 1 rate = 1250000000         ; Pon Layer
++tc 2 rate = 1250000000         ; Pon Layer
++tc 3 rate = 1250000000         ; Pon Layer
++tc 4 rate = 1250000000         ; Pon Layer
++tc 5 rate = 1250000000         ; Pon Layer
++tc 6 rate = 1250000000         ; Pon Layer
++tc 7 rate = 1250000000         ; Pon Layer
++tc 8 rate = 1250000000         ; Pon Layer
++tc 9 rate = 1250000000         ; Pon Layer
++>>>>>>> mq_pmdlink
+ tc 10 rate = 1250000000        ; Pon Layer
+ tc 11 rate = 1250000000        ; Pon Layer
+ tc 12 rate = 1250000000        ; Pon Layer
+diff --git a/lib/port/rte_port_sched.c b/lib/port/rte_port_sched.c
+index 8a7d815ef3..7319af51ea 100644
+--- a/lib/port/rte_port_sched.c
++++ b/lib/port/rte_port_sched.c
+@@ -64,7 +64,7 @@ rte_port_sched_reader_rx(void *port, struct rte_mbuf **pkts, uint32_t n_pkts)
+ 	struct rte_port_sched_reader *p = port;
+ 	uint32_t nb_rx;
+ 
+-	nb_rx = rte_sched_port_dequeue(p->sched, pkts, n_pkts);
++	nb_rx = rte_sched_port_dequeue(p->sched, pkts, n_pkts, true);
+ 	RTE_PORT_SCHED_READER_PKTS_IN_ADD(p, nb_rx);
+ 
+ 	return nb_rx;

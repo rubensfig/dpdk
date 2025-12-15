@@ -1,0 +1,532 @@
+From 1023ac597340764e4f35acf194176c41c856551d Mon Sep 17 00:00:00 2001
+From: Ubuntu <ubuntu@saturn.cob.bisdn.de>
+Date: Mon, 24 Nov 2025 19:12:23 +0000
+Subject: [PATCH] add bp changs
+
+add more bp
+
+add thread
+
+add more bp stuff
+---
+ app/test/test_sched.c           |  2 +-
+ examples/qos_sched/app_thread.c | 80 ++++++++++++++++++++++++++++++---
+ examples/qos_sched/init.c       | 45 ++++++++++++++++++-
+ examples/qos_sched/main.c       |  7 ++-
+ examples/qos_sched/main.h       | 49 ++++++++++++++++++++
+ examples/qos_sched/pmdlink.h    |  1 -
+ lib/port/rte_port_sched.c       |  2 +-
+ lib/sched/rte_sched.c           | 25 ++++++-----
+ lib/sched/rte_sched.h           |  2 +-
+ 9 files changed, 188 insertions(+), 25 deletions(-)
+
+diff --git a/app/test/test_sched.c b/app/test/test_sched.c
+index ddec572447..1b924bf46d 100644
+--- a/app/test/test_sched.c
++++ b/app/test/test_sched.c
+@@ -174,7 +174,7 @@ test_sched(void)
+ 	err = rte_sched_port_enqueue(port, in_mbufs, 10);
+ 	TEST_ASSERT_EQUAL(err, 10, "Wrong enqueue, err=%d\n", err);
+ 
+-	err = rte_sched_port_dequeue(port, out_mbufs, 10);
++	err = rte_sched_port_dequeue(port, out_mbufs, 10, true);
+ 	TEST_ASSERT_EQUAL(err, 10, "Wrong dequeue, err=%d\n", err);
+ 
+ 	for (i = 0; i < 10; i++) {
+diff --git a/examples/qos_sched/app_thread.c b/examples/qos_sched/app_thread.c
+index 5b8e932a19..3464063d8c 100644
+--- a/examples/qos_sched/app_thread.c
++++ b/examples/qos_sched/app_thread.c
+@@ -72,6 +72,59 @@ static inline int get_pkt_sched(struct rte_mbuf *m, uint32_t *subport, uint32_t
+ 	return 0;
+ }
+ 
++/* Track when BP was activated (for time-based recovery) */
++static uint64_t bp_activation_time[RTE_MAX_ETHPORTS][N_TC] = {0};
++#define BP_RECOVERY_TIME_US   1500000
++#define BP_DROP_SILENCE_US 100000  /* Deactivate after 100ms with no drops */
++
++static inline void
++update_backpressure_state(uint16_t port)
++{
++	struct rte_port_statistics *stats = &port_statistics[port];
++	uint64_t now = rte_get_tsc_cycles();
++	uint64_t elapsed = now - stats->last_check_tsc;
++	uint64_t check_interval = (stats->tsc_hz * BP_CHECK_INTERVAL_US) / 1000000;
++	
++	if (elapsed < check_interval)
++		return;
++	
++	stats->last_check_tsc = now;
++	
++	uint64_t rx_now = stats->rx;
++	uint64_t rx_delta = rx_now - stats->last_rx;
++	stats->last_rx = rx_now;
++	
++	for (int tc = 0; tc < N_TC; tc++) {
++		uint64_t dropped = __atomic_load_n(&stats->dropped[tc], __ATOMIC_ACQUIRE);
++		uint64_t last = stats->last_dropped[tc];
++		uint64_t new_drops = (dropped >= last) ? (dropped - last) : dropped;
++		stats->last_dropped[tc] = dropped;
++		
++		double drop_rate = (rx_delta > 0) ? (double)new_drops / (double)rx_delta : 0.0;
++		
++		if (!stats->bp_active[tc]) {
++			// Inactive: activate on high drop rate
++			if (drop_rate >= BP_THRESHOLD_RATE) {
++				stats->bp_active[tc] = true;
++				bp_activation_time[port][tc] = now;
++				RTE_LOG(INFO, APP, 
++				"Port %u TC %d: Backpressure ACTIVATED (drop_rate=%.4f)\n",
++					port, tc, drop_rate);
++				}
++			} else {
++				// Active: deactivate after minimum hold time expires 
++				uint64_t held_cycles = now - bp_activation_time[port][tc];
++				uint64_t min_hold_cycles = (stats->tsc_hz * BP_RECOVERY_TIME_US) / 1000000;
++				
++				if (held_cycles >= min_hold_cycles) {
++				stats->bp_active[tc] = false;
++				RTE_LOG(INFO, APP, "Port %u TC %d: Backpressure DEACTIVATED (held for %luus)\n", port, tc, BP_RECOVERY_TIME_US);
++			}
++			// else: still within minimum hold time, keep BP active
++		}
++	}
++}
++
+ void
+ app_rx_thread(struct thread_conf **confs)
+ {
+@@ -111,6 +164,10 @@ app_rx_thread(struct thread_conf **confs)
+ 					APP_STATS_ADD(conf->stat.nb_drop, 1);
+ 				} 
+ 			}
++
++       			if (likely(nb_rx > 0)) {
++				__atomic_add_fetch(&port_statistics[conf->rx_port].rx, nb_rx, __ATOMIC_RELAXED);
++			}
+ 		}
+ 		conf_idx++;
+ 		if (confs[conf_idx] == NULL)
+@@ -126,15 +183,16 @@ app_tx_thread(struct thread_conf **confs)
+ 	int conf_idx = 0;
+ 	int nb_pkts;
+ 	struct rte_eth_dev_tx_buffer *buffer;
++	int tx_port;
+ 
+ 	while ((conf = confs[conf_idx])) {
+ 		nb_pkts = rte_ring_sc_dequeue_burst(conf->tx_ring, (void **)mbufs,
+ 					burst_conf.qos_dequeue, NULL);
+ 		uint16_t nb_tx = 0;
++		tx_port = conf->tx_port;
+ 		if (likely(nb_pkts != 0)) {
+ 			for(int i = 0; i < nb_pkts; i++) {
+ 				int tx_queue = mbufs[i]->hash.sched.traffic_class;
+-				int tx_port = conf->tx_port;
+ 
+ 				if (tx_queue > N_TX_QUEUES) {
+ 					tx_queue = 1;	
+@@ -142,13 +200,15 @@ app_tx_thread(struct thread_conf **confs)
+ 
+ 				buffer = tx_buffer[tx_port][tx_queue];
+ 					
+-				nb_tx = rte_eth_tx_buffer(tx_port, tx_queue, buffer, mbufs[i]);
++				nb_tx += rte_eth_tx_buffer(tx_port, tx_queue, buffer, mbufs[i]);
+ 			}
+ 
+ 			// nb_tx = rte_eth_tx_burst(conf->tx_port, 0, mbufs, nb_pkts);
+ 			
+-			//  if (nb_pkts != nb_tx)
+-			//  	rte_pktmbuf_free_bulk(&mbufs[nb_tx], nb_pkts - nb_tx);
++			// if (nb_pkts != nb_tx) {
++			// 	APP_STATS_ADD(conf->stat.nb_drop, port_statistics[tx_port].dropped);
++			//   	rte_pktmbuf_free_bulk(&mbufs[nb_tx], nb_pkts - nb_tx);
++			// }
+ 		}
+ 
+ 		conf_idx++;
+@@ -157,16 +217,18 @@ app_tx_thread(struct thread_conf **confs)
+ 	}
+ }
+ 
+-
+ void
+ app_worker_thread(struct thread_conf **confs)
+ {
+ 	struct rte_mbuf *mbufs[burst_conf.ring_burst];
+ 	struct thread_conf *conf;
+ 	int conf_idx = 0;
++	uint16_t tx_port;
++	int bp = 0;
+ 
+ 	while ((conf = confs[conf_idx])) {
+ 		uint32_t nb_pkt;
++		tx_port = conf->tx_port;
+ 
+ 		/* Read packet from the ring */
+ 		nb_pkt = rte_ring_sc_dequeue_burst(conf->rx_ring, (void **)mbufs,
+@@ -179,8 +241,11 @@ app_worker_thread(struct thread_conf **confs)
+ 			APP_STATS_ADD(conf->stat.nb_rx, nb_pkt);
+ 		}
+ 
++		update_backpressure_state(tx_port);
++		// printf("tx_port %d %d\n", tx_port, port_statistics[tx_port].backpressure_active);
+ 		nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs,
+-					burst_conf.qos_dequeue);
++					burst_conf.qos_dequeue, port_statistics[tx_port].bp_active);
++					// burst_conf.qos_dequeue, bp);
+ 
+ 		if (likely(nb_pkt > 0))
+ 			while (rte_ring_sp_enqueue_bulk(conf->tx_ring,
+@@ -200,6 +265,7 @@ app_mixed_thread(struct thread_conf **confs)
+ 	struct rte_mbuf *mbufs[burst_conf.ring_burst];
+ 	struct thread_conf *conf;
+ 	int conf_idx = 0;
++	uint16_t tx_port;
+ 
+ 	while ((conf = confs[conf_idx])) {
+ 		uint32_t nb_pkt;
+@@ -217,7 +283,7 @@ app_mixed_thread(struct thread_conf **confs)
+ 
+ 
+ 		nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs,
+-					burst_conf.qos_dequeue);
++					burst_conf.qos_dequeue, true);
+ 		if (likely(nb_pkt > 0)) {
+ 			uint16_t nb_tx = rte_eth_tx_burst(conf->tx_port, 0, mbufs, nb_pkt);
+ 			if (nb_tx != nb_pkt)
+diff --git a/examples/qos_sched/init.c b/examples/qos_sched/init.c
+index 33045d0a47..47a224c0a1 100644
+--- a/examples/qos_sched/init.c
++++ b/examples/qos_sched/init.c
+@@ -26,6 +26,10 @@ static uint32_t app_inited_port_mask = 0;
+ 
+ int app_pipe_to_profile[MAX_SCHED_SUBPORTS][MAX_SCHED_PIPES];
+ 
++struct rte_port_statistics port_statistics[RTE_MAX_ETHPORTS];
++struct tc_statistics tc_stats;
++struct tx_callback_ctx tx_ctx[RTE_MAX_ETHPORTS][N_TX_QUEUES];
++
+ #define MAX_NAME_LEN 32
+ 
+ struct ring_conf ring_conf = {
+@@ -64,7 +68,6 @@ static struct rte_eth_conf port_conf = {
+ 	},
+ };
+ 
+-
+ typedef uint16_t port_t;
+ typedef uint16_t teid_t;
+ 
+@@ -211,7 +214,7 @@ static void port_hqos_init(uint16_t port) {
+     uint16_t prio = 7;
+ 
+     // pmdlink_add_node(port, qos_nodes[0].teid, prio);
+-    pmdlink_set_shaper(port, qos_nodes[0].teid);
++    // pmdlink_set_shaper(port, qos_nodes[0].teid);
+     for (int i = 0; qos_nodes[i].teid != 0; i++) {
+     	printf("port=%d, teid=%d, parent_teid=%d, queue_id?%d\n",port, qos_nodes[i].teid, qos_nodes[i].parent_teid, qos_nodes[i].tx_queue_id);
+ 	if (qos_nodes[i].tx_queue_id != 0) {
+@@ -220,6 +223,26 @@ static void port_hqos_init(uint16_t port) {
+     }
+ }
+ 
++void
++tx_buffer_count_callback(struct rte_mbuf **pkts, uint16_t unsent,
++				void *userdata)
++{
++	struct tx_callback_ctx *ctx = (struct tx_callback_ctx *)userdata;
++	
++	__atomic_add_fetch(&port_statistics[ctx->portid].dropped[ctx->tc_id], unsent, __ATOMIC_RELEASE);
++//% 	/* NEW: Immediately activate BP when drops occur */
++//% 	__atomic_store_n(&port_statistics[ctx->portid].bp_active[ctx->tc_id], 
++//% 						true, __ATOMIC_RELEASE);
++//		
++//	/* Record when this TC last saw drops */
++//	__atomic_store_n(&port_statistics[ctx->portid].last_drop_tsc[ctx->tc_id],
++//						rte_get_tsc_cycles(), __ATOMIC_RELEASE);
++//	
++	/* Free unsent packets */
++	for (uint16_t i = 0; i < unsent; i++)
++		rte_pktmbuf_free(pkts[i]);
++}
++
+ static int
+ app_init_port(uint16_t portid, struct rte_mempool *mp, bool hqos_init)
+ {
+@@ -313,12 +336,30 @@ app_init_port(uint16_t portid, struct rte_mempool *mp, bool hqos_init)
+ 
+ 		rte_eth_tx_buffer_init(tx_buffer[portid][i], burst);
+ 
++		/* Setup context: queue i maps to TC i */
++	    	tx_ctx[portid][i].portid = portid;
++		tx_ctx[portid][i].tc_id = i;
++		    
++		ret = rte_eth_tx_buffer_set_err_callback(tx_buffer[portid][i], 
++				tx_buffer_count_callback, 
++				&tx_ctx[portid][i]);
++
+ 		if (ret < 0)
+ 			rte_exit(EXIT_FAILURE,
+ 				 "rte_eth_tx_queue_setup: err=%d, port=%u queue=%d\n",
+ 				 ret, portid, i);
+ 	}
+ 
++	/* Initialize port statistics and backpressure state */
++	memset(&port_statistics[portid], 0, sizeof(struct rte_port_statistics));
++	port_statistics[portid].tsc_hz = rte_get_tsc_hz();
++	port_statistics[portid].last_check_tsc = rte_get_tsc_cycles();
++	
++	RTE_LOG(INFO, APP, "Port %u: Backpressure mechanism initialized\n", portid);
++	RTE_LOG(INFO, APP, "  Check interval: %u us\n", BP_CHECK_INTERVAL_US);
++	RTE_LOG(INFO, APP, "  Activation threshold: %u drops\n", BP_THRESHOLD_RATE);
++	RTE_LOG(INFO, APP, "  Recovery threshold: %u drops\n", BP_RECOVERY_RATE);
++
+ 	/* Start device */
+ 	ret = rte_eth_dev_start(portid);
+ 	if (ret < 0)
+diff --git a/examples/qos_sched/main.c b/examples/qos_sched/main.c
+index b74a3c1d3c..caa7a973a4 100644
+--- a/examples/qos_sched/main.c
++++ b/examples/qos_sched/main.c
+@@ -55,6 +55,7 @@ app_main_loop(__rte_unused void *dummy)
+ 
+ 		if (flow->rx_core == lcore_id) {
+ 			flow->rx_thread.rx_port = flow->rx_port;
++			flow->rx_thread.tx_port = flow->tx_port;
+ 			flow->rx_thread.rx_ring =  flow->rx_ring;
+ 			flow->rx_thread.rx_queue = flow->rx_queue;
+ 			flow->rx_thread.sched_port = flow->sched_port;
+@@ -64,6 +65,7 @@ app_main_loop(__rte_unused void *dummy)
+ 			mode |= APP_RX_MODE;
+ 		}
+ 		if (flow->tx_core == lcore_id) {
++			flow->tx_thread.rx_port = flow->rx_port;
+ 			flow->tx_thread.tx_port = flow->tx_port;
+ 			flow->tx_thread.tx_ring =  flow->tx_ring;
+ 			flow->tx_thread.tx_queue = flow->tx_queue;
+@@ -156,10 +158,11 @@ app_stat(void)
+ 		memcpy(&rx_stats[i], &stats, sizeof(stats));
+ 
+ 		rte_eth_stats_get(flow->tx_port, &stats);
+-		printf("TX port %"PRIu16": tx: %" PRIu64 " err: %" PRIu64 "\n",
++		printf("TX port %"PRIu16": tx: %" PRIu64 " err: %" PRIu64 " dropped: %" PRIu64 "\n",
+ 				flow->tx_port,
+ 				stats.opackets - tx_stats[i].opackets,
+-				stats.oerrors - tx_stats[i].oerrors);
++				stats.oerrors - tx_stats[i].oerrors,
++				port_statistics[flow->tx_port].dropped[1]);
+ 		memcpy(&tx_stats[i], &stats, sizeof(stats));
+ 
+ #if APP_COLLECT_STAT
+diff --git a/examples/qos_sched/main.h b/examples/qos_sched/main.h
+index c20eb3db81..024928efa4 100644
+--- a/examples/qos_sched/main.h
++++ b/examples/qos_sched/main.h
+@@ -58,6 +58,7 @@ extern "C" {
+ #define APP_QAVG_PERIOD 100
+ 
+ #define N_TX_QUEUES 2
++#define N_TC 2
+ 
+ struct thread_stat
+ {
+@@ -65,6 +66,54 @@ struct thread_stat
+ 	uint64_t nb_drop;
+ };
+ 
++/* Backpressure tuning parameters */
++#define BP_CHECK_INTERVAL_US 100
++#define BP_THRESHOLD_RATE 0.01    /* Activate at 5% drop rate */
++#define BP_RECOVERY_RATE  0.15    /* Recover at 1% drop rate */
++
++
++/* Global per-TC drop counters (aggregated across all ports) */
++struct tc_statistics {
++	uint64_t dropped[N_TC];  /* Atomically updated drop counts per TC */
++} __rte_cache_aligned;
++
++extern struct tc_statistics tc_stats;
++
++/* Per-port statistics for backpressure mechanism */
++struct rte_port_statistics {
++	/* Drop tracking */
++	uint64_t last_dropped[N_TC];   /* Previous dropped count per TC */
++	uint64_t dropped[N_TC];  /* Atomically updated drop counts per TC */
++
++	/* Statistics */
++	uint64_t last_tx[N_TC];
++	uint64_t tx[N_TC];
++	uint64_t last_rx;
++	uint64_t rx;
++
++	
++	/* Timing */
++	uint64_t last_check_tsc;       /* TSC of last BP check */
++	uint64_t tsc_hz;               /* TSC frequency */
++	
++	/* Backpressure state per TC */
++	bool bp_active[N_TC];          /* true if BP currently active for this TC */
++
++	uint64_t last_drop_tsc[N_TC];  /* TSC when this TC last had drops */
++
++} __rte_cache_aligned;
++
++/* TX buffer callback context with TC information */
++struct tx_callback_ctx {
++	uint16_t portid;  /* Port ID for logging/debugging */
++	uint8_t tc_id;    /* Traffic class ID (maps to queue ID) */
++};
++
++extern struct tx_callback_ctx tx_ctx[RTE_MAX_ETHPORTS][N_TX_QUEUES];
++extern struct rte_port_statistics port_statistics[RTE_MAX_ETHPORTS];
++
++void tx_buffer_count_callback(struct rte_mbuf **pkts, uint16_t unsent, void *userdata);
++
+ 
+ struct thread_conf
+ {
+diff --git a/examples/qos_sched/pmdlink.h b/examples/qos_sched/pmdlink.h
+index 0394c96a2f..4282445917 100644
+--- a/examples/qos_sched/pmdlink.h
++++ b/examples/qos_sched/pmdlink.h
+@@ -1,4 +1,3 @@
+-#define _GNU_SOURCE
+ #include <assert.h>
+ #include <inttypes.h>
+ #include <pthread.h>
+diff --git a/lib/port/rte_port_sched.c b/lib/port/rte_port_sched.c
+index 8a7d815ef3..7319af51ea 100644
+--- a/lib/port/rte_port_sched.c
++++ b/lib/port/rte_port_sched.c
+@@ -64,7 +64,7 @@ rte_port_sched_reader_rx(void *port, struct rte_mbuf **pkts, uint32_t n_pkts)
+ 	struct rte_port_sched_reader *p = port;
+ 	uint32_t nb_rx;
+ 
+-	nb_rx = rte_sched_port_dequeue(p->sched, pkts, n_pkts);
++	nb_rx = rte_sched_port_dequeue(p->sched, pkts, n_pkts, true);
+ 	RTE_PORT_SCHED_READER_PKTS_IN_ADD(p, nb_rx);
+ 
+ 	return nb_rx;
+diff --git a/lib/sched/rte_sched.c b/lib/sched/rte_sched.c
+index 6ec372ca59..686c8b468b 100644
+--- a/lib/sched/rte_sched.c
++++ b/lib/sched/rte_sched.c
+@@ -2378,7 +2378,7 @@ grinder_credits_update_with_tc_ov(struct rte_sched_port *port,
+ 
+ static inline int
+ grinder_credits_check(struct rte_sched_port *port,
+-	struct rte_sched_subport *subport, uint32_t pos)
++	struct rte_sched_subport *subport, uint32_t pos, bool *bp)
+ {
+ 	struct rte_sched_grinder *grinder = subport->grinder + pos;
+ 	struct rte_sched_pipe *pipe = grinder->pipe;
+@@ -2400,6 +2400,9 @@ grinder_credits_check(struct rte_sched_port *port,
+ 	if (!enough_credits)
+ 		return 0;
+ 
++	if (bp[tc_index] == true)
++		return 0;
++
+ 	/* Update pipe and subport credits */
+ 	subport->tb_credits -= pkt_len;
+ 	subport->tc_credits[tc_index] -= pkt_len;
+@@ -2411,13 +2414,12 @@ grinder_credits_check(struct rte_sched_port *port,
+ 
+ static inline int
+ grinder_credits_check_with_tc_ov(struct rte_sched_port *port,
+-	struct rte_sched_subport *subport, uint32_t pos)
++	struct rte_sched_subport *subport, uint32_t pos, bool *bp)
+ {
+ 	struct rte_sched_grinder *grinder = subport->grinder + pos;
+ 	struct rte_sched_pipe *pipe = grinder->pipe;
+ 	struct rte_mbuf *pkt = grinder->pkt;
+ 	uint32_t tc_index = grinder->tc_index;
+-	uint32_t sp_tc_index = grinder->pindex >> 9;
+ 	uint64_t pkt_len = pkt->pkt_len + port->frame_overhead;
+ 	uint64_t subport_tb_credits = subport->tb_credits;
+ 	uint64_t subport_tc_credits = subport->tc_credits[tc_index];
+@@ -2446,6 +2448,9 @@ grinder_credits_check_with_tc_ov(struct rte_sched_port *port,
+ 	if (!enough_credits)
+ 		return 0;
+ 
++	if (bp[tc_index] == true)
++		subport->tc_credits[tc_index] -= 100000000;
++
+ 	/* Update pipe and subport credits */
+ 	subport->tb_credits -= pkt_len;
+ 	subport->tc_credits[tc_index] -= pkt_len;
+@@ -2459,7 +2464,7 @@ grinder_credits_check_with_tc_ov(struct rte_sched_port *port,
+ 
+ static inline int
+ grinder_schedule(struct rte_sched_port *port,
+-	struct rte_sched_subport *subport, uint32_t pos)
++	struct rte_sched_subport *subport, uint32_t pos, bool *bp)
+ {
+ 	struct rte_sched_grinder *grinder = subport->grinder + pos;
+ 	struct rte_sched_queue *queue = grinder->queue[grinder->qpos];
+@@ -2469,10 +2474,10 @@ grinder_schedule(struct rte_sched_port *port,
+ 	uint32_t be_tc_active;
+ 
+ 	if (subport->tc_ov_enabled) {
+-		if (!grinder_credits_check_with_tc_ov(port, subport, pos))
++		if (!grinder_credits_check_with_tc_ov(port, subport, pos, bp))
+ 			return 0;
+ 	} else {
+-		if (!grinder_credits_check(port, subport, pos))
++		if (!grinder_credits_check(port, subport, pos, bp))
+ 			return 0;
+ 	}
+ 
+@@ -2813,7 +2818,7 @@ grinder_prefetch_mbuf(struct rte_sched_subport *subport, uint32_t pos)
+ 
+ static inline uint32_t
+ grinder_handle(struct rte_sched_port *port,
+-	struct rte_sched_subport *subport, uint32_t pos)
++	struct rte_sched_subport *subport, uint32_t pos, bool *bp)
+ {
+ 	struct rte_sched_grinder *grinder = subport->grinder + pos;
+ 
+@@ -2862,7 +2867,7 @@ grinder_handle(struct rte_sched_port *port,
+ 	{
+ 		uint32_t wrr_active, result = 0;
+ 
+-		result = grinder_schedule(port, subport, pos);
++		result = grinder_schedule(port, subport, pos, bp);
+ 
+ 		wrr_active = (grinder->tc_index == RTE_SCHED_TRAFFIC_CLASS_BE);
+ 
+@@ -2958,7 +2963,7 @@ rte_sched_port_exceptions(struct rte_sched_subport *subport, int second_pass)
+ }
+ 
+ int
+-rte_sched_port_dequeue(struct rte_sched_port *port, struct rte_mbuf **pkts, uint32_t n_pkts)
++rte_sched_port_dequeue(struct rte_sched_port *port, struct rte_mbuf **pkts, uint32_t n_pkts, bool *bp)
+ {
+ 	struct rte_sched_subport *subport;
+ 	uint32_t subport_id = port->subport_id;
+@@ -2974,7 +2979,7 @@ rte_sched_port_dequeue(struct rte_sched_port *port, struct rte_mbuf **pkts, uint
+ 		subport = port->subports[subport_id];
+ 
+ 		count += grinder_handle(port, subport,
+-				i & (RTE_SCHED_PORT_N_GRINDERS - 1));
++				i & (RTE_SCHED_PORT_N_GRINDERS - 1), bp);
+ 
+ 		if (count == n_pkts) {
+ 			subport_id++;
+diff --git a/lib/sched/rte_sched.h b/lib/sched/rte_sched.h
+index a9ac5909ad..c30b7fa0f0 100644
+--- a/lib/sched/rte_sched.h
++++ b/lib/sched/rte_sched.h
+@@ -576,7 +576,7 @@ rte_sched_port_enqueue(struct rte_sched_port *port, struct rte_mbuf **pkts, uint
+  *   Number of packets successfully dequeued and placed in the pkts array
+  */
+ int
+-rte_sched_port_dequeue(struct rte_sched_port *port, struct rte_mbuf **pkts, uint32_t n_pkts);
++rte_sched_port_dequeue(struct rte_sched_port *port, struct rte_mbuf **pkts, uint32_t n_pkts, bool *bp);
+ 
+ /**
+  * Hierarchical scheduler subport traffic class
+-- 
+2.34.1
+

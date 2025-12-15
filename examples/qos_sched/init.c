@@ -333,7 +333,7 @@ app_init_port(uint16_t portid, struct rte_mempool *mp, bool hqos_init)
 
 		int burst = 1;
 		if (i != 0)
-			burst = 4;
+			burst = 1024;
 
 		tx_buffer[portid][i] = rte_zmalloc_socket("tx_buffer",
 				RTE_ETH_TX_BUFFER_SIZE(burst), 0,
