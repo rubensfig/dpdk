@@ -52,18 +52,33 @@ pending_init(struct pending_q *q)
 	    q->head = q->tail = q->cnt = 0;
 }
 
+static inline void pending_enqueue_burst(struct pending_q *q, struct rte_mbuf **mbufs, uint16_t nb_mbufs) {
+	for (uint16_t i = 0; i < nb_mbufs; i++) {
+		if (unlikely(q->cnt == PENDING_MAX)) {
+		/* policy decision: drop remaining packets */
+		rte_pktmbuf_free(mbufs[i]);
+		continue;
+		}
+
+		q->pkts[q->tail] = mbufs[i];
+		q->tail = (q->tail + 1) & (PENDING_MAX - 1);
+		q->cnt++;
+
+	}
+}
+
 static inline void
 pending_enqueue(struct pending_q *q, struct rte_mbuf *m)
 {
-	    if (unlikely(q->cnt == PENDING_MAX)) {
-		            /* policy decision: drop */
-		            rte_pktmbuf_free(m);
-			            return;
-				        }
+    if (unlikely(q->cnt == PENDING_MAX)) {
+		    /* policy decision: drop */
+		    rte_pktmbuf_free(m);
+			    return;
+				}
 
-	        q->pkts[q->tail] = m;
-		    q->tail = (q->tail + 1) & (PENDING_MAX - 1);
-		        q->cnt++;
+     q->pkts[q->tail] = m;
+     q->tail = (q->tail + 1) & (PENDING_MAX - 1);
+     q->cnt++;
 }
 
 static inline uint16_t
@@ -109,7 +124,7 @@ static inline int get_pkt_sched(struct rte_mbuf *m, uint32_t *subport, uint32_t 
 
  	/* Traffic class queue (TOS) */
  	*queue = pipe_queue - *traffic_class;
- 	
+
  	/* Color */
  	*color = 0;
 
@@ -257,74 +272,83 @@ app_mixed_thread(struct thread_conf **confs)
     uint32_t pending_cnt = 0;
     uint32_t pending_cnt_pq[N_TC];
 
-    struct pending_q pending;
-    // for (int i = 0; i < N_TC; i++)
-	pending_init(&pending);
+    uint16_t tc_ov[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
+
+    struct pending_q pending[N_TC];
+    for (int i = 0; i < N_TC; i++)
+	pending_init(&pending[i]);
+
+    struct rte_mbuf *tc_mbufs[N_TC][burst_conf.qos_dequeue];
+    struct rte_mbuf **pkts[N_TC];
+    uint32_t tc_counts[N_TC];
+
+    /* Initialize pkts array programatically */
+    for (int tc = 0; tc < N_TC; tc++) {
+	        pkts[tc] = tc_mbufs[tc];
+		tc_ov[tc] = 4096;
+    }
+
 
     while ((conf = confs[conf_idx])) {
+	uint32_t nb_pkt_rec = 0;
+	uint32_t nb_pkt_deq = 0;
+	
+	/* RX → Scheduler enqueue */
+	nb_pkt_rec = rte_ring_sc_dequeue_burst(conf->rx_ring, (void **)mbufs, burst_conf.ring_burst, NULL);
 
-        uint32_t nb_pkt_rec = 0;
-        uint32_t nb_pkt_deq = 0;
-
-        /* ============================================================
-         * RX → Scheduler enqueue
-         * ============================================================ */
-        nb_pkt_rec = rte_ring_sc_dequeue_burst(conf->rx_ring,
-                                               (void **)mbufs,
-                                               burst_conf.ring_burst,
-                                               NULL);
-
-        if (likely(nb_pkt_rec)) {
-            uint32_t nb_sent = rte_sched_port_enqueue(conf->sched_port,
-                                                      mbufs, nb_pkt_rec);
-
-            APP_STATS_ADD(conf->stat.nb_drop, nb_pkt_rec - nb_sent);
-            APP_STATS_ADD(conf->stat.nb_rx,  nb_pkt_rec);
-        }
-
-        /* ============================================================
-         * TX path
-         * ============================================================ */
-	if (pending.cnt) {
-		uint16_t n = pending_peek(&pending, mbufs, burst_conf.qos_dequeue);
-		
-		uint16_t sent = rte_eth_tx_burst(conf->tx_port, 0, mbufs, n);
-		
-		if (sent) {
-			pending_consume(&pending, sent);
-			APP_STATS_ADD(conf->stat.nb_tx, sent);
-		}
+	if (likely(nb_pkt_rec)) {
+		uint32_t nb_sent = rte_sched_port_enqueue(conf->sched_port, mbufs, nb_pkt_rec);
+		APP_STATS_ADD(conf->stat.nb_drop, nb_pkt_rec - nb_sent);
+		APP_STATS_ADD(conf->stat.nb_rx,  nb_pkt_rec);
 	}
-		
-	/* ============================================================
-	*      * TX path – dequeue new only if no pending
-	* ============================================================ */
-	if (pending.cnt == 0) {
-		
-		nb_pkt_deq = rte_sched_port_dequeue(conf->sched_port,
-		mbufs,
-		burst_conf.qos_dequeue,
-		NULL);
-		
-		if (nb_pkt_deq) {
-			uint16_t sent = rte_eth_tx_burst(conf->tx_port, 0,
-			mbufs, nb_pkt_deq);
-			
-			if (sent < nb_pkt_deq) {
-				for (uint16_t i = sent; i < nb_pkt_deq; i++)
-					pending_enqueue(&pending, mbufs[i]);
+	
+	/* TX path - send pending packets first */
+	for (int tc = 0; tc < N_TC; tc++) {
+		tc_counts[tc] = 0;
+	/*
+		uint16_t n = pending_peek(&pending[tc], mbufs, burst_conf.qos_dequeue);
+		if (n > 0) {
+			uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, mbufs, n);
+			if (sent) {
+				pending_consume(&pending[tc], sent);
+				APP_STATS_ADD(conf->stat.nb_tx, sent);
 			}
-		
-		APP_STATS_ADD(conf->stat.nb_tx, sent);
+
+		        if (pending[tc].cnt >= tc_ov[tc])
+			//	tc_ov[tc] = 0;
+				tc_ov[tc] = tc_ov[tc] / 2;
+			else
+				tc_ov[tc] -= pending[tc].cnt;
+			printf("cap [%d] %d tc ov [%d] %d\n", tc, pending[tc].cnt, tc, tc_ov[tc]);
 		}
+	*/
+	}
+	
+	/* Dequeue from scheduler and send new packets */
+	nb_pkt_deq = rte_sched_port_dequeue_tc(conf->sched_port, pkts, burst_conf.qos_dequeue, NULL, tc_counts);
+
+	for (int tc = 0; tc < N_TC; tc++) {
+		if (tc_counts[tc] == 0)
+			continue;
+
+		// printf("tc_counts[%d] %d\n", tc, tc_counts[tc]);
+	    	uint16_t max_burst = burst_conf.qos_dequeue / N_TC;  // Fair share
+		uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, pkts[tc], tc_counts[tc]);
+
+		// uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, pkts[tc], tc_counts[tc]);
+
+		// if (unlikely(sent < tc_counts[tc])) {
+		// 	pending_enqueue_burst( &pending[tc], &pkts[tc][sent], tc_counts[tc] - sent);
+		// }
+		// printf("sent %d tc counts [%d] %d cap [%d] %d tc ov [%d] %d\n", sent, tc, tc_counts[tc], tc, pending[tc].cnt, tc, tc_ov[tc]);
+
+		APP_STATS_ADD(conf->stat.nb_tx, sent);
 	}
 
-
-        /* Advance conf pointer */
-        conf_idx++;
-        if (confs[conf_idx] == NULL)
-            conf_idx = 0;
-    }
+	conf_idx++;
+	if (confs[conf_idx] == NULL)
+	conf_idx = 0;
+     }
 }
 
 
