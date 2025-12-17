@@ -195,7 +195,6 @@ app_tx_thread(struct thread_conf **confs)
 	while ((conf = confs[conf_idx])) {
 		nb_pkts = rte_ring_sc_dequeue_burst(conf->tx_ring, (void **)mbufs,
 					burst_conf.qos_dequeue, NULL);
-		uint16_t nb_tx = 0;
 		if (likely(nb_pkts != 0)) {
 			for(int i = 0; i < nb_pkts; i++) {
 				int tx_queue = mbufs[i]->hash.sched.traffic_class;
@@ -207,7 +206,7 @@ app_tx_thread(struct thread_conf **confs)
 
 				buffer = tx_buffer[tx_port][tx_queue];
 					
-				nb_tx = rte_eth_tx_buffer(tx_port, tx_queue, buffer, mbufs[i]);
+				rte_eth_tx_buffer(tx_port, tx_queue, buffer, mbufs[i]);
 			}
 
 			// nb_tx = rte_eth_tx_burst(conf->tx_port, 0, mbufs, nb_pkts);
@@ -245,7 +244,7 @@ app_worker_thread(struct thread_conf **confs)
 		}
 
 		nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs,
-					burst_conf.qos_dequeue, NULL);
+					burst_conf.qos_dequeue);
 
 		if (likely(nb_pkt > 0))
 			while (rte_ring_sp_enqueue_bulk(conf->tx_ring,
@@ -291,7 +290,6 @@ app_mixed_thread(struct thread_conf **confs)
 
     while ((conf = confs[conf_idx])) {
 	uint32_t nb_pkt_rec = 0;
-	uint32_t nb_pkt_deq = 0;
 	
 	/* RX → Scheduler enqueue */
 	nb_pkt_rec = rte_ring_sc_dequeue_burst(conf->rx_ring, (void **)mbufs, burst_conf.ring_burst, NULL);
@@ -325,14 +323,13 @@ app_mixed_thread(struct thread_conf **confs)
 	}
 	
 	/* Dequeue from scheduler and send new packets */
-	nb_pkt_deq = rte_sched_port_dequeue_tc(conf->sched_port, pkts, burst_conf.qos_dequeue, NULL, tc_counts);
+	rte_sched_port_dequeue_tc(conf->sched_port, pkts, burst_conf.qos_dequeue, NULL, tc_counts);
 
 	for (int tc = 0; tc < N_TC; tc++) {
 		if (tc_counts[tc] == 0)
 			continue;
 
 		// printf("tc_counts[%d] %d\n", tc, tc_counts[tc]);
-	    	uint16_t max_burst = burst_conf.qos_dequeue / N_TC;  // Fair share
 		uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, pkts[tc], tc_counts[tc]);
 
 		// uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, pkts[tc], tc_counts[tc]);

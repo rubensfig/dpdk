@@ -24,6 +24,11 @@
 uint32_t app_numa_mask = 0;
 static uint32_t app_inited_port_mask = 0;
 
+void pmdlink_set_shaper(uint16_t port, uint16_t source_teid);
+void pmdlink_node_priority(uint16_t port, uint16_t source_teid, uint16_t tx_priority);
+void pmdlink_add_node(uint16_t port, uint16_t source_teid, uint16_t tx_priority);
+
+
 int app_pipe_to_profile[MAX_SCHED_SUBPORTS][MAX_SCHED_PIPES];
 
 struct port_statistics_t port_statistics[RTE_MAX_ETHPORTS];
@@ -236,10 +241,10 @@ tx_buffer_count_callback(struct rte_mbuf **pkts, uint16_t unsent,
 		rte_pktmbuf_free(pkts[i]);
 }
 
+/*
 static void initialize_port_statistics(uint16_t port)
 {
 	struct port_statistics_t *stats = &port_statistics[port];
-	uint64_t hz = rte_get_tsc_hz();
 	
 	stats->tx_port = port;
 	for (int tc = 0; tc < N_TC; tc++)
@@ -250,6 +255,7 @@ static void initialize_port_statistics(uint16_t port)
 	stats->backpressure->last_state_change = rte_get_timer_cycles();
 	stats->load_stats.last_update_time = rte_get_timer_cycles();
 }
+*/
 
 static int
 app_init_port(uint16_t portid, struct rte_mempool *mp, bool hqos_init)

@@ -291,7 +291,7 @@ cfg_load_subport(struct rte_cfgfile *cfg, struct rte_sched_subport_params *subpo
 	if (!cfg || !subport_params)
 		return -1;
 
-	printf("CFG %x\n",&cfg);
+// printf("CFG %x\n",&cfg);
 	memset(app_pipe_to_profile, -1, sizeof(app_pipe_to_profile));
 	memset(active_queues, 0, sizeof(uint32_t));
 	n_active_queues = 0;
