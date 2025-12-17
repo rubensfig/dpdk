@@ -107,20 +107,20 @@ prepare_pkt(struct rte_sched_port *port, struct rte_mbuf *mbuf)
 	struct rte_ipv4_hdr *ip_hdr;
 
 	/* Simulate a classifier */
-	// eth_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
-	// vlan1 = (struct rte_vlan_hdr *)(&eth_hdr->ether_type);
-	// vlan2 = (struct rte_vlan_hdr *)(
-	// 	(uintptr_t)&eth_hdr->ether_type + sizeof(struct rte_vlan_hdr));
-	// eth_hdr = (struct rte_ether_hdr *)(
-	// 	(uintptr_t)&eth_hdr->ether_type +
-	// 	2 * sizeof(struct rte_vlan_hdr));
-	// ip_hdr = (struct rte_ipv4_hdr *)(
-	// 	(uintptr_t)eth_hdr + sizeof(eth_hdr->ether_type));
+	eth_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
+	vlan1 = (struct rte_vlan_hdr *)(&eth_hdr->ether_type);
+	vlan2 = (struct rte_vlan_hdr *)(
+		(uintptr_t)&eth_hdr->ether_type + sizeof(struct rte_vlan_hdr));
+	eth_hdr = (struct rte_ether_hdr *)(
+		(uintptr_t)&eth_hdr->ether_type +
+		2 * sizeof(struct rte_vlan_hdr));
+	ip_hdr = (struct rte_ipv4_hdr *)(
+		(uintptr_t)eth_hdr + sizeof(eth_hdr->ether_type));
 
-	// vlan1->vlan_tci = rte_cpu_to_be_16(SUBPORT);
-	// vlan2->vlan_tci = rte_cpu_to_be_16(PIPE);
-	// eth_hdr->ether_type =  rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
-	// ip_hdr->dst_addr = RTE_IPV4(0,0,TC,QUEUE);
+	vlan1->vlan_tci = rte_cpu_to_be_16(SUBPORT);
+	vlan2->vlan_tci = rte_cpu_to_be_16(PIPE);
+	eth_hdr->ether_type =  rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+	ip_hdr->dst_addr = RTE_IPV4(0,0,TC,QUEUE);
 
 
 	rte_sched_port_pkt_write(port, mbuf, SUBPORT, PIPE, TC, QUEUE,
@@ -174,7 +174,7 @@ test_sched(void)
 	err = rte_sched_port_enqueue(port, in_mbufs, 10);
 	TEST_ASSERT_EQUAL(err, 10, "Wrong enqueue, err=%d\n", err);
 
-	err = rte_sched_port_dequeue(port, out_mbufs, 10, true);
+	err = rte_sched_port_dequeue(port, out_mbufs, 10);
 	TEST_ASSERT_EQUAL(err, 10, "Wrong dequeue, err=%d\n", err);
 
 	for (i = 0; i < 10; i++) {
@@ -212,7 +212,95 @@ test_sched(void)
 
 	return 0;
 }
+#define N_TC 16
+#define BURST 10
+
+static int
+test_sched2(void)
+{
+	struct rte_mempool *mp = NULL;
+	struct rte_sched_port *port = NULL;
+	uint32_t pipe;
+	struct rte_mbuf *in_mbufs[BURST];
+	struct rte_mbuf **out_mbufs[N_TC];
+	int i;
+
+        struct rte_mbuf *tc_mbufs[N_TC][BURST];
+    	uint32_t tc_counts[N_TC];
+
+        for (int tc = 0; tc < N_TC; tc++) {
+		out_mbufs[tc] = tc_mbufs[tc];
+        }
+
+	int err;
+
+	mp = create_mempool();
+	TEST_ASSERT_NOT_NULL(mp, "Error creating mempool\n");
+
+	port_param.socket = 0;
+	port_param.rate = (uint64_t) 10000 * 1000 * 1000 / 8;
+
+	port = rte_sched_port_config(&port_param);
+	TEST_ASSERT_NOT_NULL(port, "Error config sched port\n");
+
+	err = rte_sched_subport_config(port, SUBPORT, subport_param, 0);
+	TEST_ASSERT_SUCCESS(err, "Error config sched, err=%d\n", err);
+
+	for (pipe = 0; pipe < subport_param[0].n_pipes_per_subport_enabled; pipe++) {
+		err = rte_sched_pipe_config(port, SUBPORT, pipe, 0);
+		TEST_ASSERT_SUCCESS(err, "Error config sched pipe %u, err=%d\n", pipe, err);
+	}
+
+	for (i = 0; i < 10; i++) {
+		in_mbufs[i] = rte_pktmbuf_alloc(mp);
+		TEST_ASSERT_NOT_NULL(in_mbufs[i], "Packet allocation failed\n");
+		prepare_pkt(port, in_mbufs[i]);
+	}
+
+
+	err = rte_sched_port_enqueue(port, in_mbufs, 10);
+	TEST_ASSERT_EQUAL(err, 10, "Wrong enqueue, err=%d\n", err);
+
+	err = rte_sched_port_dequeue_tc(port, out_mbufs, 10, NULL, tc_counts);
+	TEST_ASSERT_EQUAL(err, 10, "Wrong dequeue, err=%d\n", err);
+
+	for (i = 0; i < 10; i++) {
+		enum rte_color color;
+		uint32_t subport, traffic_class, queue;
+
+		color = rte_sched_port_pkt_read_color(out_mbufs[TC][i]);
+		TEST_ASSERT_EQUAL(color, RTE_COLOR_YELLOW, "Wrong color\n");
+
+		rte_sched_port_pkt_read_tree_path(port, out_mbufs[TC][i],
+				&subport, &pipe, &traffic_class, &queue);
+
+		TEST_ASSERT_EQUAL(subport, SUBPORT, "Wrong subport\n");
+		TEST_ASSERT_EQUAL(pipe, PIPE, "Wrong pipe\n");
+		TEST_ASSERT_EQUAL(traffic_class, TC, "Wrong traffic_class\n");
+		TEST_ASSERT_EQUAL(queue, QUEUE, "Wrong queue\n");
+
+	}
+
+
+	struct rte_sched_subport_stats subport_stats;
+	uint32_t tc_ov;
+	rte_sched_subport_read_stats(port, SUBPORT, &subport_stats, &tc_ov);
+#if 0
+	TEST_ASSERT_EQUAL(subport_stats.n_pkts_tc[TC-1], 10, "Wrong subport stats\n");
+#endif
+	struct rte_sched_queue_stats queue_stats;
+	uint16_t qlen;
+	rte_sched_queue_read_stats(port, QUEUE, &queue_stats, &qlen);
+#if 0
+	TEST_ASSERT_EQUAL(queue_stats.n_pkts, 10, "Wrong queue stats\n");
+#endif
+
+	rte_sched_port_free(port);
+
+	return 0;
+}
 
 #endif /* !RTE_EXEC_ENV_WINDOWS */
 
 REGISTER_TEST_COMMAND(sched_autotest, test_sched);
+REGISTER_TEST_COMMAND(sched2_autotest, test_sched2);
