@@ -2984,7 +2984,52 @@ rte_sched_port_exceptions(struct rte_sched_subport *subport, int second_pass)
 }
 
 int
-rte_sched_port_dequeue(struct rte_sched_port *port, struct rte_mbuf ***pkts, uint32_t n_pkts, uint32_t *capacity_pct) {}
+rte_sched_port_dequeue(struct rte_sched_port *port, struct rte_mbuf **pkts, uint32_t n_pkts) {
+
+	struct rte_sched_subport *subport;
+	uint32_t subport_id = port->subport_id;
+	uint32_t i, n_subports = 0, count;
+
+	port->pkts_out = pkts;
+	port->n_pkts_out = 0;
+
+	rte_sched_port_time_resync(port);
+
+	/* Take each queue in the grinder one step further */
+	for (i = 0, count = 0; ; i++)  {
+		subport = port->subports[subport_id];
+
+		count += grinder_handle(port, subport,
+				i & (RTE_SCHED_PORT_N_GRINDERS - 1), NULL);
+
+		if (count == n_pkts) {
+			subport_id++;
+
+			if (subport_id == port->n_subports_per_port)
+				subport_id = 0;
+
+			port->subport_id = subport_id;
+			break;
+		}
+
+		if (rte_sched_port_exceptions(subport, i >= RTE_SCHED_PORT_N_GRINDERS)) {
+			i = 0;
+			subport_id++;
+			n_subports++;
+		}
+
+		if (subport_id == port->n_subports_per_port)
+			subport_id = 0;
+
+		if (n_subports == port->n_subports_per_port) {
+			port->subport_id = subport_id;
+			break;
+		}
+	}
+
+	return count;
+
+}
 
 int
 rte_sched_port_dequeue_tc(struct rte_sched_port *port, struct rte_mbuf ***pkts, uint32_t n_pkts, uint32_t *capacity_pct, uint32_t *tc_counts)
