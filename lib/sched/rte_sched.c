@@ -2495,11 +2495,9 @@ grinder_schedule(struct rte_sched_port *port,
 			return 0;
 	}
 
-	/*
-	if (capacity_pct && capacity_pct[tc] == 0){
+	if (capacity_pct && capacity_pct[tc]  == 0) {
 		return 0;
 	}
-	*/
 
 	/* Advance port time */
 	port->time += pkt_len;
@@ -2527,6 +2525,11 @@ grinder_schedule(struct rte_sched_port *port,
 	/* Reset pipe loop detection */
 	subport->pipe_loop = RTE_SCHED_PIPE_INVALID;
 	grinder->productive = 1;
+
+	if (capacity_pct) {
+		capacity_pct[tc]--;
+	}
+
 
 	return 1;
 }

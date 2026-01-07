@@ -272,7 +272,7 @@ app_mixed_thread(struct thread_conf **confs)
     uint32_t pending_cnt = 0;
     uint32_t pending_cnt_pq[N_TC];
 
-    uint16_t tc_ov[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
+    uint32_t tc_ov[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
 
     struct pending_q pending[N_TC];
     for (int i = 0; i < N_TC; i++)
@@ -305,7 +305,6 @@ app_mixed_thread(struct thread_conf **confs)
 	/* TX path - send pending packets first */
 	for (int tc = 0; tc < N_TC; tc++) {
 		tc_counts[tc] = 0;
-	/*
 		uint16_t n = pending_peek(&pending[tc], mbufs, burst_conf.qos_dequeue);
 		if (n > 0) {
 			uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, mbufs, n);
@@ -314,18 +313,14 @@ app_mixed_thread(struct thread_conf **confs)
 				APP_STATS_ADD(conf->stat.nb_tx, sent);
 			}
 
-		        if (pending[tc].cnt >= tc_ov[tc])
-			//	tc_ov[tc] = 0;
-				tc_ov[tc] = tc_ov[tc] / 2;
-			else
-				tc_ov[tc] -= pending[tc].cnt;
-			printf("cap [%d] %d tc ov [%d] %d\n", tc, pending[tc].cnt, tc, tc_ov[tc]);
 		}
-	*/
+			uint16_t space = PENDING_MAX - pending[tc].cnt;
+			tc_ov[tc] = RTE_MIN(space, burst_conf.qos_dequeue);
+			// printf("cap [%d] %d tc ov [%d] %d\n", tc, pending[tc].cnt, tc, tc_ov[tc]);
 	}
 	
 	/* Dequeue from scheduler and send new packets */
-	nb_pkt_deq = rte_sched_port_dequeue_tc(conf->sched_port, pkts, burst_conf.qos_dequeue, NULL, tc_counts);
+	nb_pkt_deq = rte_sched_port_dequeue_tc(conf->sched_port, pkts, burst_conf.qos_dequeue, tc_ov, tc_counts);
 
 	for (int tc = 0; tc < N_TC; tc++) {
 		if (tc_counts[tc] == 0)
@@ -337,9 +332,9 @@ app_mixed_thread(struct thread_conf **confs)
 
 		// uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, pkts[tc], tc_counts[tc]);
 
-		// if (unlikely(sent < tc_counts[tc])) {
-		// 	pending_enqueue_burst( &pending[tc], &pkts[tc][sent], tc_counts[tc] - sent);
-		// }
+		if (unlikely(sent < tc_counts[tc])) {
+			pending_enqueue_burst( &pending[tc], &pkts[tc][sent], tc_counts[tc] - sent);
+		}
 		// printf("sent %d tc counts [%d] %d cap [%d] %d tc ov [%d] %d\n", sent, tc, tc_counts[tc], tc, pending[tc].cnt, tc, tc_ov[tc]);
 
 		APP_STATS_ADD(conf->stat.nb_tx, sent);
