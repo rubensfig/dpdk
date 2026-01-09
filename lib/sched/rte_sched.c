@@ -239,6 +239,8 @@ struct rte_sched_port {
 	/* Grinders */
 	struct rte_mbuf **pkts_out;
 	uint32_t n_pkts_out;
+	struct rte_mbuf ***pkts_out_tc;
+	uint32_t tc_pkts_out[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
 	uint32_t subport_id;
 
 	/* Large data structures */
@@ -969,6 +971,16 @@ rte_sched_port_config(struct rte_sched_port_params *params)
 		return NULL;
 	}
 
+	port->pkts_out_tc = rte_zmalloc_socket("pkts_out_tc",
+	    sizeof(struct rte_mbuf **) * RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE,
+	    RTE_CACHE_LINE_SIZE, params->socket);
+
+	for (i = 0; i < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; i++) {
+	    port->pkts_out_tc[i] = rte_zmalloc_socket("pkts_out_tc_row",
+		sizeof(struct rte_mbuf *) * MAX_BURST,
+		RTE_CACHE_LINE_SIZE, params->socket);
+	}
+
 	/* User parameters */
 	port->n_subports_per_port = params->n_subports_per_port;
 	port->n_subport_profiles = params->n_subport_profiles;
@@ -978,8 +990,10 @@ rte_sched_port_config(struct rte_sched_port_params *params)
 			__builtin_ctz(params->n_pipes_per_subport);
 	port->socket = params->socket;
 
-	for (i = 0; i < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; i++)
+	for (i = 0; i < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; i++) {
 		port->pipe_queue[i] = i;
+		port->tc_pkts_out[i] = 0;
+	}
 
 	for (i = 0, j = 0; i < RTE_SCHED_QUEUES_PER_PIPE; i++) {
 		port->pipe_tc[i] = j;
@@ -2466,6 +2480,7 @@ grinder_schedule(struct rte_sched_port *port,
 	uint32_t qindex = grinder->qindex[grinder->qpos];
 	struct rte_mbuf *pkt = grinder->pkt;
 	uint32_t pkt_len = pkt->pkt_len + port->frame_overhead;
+	uint32_t tc = grinder->tc_index;
 	uint32_t be_tc_active;
 
 	if (subport->tc_ov_enabled) {
@@ -2480,7 +2495,8 @@ grinder_schedule(struct rte_sched_port *port,
 	port->time += pkt_len;
 
 	/* Send packet */
-	port->pkts_out[port->n_pkts_out++] = pkt;
+	// port->pkts_out[port->n_pkts_out++] = pkt;
+	port->pkts_out_tc[tc][port->tc_pkts_out[tc]++] = pkt;
 	queue->qr++;
 
 	be_tc_active = (grinder->tc_index == RTE_SCHED_TRAFFIC_CLASS_BE) ? ~0x0 : 0x0;
@@ -2959,12 +2975,19 @@ rte_sched_port_exceptions(struct rte_sched_subport *subport, int second_pass)
 
 int
 rte_sched_port_dequeue(struct rte_sched_port *port, struct rte_mbuf **pkts, uint32_t n_pkts)
+int
+rte_sched_port_dequeue_tc(struct rte_sched_port *port, struct rte_mbuf ***pkts, uint32_t n_pkts, uint32_t *capacity_pct, uint32_t *tc_counts)
 {
 	struct rte_sched_subport *subport;
 	uint32_t subport_id = port->subport_id;
 	uint32_t i, n_subports = 0, count;
 
-	port->pkts_out = pkts;
+	// port->pkts_out = pkts;
+	    // Reset counters at the start
+    	for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
+        	port->tc_pkts_out[tc] = 0;
+    	}
+	// port->pkts_out_tc = pkts;
 	port->n_pkts_out = 0;
 
 	rte_sched_port_time_resync(port);
@@ -3001,5 +3024,16 @@ rte_sched_port_dequeue(struct rte_sched_port *port, struct rte_mbuf **pkts, uint
 		}
 	}
 
-	return count;
+	uint32_t total = 0;
+	    for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
+		if (port->tc_pkts_out[tc] > 0 && pkts[tc] != NULL && port->pkts_out_tc[tc] != NULL) {
+            		rte_memcpy(pkts[tc], port->pkts_out_tc[tc],
+                   		port->tc_pkts_out[tc] * sizeof(struct rte_mbuf *));
+			// pkts[tc] = port->tc_pkts_out[tc];
+			tc_counts[tc] = port->tc_pkts_out[tc];
+			total += tc_counts[tc];
+        	}
+	    }
+
+	return total;
 }
