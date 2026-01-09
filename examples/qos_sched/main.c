@@ -55,6 +55,7 @@ app_main_loop(__rte_unused void *dummy)
 
 		if (flow->rx_core == lcore_id) {
 			flow->rx_thread.rx_port = flow->rx_port;
+			flow->rx_thread.tx_port = flow->tx_port;
 			flow->rx_thread.rx_ring =  flow->rx_ring;
 			flow->rx_thread.rx_queue = flow->rx_queue;
 			flow->rx_thread.sched_port = flow->sched_port;
@@ -64,6 +65,7 @@ app_main_loop(__rte_unused void *dummy)
 			mode |= APP_RX_MODE;
 		}
 		if (flow->tx_core == lcore_id) {
+			flow->tx_thread.rx_port = flow->rx_port;
 			flow->tx_thread.tx_port = flow->tx_port;
 			flow->tx_thread.tx_ring =  flow->tx_ring;
 			flow->tx_thread.tx_queue = flow->tx_queue;
@@ -76,6 +78,7 @@ app_main_loop(__rte_unused void *dummy)
 			flow->wt_thread.rx_ring =  flow->rx_ring;
 			flow->wt_thread.tx_ring =  flow->tx_ring;
 			flow->wt_thread.tx_port =  flow->tx_port;
+			flow->tx_thread.tx_queue = flow->tx_queue;
 			flow->wt_thread.sched_port =  flow->sched_port;
 
 			wt_confs[wt_idx++] = &flow->wt_thread;

@@ -211,7 +211,7 @@ static void port_hqos_init(uint16_t port) {
     uint16_t prio = 7;
 
     // pmdlink_add_node(port, qos_nodes[0].teid, prio);
-    pmdlink_set_shaper(port, qos_nodes[0].teid);
+    // pmdlink_set_shaper(port, qos_nodes[0].teid);
     for (int i = 0; qos_nodes[i].teid != 0; i++) {
     	printf("port=%d, teid=%d, parent_teid=%d, queue_id?%d\n",port, qos_nodes[i].teid, qos_nodes[i].parent_teid, qos_nodes[i].tx_queue_id);
 	if (qos_nodes[i].tx_queue_id != 0) {
@@ -299,24 +299,6 @@ app_init_port(uint16_t portid, struct rte_mempool *mp, bool hqos_init)
 		tx_conf.offloads = local_port_conf.txmode.offloads;
 		ret = rte_eth_tx_queue_setup(portid, i,
 			(uint16_t)ring_conf.tx_size, rte_eth_dev_socket_id(portid), &tx_conf);
-
-		int burst = 1;
-		// if (i != 0)
-		// 	burst = 4;
-
-		tx_buffer[portid][i] = rte_zmalloc_socket("tx_buffer",
-				RTE_ETH_TX_BUFFER_SIZE(burst), 0,
-				rte_eth_dev_socket_id(portid));
-		if (tx_buffer[portid][i] == NULL)
-			rte_exit(EXIT_FAILURE, "Cannot allocate buffer for tx on port %u\n",
-					portid);
-
-		rte_eth_tx_buffer_init(tx_buffer[portid][i], burst);
-
-		if (ret < 0)
-			rte_exit(EXIT_FAILURE,
-				 "rte_eth_tx_queue_setup: err=%d, port=%u queue=%d\n",
-				 ret, portid, i);
 	}
 
 	/* Start device */
@@ -613,8 +595,8 @@ int app_init(void)
 		if (qos_conf[i].mbuf_pool == NULL)
 			rte_exit(EXIT_FAILURE, "Cannot init mbuf pool for socket %u\n", i);
 
-		app_init_port(qos_conf[i].rx_port, qos_conf[i].mbuf_pool, true);
-		app_init_port(qos_conf[i].tx_port, qos_conf[i].mbuf_pool, true);
+		app_init_port(qos_conf[i].rx_port, qos_conf[i].mbuf_pool, false);
+		app_init_port(qos_conf[i].tx_port, qos_conf[i].mbuf_pool, false);
 
 		rte_eth_link_get(qos_conf[i].tx_port, &link);
 		if (link.link_status == 0)

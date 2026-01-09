@@ -1,4 +1,3 @@
-#define _GNU_SOURCE
 #include <assert.h>
 #include <inttypes.h>
 #include <pthread.h>
