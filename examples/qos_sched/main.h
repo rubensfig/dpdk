@@ -63,6 +63,7 @@ extern "C" {
 struct thread_stat
 {
 	uint64_t nb_rx;
+	uint64_t nb_tx;
 	uint64_t nb_drop;
 };
 

@@ -24,18 +24,81 @@
  * Values below define offset to each field from start of frame
  */
 // VLAN offload ON {
-// #define SUBPORT_OFFSET	5
-// #define PIPE_OFFSET	16
-// #define QUEUE_OFFSET	7
-// #define COLOR_OFFSET	19
+#define SUBPORT_OFFSET	5
+#define PIPE_OFFSET	16
+#define QUEUE_OFFSET	7
+#define COLOR_OFFSET	19
 // }
 
 // Switchdev VLAN offload off {
-#define SUBPORT_OFFSET	7
-#define PIPE_OFFSET	18
-#define QUEUE_OFFSET	9
-#define COLOR_OFFSET	19
+// #define SUBPORT_OFFSET	7
+// #define PIPE_OFFSET	18
+// #define QUEUE_OFFSET	9
+// #define COLOR_OFFSET	19
 // }
+
+#define PENDING_MAX 4096   /* tune: must cover worst-case backpressure */
+
+struct pending_q {
+	struct rte_mbuf *pkts[PENDING_MAX];
+	uint16_t head;   /* dequeue */
+	uint16_t tail;   /* enqueue */
+	uint16_t cnt;
+} __rte_cache_aligned;
+
+static inline void
+pending_init(struct pending_q *q)
+{
+	    q->head = q->tail = q->cnt = 0;
+}
+
+static inline void pending_enqueue_burst(struct pending_q *q, struct rte_mbuf **mbufs, uint16_t nb_mbufs) {
+	for (uint16_t i = 0; i < nb_mbufs; i++) {
+		if (unlikely(q->cnt == PENDING_MAX)) {
+		/* policy decision: drop remaining packets */
+		rte_pktmbuf_free(mbufs[i]);
+		continue;
+		}
+
+		q->pkts[q->tail] = mbufs[i];
+		q->tail = (q->tail + 1) & (PENDING_MAX - 1);
+		q->cnt++;
+
+	}
+}
+
+static inline void
+pending_enqueue(struct pending_q *q, struct rte_mbuf *m)
+{
+    if (unlikely(q->cnt == PENDING_MAX)) {
+		    /* policy decision: drop */
+		    rte_pktmbuf_free(m);
+			    return;
+				}
+
+     q->pkts[q->tail] = m;
+     q->tail = (q->tail + 1) & (PENDING_MAX - 1);
+     q->cnt++;
+}
+
+static inline uint16_t
+pending_peek(struct pending_q *q, struct rte_mbuf **out, uint16_t max)
+{
+    uint16_t n = RTE_MIN(q->cnt, max);
+
+	for (uint16_t i = 0; i < n; i++) {
+		out[i] = q->pkts[(q->head + i) & (PENDING_MAX - 1)];
+	}
+	    return n;
+}
+
+static inline void
+pending_consume(struct pending_q *q, uint16_t n)
+{
+    q->head = (q->head + n) & (PENDING_MAX - 1);
+    q->cnt -= n;
+}
+
 
 static inline int get_pkt_sched(struct rte_mbuf *m, uint32_t *subport, uint32_t *pipe,
 			uint32_t *traffic_class, uint32_t *queue, uint32_t *color)
@@ -137,18 +200,19 @@ app_tx_thread(struct thread_conf **confs)
 				int tx_port = conf->tx_port;
 
 				if (tx_queue > N_TX_QUEUES) {
-					tx_queue = 1;	
+					tx_queue = 1;
 				}
 
 				buffer = tx_buffer[tx_port][tx_queue];
-					
-				nb_tx = rte_eth_tx_buffer(tx_port, tx_queue, buffer, mbufs[i]);
+
+				nb_tx += rte_eth_tx_buffer(tx_port, tx_queue, buffer, mbufs[i]);
 			}
+			APP_STATS_ADD(conf->stat.nb_tx, nb_tx);
 
 			// nb_tx = rte_eth_tx_burst(conf->tx_port, 0, mbufs, nb_pkts);
-			
-			//  if (nb_pkts != nb_tx)
-			//  	rte_pktmbuf_free_bulk(&mbufs[nb_tx], nb_pkts - nb_tx);
+
+			// if (nb_pkts != nb_tx)
+				// rte_pktmbuf_free_bulk(&mbufs[nb_tx], nb_pkts - nb_tx);
 		}
 
 		conf_idx++;
@@ -193,7 +257,86 @@ app_worker_thread(struct thread_conf **confs)
 	}
 }
 
+void
+app_mixed_thread(struct thread_conf **confs)
+{
+    struct rte_mbuf *mbufs[burst_conf.ring_burst];
+    struct thread_conf *conf;
+    int conf_idx = 0;
 
+    uint32_t tc_ov[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
+
+    struct pending_q pending[N_TC];
+    for (int i = 0; i < N_TC; i++)
+	pending_init(&pending[i]);
+
+    struct rte_mbuf *tc_mbufs[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE][burst_conf.qos_dequeue];
+    struct rte_mbuf **pkts[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
+    uint32_t tc_counts[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
+
+    /* Initialize pkts array programatically */
+    for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
+	        pkts[tc] = tc_mbufs[tc];
+		tc_ov[tc] = 4096;
+    }
+
+    while ((conf = confs[conf_idx])) {
+	uint32_t nb_pkt_rec = 0;
+
+	/* RX → Scheduler enqueue */
+	nb_pkt_rec = rte_ring_sc_dequeue_burst(conf->rx_ring, (void **)mbufs, burst_conf.ring_burst, NULL);
+
+	if (likely(nb_pkt_rec)) {
+		uint32_t nb_sent = rte_sched_port_enqueue(conf->sched_port, mbufs, nb_pkt_rec);
+		APP_STATS_ADD(conf->stat.nb_drop, nb_pkt_rec - nb_sent);
+		APP_STATS_ADD(conf->stat.nb_rx,  nb_pkt_rec);
+	}
+
+	/* TX path - send pending packets first */
+	for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
+		tc_counts[tc] = 0;
+		uint16_t n = pending_peek(&pending[tc], mbufs, burst_conf.qos_dequeue);
+		if (n > 0) {
+			uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, mbufs, n);
+			if (sent) {
+				pending_consume(&pending[tc], sent);
+				APP_STATS_ADD(conf->stat.nb_tx, sent);
+			}
+
+		}
+			uint16_t space = PENDING_MAX - pending[tc].cnt;
+			tc_ov[tc] = RTE_MIN(space, burst_conf.qos_dequeue);
+			// printf("cap [%d] %d tc ov [%d] %d\n", tc, pending[tc].cnt, tc, tc_ov[tc]);
+	}
+
+	/* Dequeue from scheduler and send new packets */
+	rte_sched_port_dequeue_tc(conf->sched_port, pkts, burst_conf.qos_dequeue, tc_ov, tc_counts);
+
+	for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
+		if (tc_counts[tc] == 0)
+			continue;
+
+		// printf("tc_counts[%d] %d\n", tc, tc_counts[tc]);
+		uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, pkts[tc], tc_counts[tc]);
+
+		// uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, pkts[tc], tc_counts[tc]);
+
+		if (unlikely(sent < tc_counts[tc])) {
+			pending_enqueue_burst( &pending[tc], &pkts[tc][sent], tc_counts[tc] - sent);
+		}
+		// printf("sent %d tc counts [%d] %d cap [%d] %d tc ov [%d] %d\n", sent, tc, tc_counts[tc], tc, pending[tc].cnt, tc, tc_ov[tc]);
+
+		APP_STATS_ADD(conf->stat.nb_tx, sent);
+	}
+
+	conf_idx++;
+	if (confs[conf_idx] == NULL)
+	conf_idx = 0;
+     }
+}
+
+
+/*
 void
 app_mixed_thread(struct thread_conf **confs)
 {
@@ -204,7 +347,6 @@ app_mixed_thread(struct thread_conf **confs)
 	while ((conf = confs[conf_idx])) {
 		uint32_t nb_pkt;
 
-		/* Read packet from the ring */
 		nb_pkt = rte_ring_sc_dequeue_burst(conf->rx_ring, (void **)mbufs,
 					burst_conf.ring_burst, NULL);
 		if (likely(nb_pkt)) {
@@ -228,4 +370,4 @@ app_mixed_thread(struct thread_conf **confs)
 		if (confs[conf_idx] == NULL)
 			conf_idx = 0;
 	}
-}
+} */

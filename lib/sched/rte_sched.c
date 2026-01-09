@@ -38,6 +38,7 @@
  * Chosen so that minimum rate is 480 bit/sec
  */
 #define RTE_SCHED_TIME_SHIFT		      8
+#define MAX_BURST			      4096
 
 struct rte_sched_pipe_profile {
 	/* Token bucket (TB) */
@@ -2368,8 +2369,10 @@ grinder_credits_update_with_tc_ov(struct rte_sched_port *port,
 		subport->tc_ov_wm =
 			grinder_tc_ov_credits_update(port, subport, pos);
 
-		for (i = 0; i < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; i++)
-			subport->tc_credits[i] = sp->tc_credits_per_period[i];
+		for (i = 0; i < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; i++) {
+		    uint64_t base_credits = sp->tc_credits_per_period[i];
+		    subport->tc_credits[i] = base_credits;
+		}
 
 		subport->tc_time = port->time + sp->tc_period;
 		subport->tc_ov_period_id++;
@@ -2473,7 +2476,7 @@ grinder_credits_check_with_tc_ov(struct rte_sched_port *port,
 
 static inline int
 grinder_schedule(struct rte_sched_port *port,
-	struct rte_sched_subport *subport, uint32_t pos)
+	struct rte_sched_subport *subport, uint32_t pos,  uint32_t *capacity_pct)
 {
 	struct rte_sched_grinder *grinder = subport->grinder + pos;
 	struct rte_sched_queue *queue = grinder->queue[grinder->qpos];
@@ -2489,6 +2492,10 @@ grinder_schedule(struct rte_sched_port *port,
 	} else {
 		if (!grinder_credits_check(port, subport, pos))
 			return 0;
+	}
+
+	if (capacity_pct && capacity_pct[tc]  == 0) {
+		return 0;
 	}
 
 	/* Advance port time */
@@ -2517,6 +2524,11 @@ grinder_schedule(struct rte_sched_port *port,
 	/* Reset pipe loop detection */
 	subport->pipe_loop = RTE_SCHED_PIPE_INVALID;
 	grinder->productive = 1;
+
+	if (capacity_pct) {
+		capacity_pct[tc]--;
+	}
+
 
 	return 1;
 }
@@ -2829,7 +2841,7 @@ grinder_prefetch_mbuf(struct rte_sched_subport *subport, uint32_t pos)
 
 static inline uint32_t
 grinder_handle(struct rte_sched_port *port,
-	struct rte_sched_subport *subport, uint32_t pos)
+	struct rte_sched_subport *subport, uint32_t pos, uint32_t *capacity_pct)
 {
 	struct rte_sched_grinder *grinder = subport->grinder + pos;
 
@@ -2878,7 +2890,7 @@ grinder_handle(struct rte_sched_port *port,
 	{
 		uint32_t wrr_active, result = 0;
 
-		result = grinder_schedule(port, subport, pos);
+		result = grinder_schedule(port, subport, pos, capacity_pct);
 
 		wrr_active = (grinder->tc_index == RTE_SCHED_TRAFFIC_CLASS_BE);
 
@@ -2975,19 +2987,12 @@ rte_sched_port_exceptions(struct rte_sched_subport *subport, int second_pass)
 
 int
 rte_sched_port_dequeue(struct rte_sched_port *port, struct rte_mbuf **pkts, uint32_t n_pkts)
-int
-rte_sched_port_dequeue_tc(struct rte_sched_port *port, struct rte_mbuf ***pkts, uint32_t n_pkts, uint32_t *capacity_pct, uint32_t *tc_counts)
 {
 	struct rte_sched_subport *subport;
 	uint32_t subport_id = port->subport_id;
 	uint32_t i, n_subports = 0, count;
 
-	// port->pkts_out = pkts;
-	    // Reset counters at the start
-    	for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
-        	port->tc_pkts_out[tc] = 0;
-    	}
-	// port->pkts_out_tc = pkts;
+	port->pkts_out = pkts;
 	port->n_pkts_out = 0;
 
 	rte_sched_port_time_resync(port);
@@ -2997,7 +3002,57 @@ rte_sched_port_dequeue_tc(struct rte_sched_port *port, struct rte_mbuf ***pkts, 
 		subport = port->subports[subport_id];
 
 		count += grinder_handle(port, subport,
-				i & (RTE_SCHED_PORT_N_GRINDERS - 1));
+				i & (RTE_SCHED_PORT_N_GRINDERS - 1), NULL);
+
+		if (count == n_pkts) {
+			subport_id++;
+
+			if (subport_id == port->n_subports_per_port)
+				subport_id = 0;
+
+			port->subport_id = subport_id;
+			break;
+		}
+
+		if (rte_sched_port_exceptions(subport, i >= RTE_SCHED_PORT_N_GRINDERS)) {
+			i = 0;
+			subport_id++;
+			n_subports++;
+		}
+
+		if (subport_id == port->n_subports_per_port)
+			subport_id = 0;
+
+		if (n_subports == port->n_subports_per_port) {
+			port->subport_id = subport_id;
+			break;
+		}
+	}
+
+	return count;
+}
+
+int
+rte_sched_port_dequeue_tc(struct rte_sched_port *port, struct rte_mbuf ***pkts, uint32_t n_pkts, uint32_t *capacity_pct, uint32_t *tc_counts)
+{
+	struct rte_sched_subport *subport;
+	uint32_t subport_id = port->subport_id;
+	uint32_t i, n_subports = 0, count;
+
+	// Reset counters at the start
+    	for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
+        	port->tc_pkts_out[tc] = 0;
+    	}
+	port->n_pkts_out = 0;
+
+	rte_sched_port_time_resync(port);
+
+	/* Take each queue in the grinder one step further */
+	for (i = 0, count = 0; ; i++)  {
+		subport = port->subports[subport_id];
+
+		count += grinder_handle(port, subport,
+				i & (RTE_SCHED_PORT_N_GRINDERS - 1), capacity_pct);
 
 		if (count == n_pkts) {
 			subport_id++;
@@ -3025,15 +3080,15 @@ rte_sched_port_dequeue_tc(struct rte_sched_port *port, struct rte_mbuf ***pkts, 
 	}
 
 	uint32_t total = 0;
-	    for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
+	for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
 		if (port->tc_pkts_out[tc] > 0 && pkts[tc] != NULL && port->pkts_out_tc[tc] != NULL) {
-            		rte_memcpy(pkts[tc], port->pkts_out_tc[tc],
-                   		port->tc_pkts_out[tc] * sizeof(struct rte_mbuf *));
+			rte_memcpy(pkts[tc], port->pkts_out_tc[tc],
+				port->tc_pkts_out[tc] * sizeof(struct rte_mbuf *));
 			// pkts[tc] = port->tc_pkts_out[tc];
 			tc_counts[tc] = port->tc_pkts_out[tc];
 			total += tc_counts[tc];
-        	}
-	    }
+		}
+	}
 
 	return total;
 }

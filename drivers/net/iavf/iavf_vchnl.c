@@ -2274,10 +2274,7 @@ int iavf_vchnl_send_vf_msg(struct iavf_adapter *adapter, struct vf_msg_command *
 	printf("iavf_vchnl_send_vf_msg\n");
 
 	struct iavf_info *vf = IAVF_DEV_PRIVATE_TO_VF(adapter);
-	struct virtchnl_hqos_cfg_list *ret_msg = NULL;
-	int err = 0, len=0, count_items = 18, count =0;
-	int last_parent_teid =0;
-	int move = 1;
+	int err = 0;
 
 	struct iavf_cmd_info args;
 
