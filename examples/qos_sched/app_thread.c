@@ -337,7 +337,7 @@ app_mixed_thread(struct thread_conf **confs)
     /* Initialize pkts array programatically */
     for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
 	        pkts[tc] = tc_mbufs[tc];
-		tc_ov[tc] = 4096;
+		tc_ov[tc] = burst_conf.qos_dequeue;
     }
 
     while ((conf = confs[conf_idx])) {
@@ -356,16 +356,16 @@ app_mixed_thread(struct thread_conf **confs)
 	for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
 		tc_counts[tc] = 0;
 		uint16_t n = pending_peek(&pending[tc], mbufs, burst_conf.qos_dequeue);
-		if (n > 0) 
-			uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, mbufs, n);
-			if (sent) {
-				pending_consume(&pending[tc], sent);
-				APP_STATS_ADD(conf->stat.nb_tx, sent);
-			}
+		if (n > 0) {
+				uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, mbufs, n);
+				if (sent) {
+					pending_consume(&pending[tc], sent);
+					APP_STATS_ADD(conf->stat.nb_tx, sent);
+				}
 
+			}
 			uint16_t space = PENDING_MAX - pending[tc].cnt;
 			tc_ov[tc] = RTE_MIN(space, burst_conf.qos_dequeue);
-			// printf("cap [%d] %d tc ov [%d] %d\n", tc, pending[tc].cnt, tc, tc_ov[tc]);
 		}
 
 	/* Dequeue from scheduler and send new packets */
@@ -377,8 +377,6 @@ app_mixed_thread(struct thread_conf **confs)
 
 		// printf("tc_counts[%d] %d\n", tc, tc_counts[tc]);
 		uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, pkts[tc], tc_counts[tc]);
-
-		// uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, pkts[tc], tc_counts[tc]);
 
 		if (unlikely(sent < tc_counts[tc])) {
 			pending_enqueue_burst( &pending[tc], &pkts[tc][sent], tc_counts[tc] - sent);
