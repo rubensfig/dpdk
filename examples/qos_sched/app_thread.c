@@ -44,6 +44,7 @@ struct pending_q {
 	uint16_t head;   /* dequeue */
 	uint16_t tail;   /* enqueue */
 	uint16_t cnt;
+	uint16_t cnt_pktsize;
 } __rte_cache_aligned;
 
 static inline void
@@ -63,6 +64,7 @@ static inline void pending_enqueue_burst(struct pending_q *q, struct rte_mbuf **
 		q->pkts[q->tail] = mbufs[i];
 		q->tail = (q->tail + 1) & (PENDING_MAX - 1);
 		q->cnt++;
+		q->cnt_pktsize += mbufs[i]->pkt_len;
 	}
 }
 
@@ -78,6 +80,7 @@ pending_enqueue(struct pending_q *q, struct rte_mbuf *m)
      q->pkts[q->tail] = m;
      q->tail = (q->tail + 1) & (PENDING_MAX - 1);
      q->cnt++;
+     q->cnt_pktsize += m->pkt_len;
 }
 
 static inline uint16_t
@@ -85,15 +88,22 @@ pending_peek(struct pending_q *q, struct rte_mbuf **out, uint16_t max)
 {
     uint16_t n = RTE_MIN(q->cnt, max);
 
-for (uint16_t i = 0; i < n; i++) {
-	out[i] = q->pkts[(q->head + i) & (PENDING_MAX - 1)];
-}
+	for (uint16_t i = 0; i < n; i++) {
+		out[i] = q->pkts[(q->head + i) & (PENDING_MAX - 1)];
+	}
     return n;
 }
 
 static inline void
 pending_consume(struct pending_q *q, uint16_t n)
 {
+
+
+    for (uint16_t i = 0; i < n; i++) {
+		    struct rte_mbuf *m = q->pkts[(q->head + i) & (PENDING_MAX - 1)];
+			    q->cnt_pktsize -= m->pkt_len;
+				}
+
     q->head = (q->head + n) & (PENDING_MAX - 1);
     q->cnt -= n;
 }
@@ -362,10 +372,38 @@ app_mixed_thread(struct thread_conf **confs)
 					pending_consume(&pending[tc], sent);
 					APP_STATS_ADD(conf->stat.nb_tx, sent);
 				}
-
 			}
-			uint16_t space = PENDING_MAX - pending[tc].cnt;
-			tc_ov[tc] = RTE_MIN(space, burst_conf.qos_dequeue);
+			// uint16_t space = PENDING_MAX - pending[tc].cnt;
+			// tc_ov[tc] = RTE_MIN(space, burst_conf.qos_dequeue);
+			// tc_ov[tc] = pending[tc].cnt_pktsize;
+			// if (tc_ov[tc] != 0)
+			// 	printf("pending pkt size[%d] %d\n", tc, tc_ov[tc]);
+
+			uint32_t min_tc_capacity = burst_conf.qos_dequeue / RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE;
+			uint32_t total_space_bytes = burst_conf.qos_dequeue * 1500;
+			uint32_t pending_bytes = pending[tc].cnt * 1500;
+			if (pending_bytes >= total_space_bytes) {
+				    tc_ov[tc] = 0;
+			} else {
+				/*
+				    uint32_t remaining_space = total_space_bytes - pending_bytes; 	
+				    tc_ov[tc] = (remaining_space * min_tc_capacity) / RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE;
+
+				    if (tc_ov[tc] > remaining_space) 
+					    tc_ov[tc] = remaining_space;
+					    */
+				    tc_ov[tc] = RTE_MAX(total_space_bytes - pending_bytes, 1500);
+			}
+
+			// uint32_t space = burst_conf.qos_dequeue * 1500;
+			// uint32_t pending_bytes = pending[tc].cnt * 1500;
+			// if (pending_bytes >= space)
+			// 	    tc_ov[tc] = 0;
+			// else
+			// 	    tc_ov[tc] = RTE_MIN(min_tc_capacity*1500 , space - pending_bytes);
+
+			// if (tc_ov[tc] != 0)
+			// 	printf("pending pkt size[%d] %d\n", tc, tc_ov[tc]);
 		}
 
 	/* Dequeue from scheduler and send new packets */
@@ -472,6 +510,50 @@ app_mixed_thread(struct thread_conf **confs)
         conf_idx++;
         if (confs[conf_idx] == NULL)
             conf_idx = 0;
+    }
+}
+#endif
+#if MIXED_THREAD_PRIOPROP
+void
+app_mixed_thread(struct thread_conf **confs)
+{
+    struct rte_mbuf *mbufs[burst_conf.ring_burst];
+    struct rte_mbuf *pending_mbufs[burst_conf.ring_burst];
+
+    struct thread_conf *conf;
+    int conf_idx = 0;
+
+   struct rte_eth_dev_tx_buffer *buffer;
+
+    while ((conf = confs[conf_idx])) {
+	uint16_t nb_pkts = rte_ring_sc_dequeue_burst(conf->rx_ring, (void **)mbufs, burst_conf.ring_burst, NULL);
+	if (likely(nb_pkts)) {
+		int nb_sent = rte_sched_port_enqueue(conf->sched_port, mbufs, nb_pkts);
+
+		APP_STATS_ADD(conf->stat.nb_drop, nb_pkts - nb_sent);
+		APP_STATS_ADD(conf->stat.nb_rx, nb_pkts);
+	}
+
+	nb_pkts = rte_sched_port_dequeue(conf->sched_port, mbufs, burst_conf.qos_dequeue);
+
+	if (likely(nb_pkts)) {
+		for(int i = 0; i < nb_pkts; i++) {
+			int tx_queue = mbufs[i]->hash.sched.traffic_class;
+			int tx_port = conf->tx_port;
+	
+			if (tx_queue > N_TX_QUEUES) {
+				tx_queue = 1;	
+			}
+	
+			buffer = tx_buffer[tx_port][tx_queue];
+				
+			rte_eth_tx_buffer(tx_port, tx_queue, buffer, mbufs[i]);
+		}
+	}
+
+	conf_idx++;
+	if (confs[conf_idx] == NULL)
+		conf_idx = 0;
     }
 }
 #endif

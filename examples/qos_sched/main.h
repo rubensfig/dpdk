@@ -30,6 +30,10 @@ extern "C" {
 #define MIXED_THREAD_PERTCDEQUEUE 0
 #endif
 
+#ifndef MIXED_THREAD_PRIOPROP
+#define MIXED_THREAD_PRIOPROP 0
+#endif
+
 #define APP_RX_DESC_DEFAULT 1024
 #define APP_TX_DESC_DEFAULT 1024
 

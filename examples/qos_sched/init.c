@@ -297,8 +297,20 @@ app_init_port(uint16_t portid, struct rte_mempool *mp, bool hqos_init)
 	fflush(stdout);
 	for (int i = 0; i < N_TX_QUEUES; i++) {
 		tx_conf.offloads = local_port_conf.txmode.offloads;
-		ret = rte_eth_tx_queue_setup(portid, i,
-			(uint16_t)ring_conf.tx_size, rte_eth_dev_socket_id(portid), &tx_conf);
+		ret = rte_eth_tx_queue_setup(portid, i, (uint16_t)ring_conf.tx_size, rte_eth_dev_socket_id(portid), &tx_conf);
+
+		int burst = 1;
+		if (i != 0)
+		 	burst = 4;
+		
+		tx_buffer[portid][i] = rte_zmalloc_socket("tx_buffer", RTE_ETH_TX_BUFFER_SIZE(burst), 0, rte_eth_dev_socket_id(portid));
+		if (tx_buffer[portid][i] == NULL)
+			rte_exit(EXIT_FAILURE, "Cannot allocate buffer for tx on port %u\n", portid);
+		
+		rte_eth_tx_buffer_init(tx_buffer[portid][i], burst);
+
+		if (ret < 0)
+		       	rte_exit(EXIT_FAILURE, "rte_eth_tx_queue_setup: err=%d, port=%u queue=%d\n", ret, portid, i);
 	}
 
 	/* Start device */
