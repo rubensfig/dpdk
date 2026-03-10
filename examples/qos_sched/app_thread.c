@@ -24,17 +24,17 @@
  * Values below define offset to each field from start of frame
  */
 // VLAN offload ON {
-#define SUBPORT_OFFSET	5
-#define PIPE_OFFSET	16
-#define QUEUE_OFFSET	7
-#define COLOR_OFFSET	19
+// #define SUBPORT_OFFSET	5
+// #define PIPE_OFFSET	16
+// #define QUEUE_OFFSET	7
+// #define COLOR_OFFSET	19
 // }
 
 // Switchdev VLAN offload off {
-// #define SUBPORT_OFFSET	7
-// #define PIPE_OFFSET	18
-// #define QUEUE_OFFSET	9
-// #define COLOR_OFFSET	19
+#define SUBPORT_OFFSET	7
+#define PIPE_OFFSET	18
+#define QUEUE_OFFSET	9
+#define COLOR_OFFSET	19
 // }
 
 #define PENDING_MAX 4096   /* tune: must cover worst-case backpressure */
@@ -137,9 +137,9 @@ static inline int get_pkt_sched(struct rte_mbuf *m, uint32_t *subport, uint32_t 
  	/* Color */
  	*color = 0;
 
-	rte_ether_addr_copy(&eth_hdr->dst_addr, &addr);
-	rte_ether_addr_copy(&eth_hdr->src_addr, &eth_hdr->dst_addr);
-	rte_ether_addr_copy(&addr, &eth_hdr->src_addr);
+	// rte_ether_addr_copy(&eth_hdr->dst_addr, &addr);
+	// rte_ether_addr_copy(&eth_hdr->src_addr, &eth_hdr->dst_addr);
+	// rte_ether_addr_copy(&addr, &eth_hdr->src_addr);
 
 	return 0;
 }
@@ -373,37 +373,8 @@ app_mixed_thread(struct thread_conf **confs)
 					APP_STATS_ADD(conf->stat.nb_tx, sent);
 				}
 			}
-			// uint16_t space = PENDING_MAX - pending[tc].cnt;
-			// tc_ov[tc] = RTE_MIN(space, burst_conf.qos_dequeue);
-			// tc_ov[tc] = pending[tc].cnt_pktsize;
-			// if (tc_ov[tc] != 0)
-			// 	printf("pending pkt size[%d] %d\n", tc, tc_ov[tc]);
-
-			uint32_t min_tc_capacity = burst_conf.qos_dequeue / RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE;
-			uint32_t total_space_bytes = burst_conf.qos_dequeue * 1500;
-			uint32_t pending_bytes = pending[tc].cnt * 1500;
-			if (pending_bytes >= total_space_bytes) {
-				    tc_ov[tc] = 0;
-			} else {
-				/*
-				    uint32_t remaining_space = total_space_bytes - pending_bytes; 	
-				    tc_ov[tc] = (remaining_space * min_tc_capacity) / RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE;
-
-				    if (tc_ov[tc] > remaining_space) 
-					    tc_ov[tc] = remaining_space;
-					    */
-				    tc_ov[tc] = RTE_MAX(total_space_bytes - pending_bytes, 1500);
-			}
-
-			// uint32_t space = burst_conf.qos_dequeue * 1500;
-			// uint32_t pending_bytes = pending[tc].cnt * 1500;
-			// if (pending_bytes >= space)
-			// 	    tc_ov[tc] = 0;
-			// else
-			// 	    tc_ov[tc] = RTE_MIN(min_tc_capacity*1500 , space - pending_bytes);
-
-			// if (tc_ov[tc] != 0)
-			// 	printf("pending pkt size[%d] %d\n", tc, tc_ov[tc]);
+			uint16_t space = PENDING_MAX - pending[tc].cnt;
+			tc_ov[tc] = RTE_MIN(space, burst_conf.qos_dequeue);
 		}
 
 	/* Dequeue from scheduler and send new packets */
