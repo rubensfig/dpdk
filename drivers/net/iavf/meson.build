@@ -21,7 +21,6 @@ sources = files(
         'iavf_tm.c',
         'iavf_ipsec_crypto.c',
         'iavf_fsub.c',
-        'iavf_pmdlink.c',
 )
 
 if arch_subdir == 'x86'

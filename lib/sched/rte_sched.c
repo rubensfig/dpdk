@@ -42,6 +42,7 @@
  * Chosen so that minimum rate is 480 bit/sec
  */
 #define RTE_SCHED_TIME_SHIFT		      8
+#define MAX_BURST			      4096
 
 struct rte_sched_pipe_profile {
 	/* Token bucket (TB) */
@@ -241,6 +242,8 @@ struct __rte_cache_aligned rte_sched_port {
 	/* Grinders */
 	struct rte_mbuf **pkts_out;
 	uint32_t n_pkts_out;
+	struct rte_mbuf ***pkts_out_tc;
+	uint32_t tc_pkts_out[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
 	uint32_t subport_id;
 
 	/* Large data structures */
@@ -969,6 +972,16 @@ rte_sched_port_config(struct rte_sched_port_params *params)
 		SCHED_LOG(ERR, "%s: Memory allocation fails", __func__);
 		rte_free(port);
 		return NULL;
+	}
+
+	port->pkts_out_tc = rte_zmalloc_socket("pkts_out_tc",
+		sizeof(struct rte_mbuf **) * RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE,
+		RTE_CACHE_LINE_SIZE, params->socket);
+
+	for (i = 0; i < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; i++) {
+		port->pkts_out_tc[i] = rte_zmalloc_socket("pkts_out_tc_row",
+		sizeof(struct rte_mbuf *) * MAX_BURST,
+		RTE_CACHE_LINE_SIZE, params->socket);
 	}
 
 	/* User parameters */

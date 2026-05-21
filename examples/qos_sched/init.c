@@ -19,7 +19,6 @@
 
 #include "main.h"
 #include "cfg_file.h"
-#include "pmdlink.h"
 
 uint32_t app_numa_mask = 0;
 static uint32_t app_inited_port_mask = 0;
@@ -68,7 +67,7 @@ static struct rte_eth_conf port_conf = {
 typedef uint16_t port_t;
 typedef uint16_t teid_t;
 
-
+/*
 qos_node_t *pmdlink_read_topology(port_t port) {
     struct vf_msg_command *cmd;
     uint8_t *response = NULL;
@@ -81,7 +80,7 @@ qos_node_t *pmdlink_read_topology(port_t port) {
     cmd->output_size = 0;
     cmd->output_buffer = &response;
     rte_log(RTE_LOG_DEBUG, RTE_LOGTYPE_USER1, "Sending VIRTCHNL_OP_HQOS_TREE_READ, port=%d\n", port);
-    rte_eth_dev_send_vf_msg(port, cmd);
+    // rte_eth_dev_send_vf_msg(port, cmd);
 
     struct virtchnl_hqos_cfg_list *sched_cfg = (struct virtchnl_hqos_cfg_list *)response;
 
@@ -199,25 +198,8 @@ void pmdlink_add_node(uint16_t port, uint16_t source_teid, uint16_t tx_priority)
 
 struct port_hqos_state *port_hqos_table[MAXPORTS];
 
+*/
 static void port_hqos_init(uint16_t port) {
-    struct port_hqos_state *pht = rte_zmalloc("user qos llapi", sizeof(struct port_hqos_state), 0);
-    port_hqos_table[port] = pht;
-
-    qos_node_t *qos_nodes = pmdlink_read_topology(port); // assumes read_vf_qos_nodes() cannot fail
-    pht->root = qos_nodes[0].teid;
-    pht->binding_count = 0;
-    pht->bindings[0] = (struct binding){0, 0}; // end marker set, for avoidance of doubt ;-)
-					       //
-    uint16_t prio = 7;
-
-    // pmdlink_add_node(port, qos_nodes[0].teid, prio);
-    // pmdlink_set_shaper(port, qos_nodes[0].teid);
-    for (int i = 0; qos_nodes[i].teid != 0; i++) {
-    	printf("port=%d, teid=%d, parent_teid=%d, queue_id?%d\n",port, qos_nodes[i].teid, qos_nodes[i].parent_teid, qos_nodes[i].tx_queue_id);
-	if (qos_nodes[i].tx_queue_id != 0) {
-		pmdlink_node_priority(port, qos_nodes[i].teid, prio--);
-	}
-    }
 }
 
 static int

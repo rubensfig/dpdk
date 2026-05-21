@@ -7163,16 +7163,4 @@ int rte_eth_dev_map_aggr_tx_affinity(uint16_t port_id, uint16_t tx_queue_id,
 	return ret;
 }
 
-
-int
-rte_eth_dev_send_vf_msg(uint16_t port_id, struct vf_msg_command *vf_command)
-{
-        struct rte_eth_dev *dev = &rte_eth_devices[port_id];
-        int ret = 0;
-
-	ret = eth_err(port_id, dev->dev_ops->send_vf_msg(dev, vf_command));
-
-        return ret;
-}
-
 RTE_LOG_REGISTER_DEFAULT(rte_eth_dev_logtype, INFO);
