@@ -27,6 +27,8 @@ uint8_t interactive = APP_INTERACTIVE_DEFAULT;
 uint32_t qavg_period = APP_QAVG_PERIOD;
 uint32_t qavg_ntimes = APP_QAVG_NTIMES;
 
+struct rte_eth_dev_tx_buffer *tx_buffer[RTE_MAX_ETHPORTS][N_TX_QUEUES] = { 0 };
+
 /* main processing loop */
 static int
 app_main_loop(__rte_unused void *dummy)
@@ -53,6 +55,7 @@ app_main_loop(__rte_unused void *dummy)
 
 		if (flow->rx_core == lcore_id) {
 			flow->rx_thread.rx_port = flow->rx_port;
+			flow->rx_thread.tx_port = flow->tx_port;
 			flow->rx_thread.rx_ring =  flow->rx_ring;
 			flow->rx_thread.rx_queue = flow->rx_queue;
 			flow->rx_thread.sched_port = flow->sched_port;
@@ -62,6 +65,7 @@ app_main_loop(__rte_unused void *dummy)
 			mode |= APP_RX_MODE;
 		}
 		if (flow->tx_core == lcore_id) {
+			flow->tx_thread.rx_port = flow->rx_port;
 			flow->tx_thread.tx_port = flow->tx_port;
 			flow->tx_thread.tx_ring =  flow->tx_ring;
 			flow->tx_thread.tx_queue = flow->tx_queue;
@@ -74,6 +78,7 @@ app_main_loop(__rte_unused void *dummy)
 			flow->wt_thread.rx_ring =  flow->rx_ring;
 			flow->wt_thread.tx_ring =  flow->tx_ring;
 			flow->wt_thread.tx_port =  flow->tx_port;
+			flow->tx_thread.tx_queue = flow->tx_queue;
 			flow->wt_thread.sched_port =  flow->sched_port;
 
 			wt_confs[wt_idx++] = &flow->wt_thread;
@@ -145,11 +150,12 @@ app_stat(void)
 
 		rte_eth_stats_get(flow->rx_port, &stats);
 		printf("\nRX port %"PRIu16": rx: %"PRIu64 " err: %"PRIu64
-				" no_mbuf: %"PRIu64 "\n",
+				" no_mbuf: %"PRIu64 " missed: %"PRIu64 "\n",
 				flow->rx_port,
 				stats.ipackets - rx_stats[i].ipackets,
 				stats.ierrors - rx_stats[i].ierrors,
-				stats.rx_nombuf - rx_stats[i].rx_nombuf);
+				stats.rx_nombuf - rx_stats[i].rx_nombuf,
+				stats.imissed - rx_stats[i].imissed);
 		memcpy(&rx_stats[i], &stats, sizeof(stats));
 
 		rte_eth_stats_get(flow->tx_port, &stats);

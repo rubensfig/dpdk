@@ -70,8 +70,11 @@ cfg_load_pipe(struct rte_cfgfile *cfg, struct rte_sched_pipe_params *pipe_params
 	if (!cfg || !pipe_params)
 		return -1;
 
+	int subports = port_params.n_subports_per_port;
 	profiles = rte_cfgfile_num_sections(cfg, "pipe profile", sizeof("pipe profile") - 1);
-	subport_params[0].n_pipe_profiles = profiles;
+	printf("%d\n", profiles);
+	for (int i = 0; i < subports; i++)
+		subport_params[i].n_pipe_profiles = profiles;
 
 	for (j = 0; j < profiles; j++) {
 		char pipe_name[32];
@@ -288,8 +291,9 @@ cfg_load_subport(struct rte_cfgfile *cfg, struct rte_sched_subport_params *subpo
 	if (!cfg || !subport_params)
 		return -1;
 
+	printf("CFG %x\n",&cfg);
 	memset(app_pipe_to_profile, -1, sizeof(app_pipe_to_profile));
-	memset(active_queues, 0, sizeof(active_queues));
+	memset(active_queues, 0, sizeof(uint32_t));
 	n_active_queues = 0;
 
 	if (rte_cfgfile_has_section(cfg, "red")) {

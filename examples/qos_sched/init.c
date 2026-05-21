@@ -15,9 +15,11 @@
 #include <rte_cycles.h>
 #include <rte_string_fns.h>
 #include <rte_cfgfile.h>
+#include <rte_malloc.h>
 
 #include "main.h"
 #include "cfg_file.h"
+#include "pmdlink.h"
 
 uint32_t app_numa_mask = 0;
 static uint32_t app_inited_port_mask = 0;
@@ -62,8 +64,164 @@ static struct rte_eth_conf port_conf = {
 	},
 };
 
+
+typedef uint16_t port_t;
+typedef uint16_t teid_t;
+
+
+qos_node_t *pmdlink_read_topology(port_t port) {
+    struct vf_msg_command *cmd;
+    uint8_t *response = NULL;
+
+    cmd = rte_zmalloc("vf_msg_command", sizeof(struct vf_msg_command), 0);
+
+    cmd->opcode = VIRTCHNL_OP_HQOS_TREE_READ;
+    cmd->input_buffer = NULL;
+    cmd->input_size = 0;
+    cmd->output_size = 0;
+    cmd->output_buffer = &response;
+    rte_log(RTE_LOG_DEBUG, RTE_LOGTYPE_USER1, "Sending VIRTCHNL_OP_HQOS_TREE_READ, port=%d\n", port);
+    rte_eth_dev_send_vf_msg(port, cmd);
+
+    struct virtchnl_hqos_cfg_list *sched_cfg = (struct virtchnl_hqos_cfg_list *)response;
+
+    qos_node_t *rsp = rte_zmalloc("vf_msg_command", sizeof(qos_node_t) * (1 + sched_cfg->num_elem), 0);
+
+    for (int i = 0; i < sched_cfg->num_elem; i++) {
+        if (sched_cfg->cfg[i].teid == 0)
+            rte_exit(EXIT_FAILURE, "read_vf_qos_nodes() - zero teid assertion failed\n");
+
+        rsp[i] = (qos_node_t){
+            .teid = sched_cfg->cfg[i].teid,
+            .parent_teid = sched_cfg->cfg[i].parent_teid,
+            .tx_queue_id = sched_cfg->cfg[i].tx_queue_id,
+        };
+    }
+    // set an end marker, teid==0 is not legal/used (protected by previous assertion)
+    rsp[sched_cfg->num_elem] = (qos_node_t){
+        .teid = 0,
+    };
+    rte_free(cmd);
+    return rsp;
+}
+
+void pmdlink_set_shaper(uint16_t port, uint16_t source_teid) {
+    struct vf_msg_command *cmd;
+    cmd = rte_zmalloc("vf_msg_command", sizeof(struct vf_msg_command), 0);
+
+    uint8_t *response = NULL;
+
+    struct virtchnl_hqos_cfg_list *msg = NULL;
+    int len = sizeof(struct virtchnl_hqos_cfg_list *) + (6) * sizeof(struct virtchnl_hqos_cfg *);
+
+    cmd->opcode = VIRTCHNL_OP_HQOS_ELEMS_CONF;
+    cmd->input_size = len;
+    cmd->output_buffer = &response;
+    cmd->output_size = IAVF_AQ_BUF_SZ;
+
+    msg = rte_zmalloc("hqos", len, 0);
+
+    msg->num_elem = 1;
+    msg->cfg[0].teid = source_teid;
+    // msg->cfg[0].tx_priority = tx_priority;
+    msg->cfg[0].tx_max = 10000000;
+
+    cmd->input_buffer = (uint8_t *)msg;
+
+    rte_log(RTE_LOG_INFO, RTE_LOGTYPE_USER1, "Sending VIRTCHNL_OP_HQOS_ELEMS_CONF, port=%d, source_node=%d, shaper=%d\n", port, source_teid, 10000000);
+    rte_eth_dev_send_vf_msg(port, cmd);
+
+    rte_free(msg);
+    rte_free(cmd);
+}
+
+
+void pmdlink_node_priority(uint16_t port, uint16_t source_teid, uint16_t tx_priority) {
+    struct vf_msg_command *cmd;
+    cmd = rte_zmalloc("vf_msg_command", sizeof(struct vf_msg_command), 0);
+
+    uint8_t *response = NULL;
+
+    struct virtchnl_hqos_cfg_list *msg = NULL;
+    int len = sizeof(struct virtchnl_hqos_cfg_list *) + (6) * sizeof(struct virtchnl_hqos_cfg *);
+
+    cmd->opcode = VIRTCHNL_OP_HQOS_ELEMS_CONF;
+    cmd->input_size = len;
+    cmd->output_buffer = &response;
+    cmd->output_size = IAVF_AQ_BUF_SZ;
+
+    msg = rte_zmalloc("hqos", len, 0);
+
+    msg->num_elem = 1;
+    msg->cfg[0].teid = source_teid;
+    msg->cfg[0].tx_priority = tx_priority;
+    // msg->cfg[0].tx_max = 1000000;
+    // msg->cfg[0].tx_share = 8000000;
+
+    cmd->input_buffer = (uint8_t *)msg;
+
+    rte_log(RTE_LOG_INFO, RTE_LOGTYPE_USER1, "Sending VIRTCHNL_OP_HQOS_ELEMS_CONF, port=%d, source_node=%d, prio=%d\n", port, source_teid, tx_priority);
+    rte_eth_dev_send_vf_msg(port, cmd);
+
+    rte_free(msg);
+    rte_free(cmd);
+}
+
+void pmdlink_add_node(uint16_t port, uint16_t source_teid, uint16_t tx_priority) {
+    struct vf_msg_command *cmd;
+    cmd = rte_zmalloc("vf_msg_command", sizeof(struct vf_msg_command), 0);
+
+    uint8_t *response = NULL;
+
+    struct virtchnl_hqos_cfg_list *msg = NULL;
+    int len = sizeof(struct virtchnl_hqos_cfg_list *) + (6) * sizeof(struct virtchnl_hqos_cfg *);
+
+    cmd->opcode = VIRTCHNL_OP_HQOS_ELEMS_ADD;
+    cmd->input_size = len;
+    cmd->output_buffer = &response;
+    cmd->output_size = IAVF_AQ_BUF_SZ;
+
+    msg = rte_zmalloc("hqos", len, 0);
+
+    msg->num_elem = 1;
+    msg->cfg[0].teid = source_teid;
+    msg->cfg[0].tx_priority = tx_priority;
+    // msg->cfg[0].tx_share = 8000000;
+
+    cmd->input_buffer = (uint8_t *)msg;
+
+    rte_log(RTE_LOG_INFO, RTE_LOGTYPE_USER1, "Sending VIRTCHNL_OP_HQOS_ELEMS_ADD, port=%d, source_node=%d, prio=%d\n", port, source_teid, tx_priority);
+    rte_eth_dev_send_vf_msg(port, cmd);
+
+    rte_free(msg);
+    rte_free(cmd);
+}
+
+struct port_hqos_state *port_hqos_table[MAXPORTS];
+
+static void port_hqos_init(uint16_t port) {
+    struct port_hqos_state *pht = rte_zmalloc("user qos llapi", sizeof(struct port_hqos_state), 0);
+    port_hqos_table[port] = pht;
+
+    qos_node_t *qos_nodes = pmdlink_read_topology(port); // assumes read_vf_qos_nodes() cannot fail
+    pht->root = qos_nodes[0].teid;
+    pht->binding_count = 0;
+    pht->bindings[0] = (struct binding){0, 0}; // end marker set, for avoidance of doubt ;-)
+					       //
+    uint16_t prio = 7;
+
+    // pmdlink_add_node(port, qos_nodes[0].teid, prio);
+    // pmdlink_set_shaper(port, qos_nodes[0].teid);
+    for (int i = 0; qos_nodes[i].teid != 0; i++) {
+    	printf("port=%d, teid=%d, parent_teid=%d, queue_id?%d\n",port, qos_nodes[i].teid, qos_nodes[i].parent_teid, qos_nodes[i].tx_queue_id);
+	if (qos_nodes[i].tx_queue_id != 0) {
+		pmdlink_node_priority(port, qos_nodes[i].teid, prio--);
+	}
+    }
+}
+
 static int
-app_init_port(uint16_t portid, struct rte_mempool *mp)
+app_init_port(uint16_t portid, struct rte_mempool *mp, bool hqos_init)
 {
 	int ret;
 	struct rte_eth_link link;
@@ -94,8 +252,7 @@ app_init_port(uint16_t portid, struct rte_mempool *mp)
 	tx_conf.tx_free_thresh = 0;
 	tx_conf.tx_rs_thresh = 0;
 	tx_conf.tx_deferred_start = 0;
-
-	/* init port */
+/* init port */
 	RTE_LOG(INFO, APP, "Initializing port %"PRIu16"... ", portid);
 	fflush(stdout);
 
@@ -105,10 +262,12 @@ app_init_port(uint16_t portid, struct rte_mempool *mp)
 			"Error during getting device (port %u) info: %s\n",
 			portid, strerror(-ret));
 
+	local_port_conf.rxmode.offloads |=
+			RTE_ETH_RX_OFFLOAD_VLAN;
 	if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
 		local_port_conf.txmode.offloads |=
 			RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
-	ret = rte_eth_dev_configure(portid, 1, 1, &local_port_conf);
+	ret = rte_eth_dev_configure(portid, 1, N_TX_QUEUES, &local_port_conf);
 	if (ret < 0)
 		rte_exit(EXIT_FAILURE,
 			 "Cannot configure device: err=%d, port=%u\n",
@@ -136,13 +295,23 @@ app_init_port(uint16_t portid, struct rte_mempool *mp)
 
 	/* init one TX queue */
 	fflush(stdout);
-	tx_conf.offloads = local_port_conf.txmode.offloads;
-	ret = rte_eth_tx_queue_setup(portid, 0,
-		(uint16_t)ring_conf.tx_size, rte_eth_dev_socket_id(portid), &tx_conf);
-	if (ret < 0)
-		rte_exit(EXIT_FAILURE,
-			 "rte_eth_tx_queue_setup: err=%d, port=%u queue=%d\n",
-			 ret, portid, 0);
+	for (int i = 0; i < N_TX_QUEUES; i++) {
+		tx_conf.offloads = local_port_conf.txmode.offloads;
+		ret = rte_eth_tx_queue_setup(portid, i, (uint16_t)ring_conf.tx_size, rte_eth_dev_socket_id(portid), &tx_conf);
+
+		int burst = 1;
+		if (i != 0)
+		 	burst = 4;
+		
+		tx_buffer[portid][i] = rte_zmalloc_socket("tx_buffer", RTE_ETH_TX_BUFFER_SIZE(burst), 0, rte_eth_dev_socket_id(portid));
+		if (tx_buffer[portid][i] == NULL)
+			rte_exit(EXIT_FAILURE, "Cannot allocate buffer for tx on port %u\n", portid);
+		
+		rte_eth_tx_buffer_init(tx_buffer[portid][i], burst);
+
+		if (ret < 0)
+		       	rte_exit(EXIT_FAILURE, "rte_eth_tx_queue_setup: err=%d, port=%u queue=%d\n", ret, portid, i);
+	}
 
 	/* Start device */
 	ret = rte_eth_dev_start(portid);
@@ -163,11 +332,16 @@ app_init_port(uint16_t portid, struct rte_mempool *mp)
 	rte_eth_link_to_str(link_status_text, sizeof(link_status_text), &link);
 	printf("%s\n", link_status_text);
 
+	if (hqos_init)
+		port_hqos_init(portid);
+
+	/*
 	ret = rte_eth_promiscuous_enable(portid);
 	if (ret != 0)
 		rte_exit(EXIT_FAILURE,
 			"rte_eth_promiscuous_enable: err=%s, port=%u\n",
 			rte_strerror(-ret), portid);
+	*/
 
 	/* mark port as initialized */
 	app_inited_port_mask |= 1u << portid;
@@ -203,7 +377,70 @@ static struct rte_sched_subport_profile_params
 
 struct rte_sched_subport_params subport_params[MAX_SCHED_SUBPORTS] = {
 	{
-		.n_pipes_per_subport_enabled = 4096,
+		.n_pipes_per_subport_enabled = 65536,
+		.qsize = {64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64},
+		.pipe_profiles = pipe_profiles,
+		.n_pipe_profiles = sizeof(pipe_profiles) /
+			sizeof(struct rte_sched_pipe_params),
+		.n_max_pipe_profiles = MAX_SCHED_PIPE_PROFILES,
+		.cman_params = NULL,
+	},
+	{
+		.n_pipes_per_subport_enabled = 65536,
+		.qsize = {64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64},
+		.pipe_profiles = pipe_profiles,
+		.n_pipe_profiles = sizeof(pipe_profiles) /
+			sizeof(struct rte_sched_pipe_params),
+		.n_max_pipe_profiles = MAX_SCHED_PIPE_PROFILES,
+		.cman_params = NULL,
+	},
+	{
+		.n_pipes_per_subport_enabled = 65536,
+		.qsize = {64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64},
+		.pipe_profiles = pipe_profiles,
+		.n_pipe_profiles = sizeof(pipe_profiles) /
+			sizeof(struct rte_sched_pipe_params),
+		.n_max_pipe_profiles = MAX_SCHED_PIPE_PROFILES,
+		.cman_params = NULL,
+	},
+	{
+		.n_pipes_per_subport_enabled = 65536,
+		.qsize = {64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64},
+		.pipe_profiles = pipe_profiles,
+		.n_pipe_profiles = sizeof(pipe_profiles) /
+			sizeof(struct rte_sched_pipe_params),
+		.n_max_pipe_profiles = MAX_SCHED_PIPE_PROFILES,
+		.cman_params = NULL,
+	},
+	{
+		.n_pipes_per_subport_enabled = 65536,
+		.qsize = {64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64},
+		.pipe_profiles = pipe_profiles,
+		.n_pipe_profiles = sizeof(pipe_profiles) /
+			sizeof(struct rte_sched_pipe_params),
+		.n_max_pipe_profiles = MAX_SCHED_PIPE_PROFILES,
+		.cman_params = NULL,
+	},
+	{
+		.n_pipes_per_subport_enabled = 65536,
+		.qsize = {64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64},
+		.pipe_profiles = pipe_profiles,
+		.n_pipe_profiles = sizeof(pipe_profiles) /
+			sizeof(struct rte_sched_pipe_params),
+		.n_max_pipe_profiles = MAX_SCHED_PIPE_PROFILES,
+		.cman_params = NULL,
+	},
+	{
+		.n_pipes_per_subport_enabled = 65536,
+		.qsize = {64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64},
+		.pipe_profiles = pipe_profiles,
+		.n_pipe_profiles = sizeof(pipe_profiles) /
+			sizeof(struct rte_sched_pipe_params),
+		.n_max_pipe_profiles = MAX_SCHED_PIPE_PROFILES,
+		.cman_params = NULL,
+	},
+	{
+		.n_pipes_per_subport_enabled = 65536,
 		.qsize = {64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64},
 		.pipe_profiles = pipe_profiles,
 		.n_pipe_profiles = sizeof(pipe_profiles) /
@@ -283,6 +520,9 @@ app_init_sched_port(uint32_t portid, uint32_t socketid)
 					subport);
 	}
 
+	struct rte_sched_subport_params *subport_params_ptr = subport_params;
+	printf("App mem footprint: %d Bytes\n", rte_sched_port_get_memory_footprint(&port_params,  &subport_params_ptr));
+
 	return port;
 }
 
@@ -312,7 +552,10 @@ app_load_cfg_profile(const char *profile)
 	if (ret)
 		goto _app_load_cfg_profile_error_return;
 
+	return ret;
+
 _app_load_cfg_profile_error_return:
+	rte_exit(EXIT_FAILURE, "Cannot load configuration profile %s\n", profile);
 	rte_cfgfile_close(file);
 
 	return ret;
@@ -365,8 +608,8 @@ int app_init(void)
 		if (qos_conf[i].mbuf_pool == NULL)
 			rte_exit(EXIT_FAILURE, "Cannot init mbuf pool for socket %u\n", i);
 
-		app_init_port(qos_conf[i].rx_port, qos_conf[i].mbuf_pool);
-		app_init_port(qos_conf[i].tx_port, qos_conf[i].mbuf_pool);
+		app_init_port(qos_conf[i].rx_port, qos_conf[i].mbuf_pool, false);
+		app_init_port(qos_conf[i].tx_port, qos_conf[i].mbuf_pool, false);
 
 		memset(&link, 0, sizeof(link));
 		ret = rte_eth_link_get(qos_conf[i].tx_port, &link);
@@ -405,6 +648,6 @@ int app_init(void)
 				 "TX (p = %hhu, h = %hhu, w = %hhu)\n",
 		rx_thresh.pthresh, rx_thresh.hthresh, rx_thresh.wthresh,
 		tx_thresh.pthresh, tx_thresh.hthresh, tx_thresh.wthresh);
-
+  
 	return 0;
 }

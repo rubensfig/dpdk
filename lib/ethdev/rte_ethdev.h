@@ -6365,6 +6365,11 @@ rte_eth_rx_queue_count(uint16_t port_id, uint16_t queue_id)
 	return (int)(*p->rx_queue_count)(qd);
 }
 
+struct vf_msg_command;
+__rte_experimental
+int
+rte_eth_dev_send_vf_msg(uint16_t port_id, struct vf_msg_command *vf_command);
+
 /**@{@name Rx hardware descriptor states
  * @see rte_eth_rx_descriptor_status
  */

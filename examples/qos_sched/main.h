@@ -18,6 +18,22 @@ extern "C" {
  */
 #define APP_INTERACTIVE_DEFAULT 0
 
+#ifndef MIXED_THREAD_PRIOBP
+#define MIXED_THREAD_PRIOBP 1
+#endif
+
+#ifndef MIXED_THREAD_AGGBP
+#define MIXED_THREAD_AGGBP 0
+#endif
+
+#ifndef MIXED_THREAD_PERTCDEQUEUE
+#define MIXED_THREAD_PERTCDEQUEUE 0
+#endif
+
+#ifndef MIXED_THREAD_PRIOPROP
+#define MIXED_THREAD_PRIOPROP 0
+#endif
+
 #define APP_RX_DESC_DEFAULT 1024
 #define APP_TX_DESC_DEFAULT 1024
 
@@ -39,7 +55,8 @@ extern "C" {
 
 #define MAX_DATA_STREAMS RTE_MAX_LCORE/2
 #define MAX_SCHED_SUBPORTS		8
-#define MAX_SCHED_PIPES		4096
+// #define MAX_SCHED_PIPES			65536
+#define MAX_SCHED_PIPES			4096
 #define MAX_SCHED_PIPE_PROFILES		256
 #define MAX_SCHED_SUBPORT_PROFILES	8
 
@@ -56,9 +73,13 @@ extern "C" {
 #define APP_QAVG_NTIMES 10
 #define APP_QAVG_PERIOD 100
 
+#define N_TX_QUEUES 16
+#define N_TC 16
+
 struct thread_stat
 {
 	uint64_t nb_rx;
+	uint64_t nb_tx;
 	uint64_t nb_drop;
 };
 
@@ -141,6 +162,8 @@ extern uint32_t n_active_queues;
 extern struct rte_sched_port_params port_params;
 extern struct rte_sched_cman_params cman_params;
 extern struct rte_sched_subport_params subport_params[MAX_SCHED_SUBPORTS];
+
+extern struct rte_eth_dev_tx_buffer *tx_buffer[RTE_MAX_ETHPORTS][N_TX_QUEUES];
 
 int app_parse_args(int argc, char **argv);
 int app_init(void);
