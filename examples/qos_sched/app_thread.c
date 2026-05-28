@@ -15,6 +15,7 @@
 #include <rte_sched.h>
 
 #include "main.h"
+#include "pending_stats.h"
 
 /*
  * QoS parameters are encoded as follows:
@@ -37,14 +38,11 @@
 // #define COLOR_OFFSET	19
 // }
 
-#define PENDING_MAX 4096   /* tune: must cover worst-case backpressure */
-
 struct pending_q {
 	struct rte_mbuf *pkts[PENDING_MAX];
-	uint16_t head;   /* dequeue */
-	uint16_t tail;   /* enqueue */
-	uint16_t cnt;
-	uint16_t cnt_pktsize;
+	uint64_t         enqueue_tsc[PENDING_MAX]; /* parallel TSC stamp array    */
+	uint8_t          retry_cnt[PENDING_MAX];   /* how many tx attempts so far */
+	uint16_t         head, tail, cnt, cnt_pktsize;
 } __rte_cache_aligned;
 
 static inline void
@@ -68,13 +66,81 @@ static inline void pending_enqueue_burst(struct pending_q *q, struct rte_mbuf **
 	}
 }
 
+static inline void pending_enqueue_burst_tracked(struct pending_q *q, pending_tc_stats_t *s, struct rte_mbuf **mbufs, uint16_t nb_mbufs) {
+	uint64_t now = rte_rdtsc();
+	uint16_t dropped = 0;
+
+	for (uint16_t i = 0; i < nb_mbufs; i++) {
+		if (unlikely(q->cnt >= PENDING_MAX)) {
+			/* policy decision: drop remaining packets */
+			rte_pktmbuf_free(mbufs[i]);
+			dropped++;
+			continue;
+		}
+
+		q->pkts[q->tail] = mbufs[i];
+		q->enqueue_tsc[q->tail]  = now;
+		q->retry_cnt[q->tail] = 1;
+		q->tail = (q->tail + 1) & (PENDING_MAX - 1);
+		q->cnt++;
+		q->cnt_pktsize += mbufs[i]->pkt_len;
+	}
+
+	s->retry_loss += dropped;
+}
+
+/*
+static inline void
+pending_enqueue_burst_tracked(struct pending_q *q, pending_tc_stats_t *s,
+		                               struct rte_mbuf **pkts_in, uint16_t n)
+{
+	uint64_t now = rte_rdtsc();
+	uint16_t dropped = 0;
+
+	for (uint16_t i = 0; i < n; i++) {
+		if (q->cnt >= PENDING_MAX) {
+		       	rte_pktmbuf_free(pkts_in[i]);
+		       	dropped++; 
+			continue; 
+		}
+
+		uint16_t slot         = (q->tail + i) % PENDING_MAX;
+		q->pkts[slot]         = pkts_in[i];
+		q->enqueue_tsc[slot]  = now;
+		q->retry_cnt[slot]    = 1;
+		q->tail               = (q->tail + 1) % PENDING_MAX;
+		q->cnt++;
+	}
+
+	s->retry_loss += dropped;
+}
+*/
+
+/* Call after a successful pending_consume() to record latency + retries */
+static inline void
+pending_consume_tracked(struct pending_q *q, pending_tc_stats_t *s, uint16_t n)
+{
+    for (uint16_t i = 0; i < n; i++) {
+	struct rte_mbuf *m = q->pkts[(q->head + i) & (PENDING_MAX - 1)];
+
+	pstats_record_latency(s, q->enqueue_tsc[(q->head + i) & (PENDING_MAX - 1)]);
+	pstats_record_retry(s, q->retry_cnt[(q->head + i) & (PENDING_MAX - 1)]);
+	s->pkts_retry_total += q->retry_cnt[(q->head + i) & (PENDING_MAX - 1)];
+
+	q->cnt_pktsize -= m->pkt_len;
+    }
+
+    q->head = (q->head + n) & (PENDING_MAX - 1);
+    q->cnt -= n;
+}
+
 static inline void
 pending_enqueue(struct pending_q *q, struct rte_mbuf *m)
 {
     if (unlikely(q->cnt == PENDING_MAX)) {
-		    /* policy decision: drop */
-		    rte_pktmbuf_free(m);
-			    return;
+	/* policy decision: drop */
+	rte_pktmbuf_free(m);
+	return;
 				}
 
      q->pkts[q->tail] = m;
@@ -97,12 +163,10 @@ pending_peek(struct pending_q *q, struct rte_mbuf **out, uint16_t max)
 static inline void
 pending_consume(struct pending_q *q, uint16_t n)
 {
-
-
     for (uint16_t i = 0; i < n; i++) {
-		    struct rte_mbuf *m = q->pkts[(q->head + i) & (PENDING_MAX - 1)];
-			    q->cnt_pktsize -= m->pkt_len;
-				}
+	struct rte_mbuf *m = q->pkts[(q->head + i) & (PENDING_MAX - 1)];
+	q->cnt_pktsize -= m->pkt_len;
+    }
 
     q->head = (q->head + n) & (PENDING_MAX - 1);
     q->cnt -= n;
@@ -401,6 +465,103 @@ app_mixed_thread(struct thread_conf **confs)
      }
 }
 #endif
+
+#if MIXED_THREAD_PRIOBP_STATS
+void
+app_mixed_thread(struct thread_conf **confs)
+{
+    struct rte_mbuf *mbufs[burst_conf.ring_burst];
+    struct thread_conf *conf;
+    int conf_idx = 0;
+
+    uint32_t tc_ov[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
+
+    struct pending_q pending[N_TC];
+    for (int i = 0; i < N_TC; i++)
+	pending_init(&pending[i]);
+
+    struct flow_conf *flow = container_of(confs[0], struct flow_conf, wt_thread);
+    pending_tc_stats_t *stats = flow->tc_stats;
+
+    for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++)
+	        pstats_reset(&stats[tc]);
+
+    struct rte_mbuf *tc_mbufs[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE][burst_conf.qos_dequeue];
+    struct rte_mbuf **pkts[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
+    uint32_t tc_counts[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
+
+    /* Initialize pkts array programatically */
+    for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
+	        pkts[tc] = tc_mbufs[tc];
+		tc_ov[tc] = burst_conf.qos_dequeue;
+    }
+
+    while ((conf = confs[conf_idx])) {
+	uint32_t nb_pkt_rec = 0;
+
+	/* RX → Scheduler enqueue */
+	nb_pkt_rec = rte_ring_sc_dequeue_burst(conf->rx_ring, (void **)mbufs, burst_conf.ring_burst, NULL);
+
+	if (likely(nb_pkt_rec)) {
+		uint32_t nb_sent = rte_sched_port_enqueue(conf->sched_port, mbufs, nb_pkt_rec);
+		APP_STATS_ADD(conf->stat.nb_drop, nb_pkt_rec - nb_sent);
+		APP_STATS_ADD(conf->stat.nb_rx,  nb_pkt_rec);
+	}
+
+	/* ── TX path: drain pending ──────────────────────────── */
+	for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
+		tc_counts[tc] = 0;
+		uint16_t n = pending_peek(&pending[tc], mbufs, burst_conf.qos_dequeue);
+
+		/* STATS: occupancy snapshot (cheap — just read .cnt) */
+		pstats_record_occupancy(&stats[tc], pending[tc].cnt);
+
+		if (n > 0) {
+			uint64_t t0 = rte_rdtsc();
+			uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, mbufs, n);
+			uint64_t t1 = rte_rdtsc();
+			if (sent) {
+				pending_consume_tracked(&pending[tc], &stats[tc], sent);
+				//pending_consume(&pending[tc], sent);
+				APP_STATS_ADD(conf->stat.nb_tx, sent);
+				stats[tc].cycles_retry += (t1 - t0);
+				stats[tc].pkts_tx_total += sent;
+			}
+		}
+
+		uint16_t used = pending[tc].cnt;
+		uint16_t headroom = (used < PENDING_MAX) ? (PENDING_MAX - used) : 0;
+		tc_ov[tc] = RTE_MIN(headroom, burst_conf.qos_dequeue);
+	}
+
+
+	/* ── Scheduler dequeue + fresh TX ───────────────────── */
+	rte_sched_port_dequeue_tc(conf->sched_port, pkts, burst_conf.qos_dequeue, tc_ov, tc_counts);
+
+	for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
+		if (tc_counts[tc] == 0) continue;
+
+		uint64_t t0   = rte_rdtsc();
+		uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, pkts[tc], tc_counts[tc]);
+		uint64_t t1   = rte_rdtsc();
+
+		stats[tc].cycles_tx     += (t1 - t0);
+		stats[tc].pkts_tx_total += sent;
+
+		if (unlikely(sent < tc_counts[tc])) {
+			pending_enqueue_burst_tracked(&pending[tc], &stats[tc], &pkts[tc][sent], tc_counts[tc] - sent);
+			// pending_enqueue_burst(&pending[tc], &pkts[tc][sent], tc_counts[tc] - sent);
+		}
+		APP_STATS_ADD(conf->stat.nb_tx, sent);
+	}
+
+	conf_idx++;
+	if (confs[conf_idx] == NULL)
+	conf_idx = 0;
+     }
+}
+#endif
+
 #if MIXED_THREAD_AGGBP
 void
 app_mixed_thread(struct thread_conf **confs)

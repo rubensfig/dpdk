@@ -19,6 +19,7 @@
 
 #include "main.h"
 #include "cfg_file.h"
+#include "pending_stats.h"
 
 uint32_t app_numa_mask = 0;
 static uint32_t app_inited_port_mask = 0;
@@ -611,7 +612,13 @@ int app_init(void)
 		}
 
 		qos_conf[i].sched_port = app_init_sched_port(qos_conf[i].tx_port, socket);
+
+		for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++)
+			pstats_reset(&qos_conf[i].tc_stats[tc]);
 	}
+
+	rte_telemetry_register_cmd( "/qos/pending_stats", telemetry_pending_stats,
+				    "Pending queue stats. Params: flow_id[,tc]");
 
 	RTE_LOG(INFO, APP, "time stamp clock running at %" PRIu64 " Hz\n",
 			 rte_get_timer_hz());

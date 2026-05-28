@@ -178,6 +178,67 @@ app_stat(void)
 			flow->wt_thread.stat.nb_rx - flow->wt_thread.stat.nb_drop);
 		printf("-------+------------+------------+\n");
 
+#if MIXED_THREAD_PRIOBP_STATS
+	uint64_t hz = rte_get_tsc_hz();
+	printf("-------+------------ Pending Queue Stats -------------+\n");
+	printf("  TC   | avg_occ | max_occ | avg_lat_ns | max_lat_ns | loss | cyc/tx | cyc/retry |\n");
+	printf("-------+---------+---------+------------+------------+------+--------+-----------+\n");
+	
+	for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
+		pending_tc_stats_t *s = &flow->tc_stats[tc];
+	
+	double avg_occ   = s->occ_samples ? (double)s->occ_sum / s->occ_samples : 0;
+	uint64_t avg_lat = s->lat_samples ? (s->lat_sum_tsc / s->lat_samples) * 1000000000ULL / hz : 0;
+	uint64_t max_lat = (s->lat_max_tsc * 1000000000ULL) / hz;
+	double cyc_tx    = s->pkts_tx_total ? (double)s->cycles_tx    / s->pkts_tx_total    : 0;
+	double cyc_retry = s->pkts_retry_total ? (double)s->cycles_retry / s->pkts_retry_total : 0;
+	
+	printf("  %2d   | %7.1f | %7u | %10lu | %10lu | %4lu | %6.1f | %9.1f |\n",
+		tc, avg_occ, s->occ_max, avg_lat, max_lat, s->retry_loss, cyc_tx, cyc_retry);
+	
+	/* occupancy histogram */
+	if (s->occ_samples && s->occ_max > 0) {
+		printf("  occ_hist (bucket=%d slots):\n", PENDING_MAX / PHIST_OCC_BUCKETS);
+		for (int b = 0; b < PHIST_OCC_BUCKETS; b++) {
+
+			if (!s->occ_hist[b]) continue;
+
+			printf("    [%4d-%4d]: %lu\n", b * PENDING_MAX / PHIST_OCC_BUCKETS,
+			(b + 1) * PENDING_MAX / PHIST_OCC_BUCKETS - 1, s->occ_hist[b]);
+		}
+	}
+	
+	/* latency histogram */
+	if (s->lat_samples) {
+		printf("  lat_hist (ns):\n");
+
+		for (int b = 0; b < PHIST_LAT_BUCKETS; b++) {
+
+			if (!s->lat_hist[b]) continue;
+			if (lat_hist_edges_ns[b] == UINT64_MAX)
+				printf("    [    >1s]: %lu\n", s->lat_hist[b]);
+			else
+				printf("    [<%7lu]: %lu\n", lat_hist_edges_ns[b], s->lat_hist[b]);
+		}
+	}
+	
+	/* retry histogram */
+	if (s->retry_total) {
+		printf("  retry_hist:\n");
+		for (int b = 0; b < PHIST_RETRY_BUCKETS; b++) {
+			if (!s->retry_hist[b]) continue;
+			if (b == PHIST_RETRY_BUCKETS - 1)
+				printf("    [%d+]: %lu\n", b, s->retry_hist[b]);
+			else
+				printf("    [%d]:  %lu\n", b, s->retry_hist[b]);
+		}
+	}
+	
+	pstats_reset(s);
+	}
+	printf("-------+---------+---------+------------+------------+------+--------+-----------+\n");
+#endif
+
 		memset(&flow->rx_thread.stat, 0, sizeof(struct thread_stat));
 		memset(&flow->wt_thread.stat, 0, sizeof(struct thread_stat));
 #endif

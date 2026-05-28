@@ -6,6 +6,7 @@
 #define _MAIN_H_
 
 #include <rte_sched.h>
+#include "pending_stats.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -19,7 +20,11 @@ extern "C" {
 #define APP_INTERACTIVE_DEFAULT 0
 
 #ifndef MIXED_THREAD_PRIOBP
-#define MIXED_THREAD_PRIOBP 1
+#define MIXED_THREAD_PRIOBP 0
+#endif
+
+#ifndef MIXED_THREAD_PRIOBP_STATS
+#define MIXED_THREAD_PRIOBP_STATS 1
 #endif
 
 #ifndef MIXED_THREAD_AGGBP
@@ -117,6 +122,8 @@ struct flow_conf
 	struct thread_conf rx_thread;
 	struct thread_conf wt_thread;
 	struct thread_conf tx_thread;
+
+	pending_tc_stats_t tc_stats[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
 };
 
 
@@ -184,6 +191,10 @@ int qavg_tcpipe(uint16_t port_id, uint32_t subport_id, uint32_t pipe_id,
 int qavg_pipe(uint16_t port_id, uint32_t subport_id, uint32_t pipe_id);
 int qavg_tcsubport(uint16_t port_id, uint32_t subport_id, uint8_t tc);
 int qavg_subport(uint16_t port_id, uint32_t subport_id);
+int
+telemetry_pending_stats(const char *cmd __rte_unused, 
+		const char *params, struct rte_tel_data *d);
+
 
 #ifdef __cplusplus
 }
