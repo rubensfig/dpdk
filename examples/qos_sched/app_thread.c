@@ -25,9 +25,9 @@
  * Values below define offset to each field from start of frame
  */
 // VLAN offload ON {
-#define SUBPORT_OFFSET	5
-#define PIPE_OFFSET	16
-#define QUEUE_OFFSET	7
+#define SUBPORT_OFFSET	8
+#define PIPE_OFFSET	18
+#define QUEUE_OFFSET	9
 #define COLOR_OFFSET	19
 // }
 
