@@ -25,7 +25,7 @@
  * Values below define offset to each field from start of frame
  */
 // VLAN offload ON {
-#define SUBPORT_OFFSET	8
+#define SUBPORT_OFFSET	7
 #define PIPE_OFFSET	18
 #define QUEUE_OFFSET	9
 #define COLOR_OFFSET	19
@@ -201,9 +201,9 @@ static inline int get_pkt_sched(struct rte_mbuf *m, uint32_t *subport, uint32_t 
  	/* Color */
  	*color = 0;
 
-	// rte_ether_addr_copy(&eth_hdr->dst_addr, &addr);
-	// rte_ether_addr_copy(&eth_hdr->src_addr, &eth_hdr->dst_addr);
-	// rte_ether_addr_copy(&addr, &eth_hdr->src_addr);
+	rte_ether_addr_copy(&eth_hdr->dst_addr, &addr);
+	rte_ether_addr_copy(&eth_hdr->src_addr, &eth_hdr->dst_addr);
+	rte_ether_addr_copy(&addr, &eth_hdr->src_addr);
 
 	return 0;
 }
