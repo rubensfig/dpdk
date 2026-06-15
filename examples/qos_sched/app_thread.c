@@ -201,9 +201,9 @@ static inline int get_pkt_sched(struct rte_mbuf *m, uint32_t *subport, uint32_t 
  	/* Color */
  	*color = 0;
 
-	rte_ether_addr_copy(&eth_hdr->dst_addr, &addr);
-	rte_ether_addr_copy(&eth_hdr->src_addr, &eth_hdr->dst_addr);
-	rte_ether_addr_copy(&addr, &eth_hdr->src_addr);
+	// rte_ether_addr_copy(&eth_hdr->dst_addr, &addr);
+	// rte_ether_addr_copy(&eth_hdr->src_addr, &eth_hdr->dst_addr);
+	// rte_ether_addr_copy(&addr, &eth_hdr->src_addr);
 
 	return 0;
 }

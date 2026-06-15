@@ -3,7 +3,7 @@
 #include <string.h>
 #include <rte_cycles.h>
 
-#define PENDING_MAX 64
+#define PENDING_MAX 4096
 
 /* ── Histogram bucket config ─────────────────────────── */
 #define PHIST_OCC_BUCKETS   16   /* occupancy:  bucket i → [i*(PENDING_MAX/16), ...) */
