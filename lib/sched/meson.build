@@ -15,4 +15,4 @@ headers = files(
         'rte_sched_common.h',
         'rte_pie.h',
 )
-deps += ['mbuf', 'meter']
+deps += ['mbuf', 'meter','net']

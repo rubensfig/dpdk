@@ -15,13 +15,14 @@
 #include <rte_mbuf.h>
 #include <rte_bitmap.h>
 #include <rte_reciprocal.h>
+#include <rte_ether.h>
+#include <rte_ip.h>
 
 #include "rte_sched.h"
 #include "rte_sched_log.h"
 #include "rte_sched_common.h"
 
 #include "rte_approx.h"
-
 
 #ifdef __INTEL_COMPILER
 #pragma warning(disable:2259) /* conversion may lose significant bits */
@@ -2009,6 +2010,35 @@ rte_sched_port_enqueue_qwa_prefetch0(struct rte_sched_port *port,
 }
 
 static inline int
+mark_packet_with_ecn(struct rte_mbuf *pkt)
+{
+	struct rte_ipv4_hdr *iphdr;
+
+	if (!RTE_ETH_IS_IPV4_HDR(pkt->packet_type))
+		return -1;
+
+	iphdr = rte_pktmbuf_mtod_offset(pkt, struct rte_ipv4_hdr *,
+		sizeof(struct rte_ether_hdr));
+
+	/* ECN field is the lowest 2 bits of the TOS byte.
+	*      * Only ECT(0)=10 or ECT(1)=01 packets can be marked.
+	*           */
+	switch (iphdr->type_of_service & 0x3) {
+	case 0x1: /* ECT(1) */
+	case 0x2: /* ECT(0) */
+	iphdr->type_of_service =
+	(iphdr->type_of_service & ~0x3) | 0x3; /* CE */
+
+	iphdr->hdr_checksum = 0;
+	iphdr->hdr_checksum = rte_ipv4_cksum(iphdr);
+	return 0;
+
+	default:
+	/* Not ECN capable or already CE */
+	return -1;
+	}
+}
+static inline int
 rte_sched_port_enqueue_qwa(struct rte_sched_port *port,
 	struct rte_sched_subport *subport,
 	uint32_t qindex,
@@ -2023,7 +2053,7 @@ rte_sched_port_enqueue_qwa(struct rte_sched_port *port,
 	qsize = rte_sched_subport_pipe_qsize(port, subport, qindex);
 	qlen = q->qw - q->qr;
 
-	/* Drop the packet (and update drop stats) when queue is full */
+	/* Drop the packet (and update drop stats) when queue is full
 	if (unlikely(rte_sched_port_cman_drop(port, subport, pkt, qindex, qlen) ||
 		     (qlen >= qsize))) {
 		rte_pktmbuf_free(pkt);
@@ -2031,6 +2061,29 @@ rte_sched_port_enqueue_qwa(struct rte_sched_port *port,
 			qindex, pkt, qlen < qsize);
 		rte_sched_port_update_queue_stats_on_drop(subport, qindex, pkt,
 			qlen < qsize);
+		return 0;
+	} */
+
+	/* Congestion indication from CMAN */
+	if (unlikely(rte_sched_port_cman_drop(port, subport, pkt, qindex, qlen))) {
+		if (mark_packet_with_ecn(pkt) != 0) {
+			/* Could not mark -> drop */
+			rte_pktmbuf_free(pkt);
+			rte_sched_port_update_subport_stats_on_drop(port, subport,
+			qindex, pkt, 1);
+			rte_sched_port_update_queue_stats_on_drop(subport, qindex,
+			pkt, 1);
+			return 0;
+		}
+	}
+
+	/* Queue full: always drop */
+	if (unlikely(qlen >= qsize)) {
+		rte_pktmbuf_free(pkt);
+		rte_sched_port_update_subport_stats_on_drop(port, subport,
+		qindex, pkt, 0);
+		rte_sched_port_update_queue_stats_on_drop(subport, qindex,
+		pkt, 0);
 		return 0;
 	}
 
