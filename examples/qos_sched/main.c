@@ -136,6 +136,14 @@ app_main_loop(__rte_unused void *dummy)
 	return 0;
 }
 
+static void print_lat_range(double ns) {
+	if (ns < 1e3)       printf("%8.0fns", ns);
+	else if (ns < 1e6)  printf("%8.2fus", ns / 1e3);
+	else if (ns < 1e9)  printf("%8.2fms", ns / 1e6);
+	else                printf("%8.2fs ", ns / 1e9);
+}
+
+
 void
 app_stat(void)
 {
@@ -210,15 +218,26 @@ app_stat(void)
 	
 	/* latency histogram */
 	if (s->lat_samples) {
-		printf("  lat_hist (ns):\n");
-
+		printf("  lat_hist:\n");
 		for (int b = 0; b < PHIST_LAT_BUCKETS; b++) {
-
 			if (!s->lat_hist[b]) continue;
-			if (lat_hist_edges_ns[b] == UINT64_MAX)
-				printf("    [    >1s]: %lu\n", s->lat_hist[b]);
-			else
-				printf("    [<%7lu]: %lu\n", lat_hist_edges_ns[b], s->lat_hist[b]);
+			
+			if (b == PHIST_LAT_BUCKETS - 1) {
+			printf("    [>=");
+			print_lat_range(pow(10.0, PHIST_MAX_DECADE_EXP));
+			printf("       ]: %lu\n", s->lat_hist[b]);
+			continue;
+			}
+			
+			double lo = pow(10.0, PHIST_MIN_DECADE_EXP +
+			(double)b / PHIST_BUCKETS_PER_DECADE);
+			double hi = pow(10.0, PHIST_MIN_DECADE_EXP +
+			(double)(b + 1) / PHIST_BUCKETS_PER_DECADE);
+			printf("    [");
+			print_lat_range(lo);
+			printf(" - ");
+			print_lat_range(hi);
+		printf("): %lu\n", s->lat_hist[b]);
 		}
 	}
 	

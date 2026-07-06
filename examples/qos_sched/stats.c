@@ -389,6 +389,20 @@ telemetry_pending_stats(const char *cmd __rte_unused, const char *params, struct
 	struct flow_conf *flow = &qos_conf[flow_id];
 	
 	rte_tel_data_start_dict(d);
+
+	/* latency histogram bucket edges (ns) — published once so consumers
+	 *    can interpret lat_hist[] without re-deriving the log-spacing formula */
+	struct rte_tel_data *lat_edges = rte_tel_data_alloc();
+	rte_tel_data_start_array(lat_edges, RTE_TEL_UINT_VAL);
+	for (int b = 0; b <= PHIST_LAT_BUCKETS; b++) {
+		uint64_t edge_ns;
+		if (b == PHIST_LAT_BUCKETS)
+			edge_ns = (uint64_t)pow(10.0, PHIST_MAX_DECADE_EXP);
+		else
+			edge_ns = (uint64_t)pow(10.0, PHIST_MIN_DECADE_EXP + (double)b / PHIST_BUCKETS_PER_DECADE);
+		rte_tel_data_add_array_uint(lat_edges, edge_ns);
+	}
+	rte_tel_data_add_dict_container(d, "lat_hist_edges_ns", lat_edges, 0);
 	
 	for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
 		if (tc_filter >= 0 && tc != tc_filter) continue;
@@ -399,17 +413,17 @@ telemetry_pending_stats(const char *cmd __rte_unused, const char *params, struct
 		struct rte_tel_data *tc_d = rte_tel_data_alloc();
 		rte_tel_data_start_dict(tc_d);
 		
-		double avg_occ = s->occ_samples ? (double)s->occ_sum / s->occ_samples : 0.0;
+		uint64_t avg_occ = s->occ_samples ? s->occ_sum / s->occ_samples : 0;
 	       	uint64_t avg_lat = s->lat_samples ? (s->lat_sum_tsc / s->lat_samples) * 1000000000ULL / hz : 0;
 		uint64_t max_lat = (s->lat_max_tsc * 1000000000ULL) / hz;
 		
 		rte_tel_data_add_dict_uint(tc_d, "avg_occ",       avg_occ);
-		rte_tel_data_add_dict_uint  (tc_d, "max_occ",       s->occ_max);
-		rte_tel_data_add_dict_uint  (tc_d, "avg_lat_ns",    avg_lat);
-		rte_tel_data_add_dict_uint  (tc_d, "max_lat_ns",    max_lat);
-		rte_tel_data_add_dict_uint  (tc_d, "retry_loss",    s->retry_loss);
-		rte_tel_data_add_dict_uint  (tc_d, "pkts_tx",       s->pkts_tx_total);
-		rte_tel_data_add_dict_uint  (tc_d, "pkts_retry",    s->pkts_retry_total);
+		rte_tel_data_add_dict_uint(tc_d, "max_occ",       s->occ_max);
+		rte_tel_data_add_dict_uint(tc_d, "avg_lat_ns",    avg_lat);
+		rte_tel_data_add_dict_uint(tc_d, "max_lat_ns",    max_lat);
+		rte_tel_data_add_dict_uint(tc_d, "retry_loss",    s->retry_loss);
+		rte_tel_data_add_dict_uint(tc_d, "pkts_tx",       s->pkts_tx_total);
+		rte_tel_data_add_dict_uint(tc_d, "pkts_retry",    s->pkts_retry_total);
 		
 		double cyc_tx    = s->pkts_tx_total ? (double)s->cycles_tx    / s->pkts_tx_total    : 0.0;
 		double cyc_retry = s->pkts_retry_total ? (double)s->cycles_retry / s->pkts_retry_total : 0.0;
@@ -428,7 +442,7 @@ telemetry_pending_stats(const char *cmd __rte_unused, const char *params, struct
 		struct rte_tel_data *lat_hist = rte_tel_data_alloc();
 		rte_tel_data_start_array(lat_hist, RTE_TEL_UINT_VAL);
 		for (int b = 0; b < PHIST_LAT_BUCKETS; b++)
-			    rte_tel_data_add_array_uint(lat_hist, s->lat_hist[b]);
+			        rte_tel_data_add_array_uint(lat_hist, s->lat_hist[b]);
 		rte_tel_data_add_dict_container(tc_d, "lat_hist", lat_hist, 0);
 
 		/* retry histogram */
@@ -443,6 +457,7 @@ telemetry_pending_stats(const char *cmd __rte_unused, const char *params, struct
 		snprintf(key, sizeof(key), "tc_%d", tc);
 		rte_tel_data_add_dict_container(d, key, tc_d, 0);
 	}
+
 	
 	return 0;
 }

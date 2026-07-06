@@ -71,10 +71,12 @@ static inline void pending_enqueue_burst_tracked(struct pending_q *q, pending_tc
 	uint16_t dropped = 0;
 
 	for (uint16_t i = 0; i < nb_mbufs; i++) {
+
 		if (unlikely(q->cnt >= PENDING_MAX)) {
+			printf("DROPPED\n");
 			/* policy decision: drop remaining packets */
 			rte_pktmbuf_free(mbufs[i]);
-			dropped++;
+			s->retry_loss++;
 			continue;
 		}
 
@@ -86,7 +88,6 @@ static inline void pending_enqueue_burst_tracked(struct pending_q *q, pending_tc
 		q->cnt_pktsize += mbufs[i]->pkt_len;
 	}
 
-	s->retry_loss += dropped;
 }
 
 /*
@@ -141,7 +142,7 @@ pending_enqueue(struct pending_q *q, struct rte_mbuf *m)
 	/* policy decision: drop */
 	rte_pktmbuf_free(m);
 	return;
-				}
+     }
 
      q->pkts[q->tail] = m;
      q->tail = (q->tail + 1) & (PENDING_MAX - 1);
@@ -189,7 +190,7 @@ static inline int get_pkt_sched(struct rte_mbuf *m, uint32_t *subport, uint32_t 
  	/* Dst Addr */
  	*pipe = (rte_be_to_cpu_16(pdata[PIPE_OFFSET]) & 0xFFFF);
 
-	pipe_queue = (rte_be_to_cpu_16(pdata[QUEUE_OFFSET]) & 0x00FF);
+	pipe_queue = ((rte_be_to_cpu_16(pdata[QUEUE_OFFSET]) & 0x00FC) >> 2);
 
  	/* Traffic class (TOS) */
  	*traffic_class = pipe_queue > RTE_SCHED_TRAFFIC_CLASS_BE ?
@@ -197,13 +198,32 @@ static inline int get_pkt_sched(struct rte_mbuf *m, uint32_t *subport, uint32_t 
 
  	/* Traffic class queue (TOS) */
  	*queue = pipe_queue - *traffic_class;
- 	
+
+//	printf("tos=0x%x dscp=%u tc=%u q=%u\n",
+//			       rte_be_to_cpu_16(pdata[QUEUE_OFFSET]) & 0xff,
+//			              pipe_queue,
+//				             *traffic_class,
+//					            *queue);
  	/* Color */
  	*color = 0;
 
 	// rte_ether_addr_copy(&eth_hdr->dst_addr, &addr);
 	// rte_ether_addr_copy(&eth_hdr->src_addr, &eth_hdr->dst_addr);
 	// rte_ether_addr_copy(&addr, &eth_hdr->src_addr);
+	//        uint16_t ether_type = rte_be_to_cpu_16(eth_hdr->ether_type);
+	//
+	/*
+	uint16_t ether_type = rte_be_to_cpu_16(eth_hdr->ether_type);
+	if (ether_type == RTE_ETHER_TYPE_IPV4) {
+	     struct rte_ipv4_hdr *ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
+
+	    if (ip_hdr->next_proto_id == IPPROTO_UDP) {
+			rte_ether_addr_copy(&eth_hdr->dst_addr, &addr);
+			rte_ether_addr_copy(&eth_hdr->src_addr, &eth_hdr->dst_addr);
+			rte_ether_addr_copy(&addr, &eth_hdr->src_addr);
+	    }
+	}
+	*/
 
 	return 0;
 }
@@ -513,9 +533,6 @@ app_mixed_thread(struct thread_conf **confs)
 		tc_counts[tc] = 0;
 		uint16_t n = pending_peek(&pending[tc], mbufs, burst_conf.qos_dequeue);
 
-		/* STATS: occupancy snapshot (cheap — just read .cnt) */
-		pstats_record_occupancy(&stats[tc], pending[tc].cnt);
-
 		if (n > 0) {
 			uint64_t t0 = rte_rdtsc();
 			uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, mbufs, n);
@@ -527,7 +544,11 @@ app_mixed_thread(struct thread_conf **confs)
 				stats[tc].cycles_retry += (t1 - t0);
 				stats[tc].pkts_tx_total += sent;
 			}
+
 		}
+
+		/* STATS: occupancy snapshot */
+		pstats_record_occupancy(&stats[tc], pending[tc].cnt);
 
 		uint16_t used = pending[tc].cnt;
 		uint16_t headroom = (used < PENDING_MAX) ? (PENDING_MAX - used) : 0;
