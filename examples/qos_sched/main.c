@@ -186,7 +186,7 @@ app_stat(void)
 			flow->wt_thread.stat.nb_rx - flow->wt_thread.stat.nb_drop);
 		printf("-------+------------+------------+\n");
 
-#if MIXED_THREAD_PRIOBP_STATS
+#if MIXED_THREAD_PRIOBP_STATS || MIXED_THREAD_PAB_BQL
 	uint64_t hz = rte_get_tsc_hz();
 	printf("-------+------------ Pending Queue Stats -------------+\n");
 	printf("  TC   | avg_occ | max_occ | avg_lat_ns | max_lat_ns | loss | cyc/tx | cyc/retry |\n");

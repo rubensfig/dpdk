@@ -199,17 +199,20 @@ static inline int get_pkt_sched(struct rte_mbuf *m, uint32_t *subport, uint32_t 
  	/* Traffic class queue (TOS) */
  	*queue = pipe_queue - *traffic_class;
 
-//	printf("tos=0x%x dscp=%u tc=%u q=%u\n",
-//			       rte_be_to_cpu_16(pdata[QUEUE_OFFSET]) & 0xff,
-//			              pipe_queue,
-//				             *traffic_class,
-//					            *queue);
+	// for (int i = 0; i < 20; i++)
+	// 	printf("%x\n", rte_be_to_cpu_16(pdata[QUEUE_OFFSET]));
+	// printf("tos=0x%x dscp=%u tc=%u q=%u\n",
+	// 		       rte_be_to_cpu_16(pdata[QUEUE_OFFSET]) & 0xff,
+	// 		              pipe_queue,
+	// 			             *traffic_class,
+	// 				            *queue);
+	// printf("\n\n");
  	/* Color */
  	*color = 0;
 
-	// rte_ether_addr_copy(&eth_hdr->dst_addr, &addr);
-	// rte_ether_addr_copy(&eth_hdr->src_addr, &eth_hdr->dst_addr);
-	// rte_ether_addr_copy(&addr, &eth_hdr->src_addr);
+	rte_ether_addr_copy(&eth_hdr->dst_addr, &addr);
+	rte_ether_addr_copy(&eth_hdr->src_addr, &eth_hdr->dst_addr);
+	rte_ether_addr_copy(&addr, &eth_hdr->src_addr);
 	//        uint16_t ether_type = rte_be_to_cpu_16(eth_hdr->ether_type);
 	//
 	/*
@@ -484,6 +487,169 @@ app_mixed_thread(struct thread_conf **confs)
 	conf_idx = 0;
      }
 }
+#endif
+
+#if MIXED_THREAD_PAB_BQL
+#define PAB_LIMIT_MIN     4u          /* pkts; seed, refine empirically */
+#define PAB_GROW_STEP     16u          /* pkts, additive growth on starve */
+#define PAB_TICK_US       200         /* interval tick, microseconds */
+ 
+struct pab_bql {
+	uint64_t num_queued;      /* cumulative pkts accepted by tx_burst */
+	uint64_t num_completed;   /* cumulative pkts confirmed done by NIC */
+	uint32_t limit;           /* adaptive per-TC pkt budget */
+	uint64_t last_tick_cycles;
+};
+ 
+void app_mixed_thread(struct thread_conf **confs)
+{
+	struct rte_mbuf *mbufs[burst_conf.ring_burst];
+	struct thread_conf *conf;
+	int conf_idx = 0;
+
+	uint32_t tc_ov[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
+
+	struct pending_q pending[N_TC];
+	for (int i = 0; i < N_TC; i++)
+	pending_init(&pending[i]);
+
+	struct flow_conf *flow = container_of(confs[0], struct flow_conf, wt_thread);
+	pending_tc_stats_t *stats = flow->tc_stats;
+
+	for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++)
+	pstats_reset(&stats[tc]);
+
+	/* ---- Added: bql state + init, same scope/lifetime as pending[] --- */
+	struct pab_bql bql[N_TC];
+	uint64_t pab_tick_cycles = (rte_get_timer_hz() * PAB_TICK_US) / 1000000;
+	for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
+	bql[tc].num_queued = 0;
+	bql[tc].num_completed = 0;
+	bql[tc].limit = burst_conf.qos_dequeue; /* start permissive */
+	bql[tc].last_tick_cycles = rte_get_timer_cycles();
+	}
+	/* ------------------------------------------------------------------ */
+
+	struct rte_mbuf *tc_mbufs[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE][burst_conf.qos_dequeue];
+	struct rte_mbuf **pkts[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
+	uint32_t tc_counts[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
+
+	/* Initialize pkts array programatically */
+	for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
+	pkts[tc] = tc_mbufs[tc];
+	tc_ov[tc] = burst_conf.qos_dequeue;
+	}
+
+	while ((conf = confs[conf_idx])) {
+		uint32_t nb_pkt_rec = 0;
+
+		/* RX → Scheduler enqueue */
+		nb_pkt_rec = rte_ring_sc_dequeue_burst(conf->rx_ring, (void **)mbufs, burst_conf.ring_burst, NULL);
+
+		if (likely(nb_pkt_rec)) {
+			uint32_t nb_sent = rte_sched_port_enqueue(conf->sched_port, mbufs, nb_pkt_rec);
+			APP_STATS_ADD(conf->stat.nb_drop, nb_pkt_rec - nb_sent);
+			APP_STATS_ADD(conf->stat.nb_rx,  nb_pkt_rec);
+		}
+
+		uint64_t now_cycles = rte_get_timer_cycles();
+		for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
+			if (bql[tc].num_queued == 0 && pending[tc].cnt == 0)
+				continue; /* skip TCs that have never carried traffic */
+
+			if (now_cycles - bql[tc].last_tick_cycles < pab_tick_cycles)
+				continue;
+
+			int freed = rte_eth_tx_done_cleanup(conf->tx_port, tc, 0);
+
+			if (freed > 0) {
+				bql[tc].num_completed += (uint64_t)freed;
+			} 
+
+			int had_demand = (pending[tc].cnt > 0) || (tc_counts[tc] > 0);
+			uint64_t inflight = bql[tc].num_queued - bql[tc].num_completed;
+
+			if (inflight == 0 && had_demand) {
+				bql[tc].limit += PAB_GROW_STEP;
+			if (bql[tc].limit > burst_conf.qos_dequeue)
+				bql[tc].limit = burst_conf.qos_dequeue;
+			} else if (inflight >= bql[tc].limit && had_demand) {
+				uint32_t unsent = pending[tc].cnt;
+				bql[tc].limit = (bql[tc].limit > unsent) ? bql[tc].limit - unsent : PAB_LIMIT_MIN;
+
+			if (bql[tc].limit < PAB_LIMIT_MIN)
+				bql[tc].limit = PAB_LIMIT_MIN;
+			}
+
+			bql[tc].last_tick_cycles = now_cycles;
+		}
+		/* ------------------------------------------------------- */
+
+		/* ── TX path: drain pending ──────────────────────────── */
+		for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
+			tc_counts[tc] = 0;
+			uint16_t n = pending_peek(&pending[tc], mbufs, burst_conf.qos_dequeue);
+
+			if (n > 0) {
+			uint64_t t0 = rte_rdtsc();
+			uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, mbufs, n);
+			uint64_t t1 = rte_rdtsc();
+			if (sent) {
+			pending_consume_tracked(&pending[tc], &stats[tc], sent);
+			APP_STATS_ADD(conf->stat.nb_tx, sent);
+			stats[tc].cycles_retry += (t1 - t0);
+			stats[tc].pkts_tx_total += sent;
+			
+			bql[tc].num_queued += sent; /* ---- Added ---- */
+			}
+		}
+		
+		/* STATS: occupancy snapshot */
+		pstats_record_occupancy(&stats[tc], pending[tc].cnt);
+		
+		uint16_t used = pending[tc].cnt;
+		uint16_t headroom = (used < PENDING_MAX) ? (PENDING_MAX - used) : 0;
+		
+		/* ---- Added: combine burst-level ring headroom (existing)
+		* with the completion-rate-derived bql limit (new). Both
+		* gates apply -- whichever is tighter wins. */
+		uint64_t inflight_now = bql[tc].num_queued - bql[tc].num_completed;
+		uint32_t bql_space = (bql[tc].limit > inflight_now) ? (uint32_t)(bql[tc].limit - inflight_now) : 0;
+
+		// if (tc < 2)
+		// printf("tc %d headroom %d bql_space %d dequeue %d\n\n", tc, headroom, bql_space, burst_conf.qos_dequeue);
+		
+		tc_ov[tc] = RTE_MIN(RTE_MIN(headroom, bql_space), burst_conf.qos_dequeue);
+		}
+		
+		/* ── Scheduler dequeue + fresh TX ───────────────────── */
+		rte_sched_port_dequeue_tc(conf->sched_port, pkts, burst_conf.qos_dequeue, tc_ov, tc_counts);
+		
+		for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
+		if (tc_counts[tc] == 0) continue;
+		
+		uint64_t t0   = rte_rdtsc();
+		uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, pkts[tc], tc_counts[tc]);
+		uint64_t t1   = rte_rdtsc();
+		
+		stats[tc].cycles_tx     += (t1 - t0);
+		stats[tc].pkts_tx_total += sent;
+		
+		bql[tc].num_queued += sent; /* ---- Added ---- */
+		
+		if (unlikely(sent < tc_counts[tc])) {
+			pending_enqueue_burst_tracked(&pending[tc], &stats[tc], &pkts[tc][sent], tc_counts[tc] - sent);
+		}
+		APP_STATS_ADD(conf->stat.nb_tx, sent);
+		}
+		
+		conf_idx++;
+		if (confs[conf_idx] == NULL)
+		conf_idx = 0;
+	}
+}
+//
+
 #endif
 
 #if MIXED_THREAD_PRIOBP_STATS
