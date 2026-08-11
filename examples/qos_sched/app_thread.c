@@ -489,7 +489,100 @@ app_mixed_thread(struct thread_conf **confs)
 }
 #endif
 
-#if MIXED_THREAD_PAB_BQL
+//#if MIXED_THREAD_PAB_DQL
+/*
+Get the number of used descriptors of a Tx queue.
+
+This function retrieves the number of used descriptors of a transmit queue. Applications can use this API in the fast path to inspect Tx queue occupancy and take appropriate actions based on the available free descriptors. An example action could be implementing Random Early Discard (RED).
+
+Since it's a fast-path function, no check is performed on port_id and queue_id. The caller must therefore ensure that the port is enabled and the queue is configured and running.
+*/
+// #endif
+
+#if MIXED_THREAD_PAB_COMP
+void app_mixed_thread(struct thread_conf **confs)
+{
+        struct rte_mbuf *mbufs[burst_conf.ring_burst];
+        struct thread_conf *conf;
+        int conf_idx = 0;
+
+        uint32_t tc_ov[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
+
+        struct flow_conf *flow = container_of(confs[0], struct flow_conf, wt_thread);
+        pending_tc_stats_t *stats = flow->tc_stats;
+
+        for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++)
+                pstats_reset(&stats[tc]);
+
+        struct rte_mbuf *tc_mbufs[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE][burst_conf.qos_dequeue];
+        struct rte_mbuf **pkts[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
+        uint32_t tc_counts[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
+
+        for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
+                pkts[tc] = tc_mbufs[tc];
+                tc_ov[tc] = burst_conf.qos_dequeue;
+        }
+
+        while ((conf = confs[conf_idx])) {
+                uint32_t nb_pkt_rec = 0;
+
+                /* RX → Scheduler enqueue */
+                nb_pkt_rec = rte_ring_sc_dequeue_burst(conf->rx_ring, (void **)mbufs,
+                                                        burst_conf.ring_burst, NULL);
+
+                if (likely(nb_pkt_rec)) {
+                        uint32_t nb_sent = rte_sched_port_enqueue(conf->sched_port, mbufs, nb_pkt_rec);
+                        APP_STATS_ADD(conf->stat.nb_drop, nb_pkt_rec - nb_sent);
+                        APP_STATS_ADD(conf->stat.nb_rx,  nb_pkt_rec);
+                }
+
+                /* ── Set per-TC dequeue budget from live NIC queue occupancy ── */
+                for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
+                        int used = rte_eth_tx_queue_count(conf->tx_port, tc);
+
+                        /* used < 0 means driver doesn't support the counter --
+                         * fall back to fully open rather than gating shut. */
+                        uint32_t space = (used >= 0 && (uint32_t)used < burst_conf.qos_dequeue)
+                                          ? burst_conf.qos_dequeue - (uint32_t)used
+                                          : burst_conf.qos_dequeue;
+
+                        tc_ov[tc] = RTE_MIN(space, burst_conf.qos_dequeue);
+                        // tc_ov[tc] = burst_conf.qos_dequeue;
+                }
+
+                /* ── Scheduler dequeue + TX ──────────────────────────── */
+		memset(tc_counts, 0, sizeof(tc_counts));
+                rte_sched_port_dequeue_tc(conf->sched_port, pkts, burst_conf.qos_dequeue, tc_ov, tc_counts);
+
+                for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
+                        if (tc_counts[tc] == 0)
+                                continue;
+
+                        uint64_t t0   = rte_rdtsc();
+                        uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, pkts[tc], tc_counts[tc]);
+                        uint64_t t1   = rte_rdtsc();
+
+                        stats[tc].cycles_tx     += (t1 - t0);
+                        stats[tc].pkts_tx_total += sent;
+
+                        if (unlikely(sent < tc_counts[tc])) {
+                                /* Not sent, and no pending queue to stash them in --
+                                 * they must be freed or you'll leak mbufs. */
+                                for (uint32_t i = sent; i < tc_counts[tc]; i++)
+                                        rte_pktmbuf_free(pkts[tc][i]);
+                                APP_STATS_ADD(conf->stat.nb_drop, tc_counts[tc] - sent);
+                        }
+                        APP_STATS_ADD(conf->stat.nb_tx, sent);
+                }
+
+                conf_idx++;
+                if (confs[conf_idx] == NULL)
+                        conf_idx = 0;
+        }
+}
+#endif
+
+#if MIXED_THREAD_PAB_BQL // PQL
 #define PAB_LIMIT_MIN     4u          /* pkts; seed, refine empirically */
 #define PAB_GROW_STEP     16u          /* pkts, additive growth on starve */
 #define PAB_TICK_US       200         /* interval tick, microseconds */
@@ -523,10 +616,10 @@ void app_mixed_thread(struct thread_conf **confs)
 	struct pab_bql bql[N_TC];
 	uint64_t pab_tick_cycles = (rte_get_timer_hz() * PAB_TICK_US) / 1000000;
 	for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
-	bql[tc].num_queued = 0;
-	bql[tc].num_completed = 0;
-	bql[tc].limit = burst_conf.qos_dequeue; /* start permissive */
-	bql[tc].last_tick_cycles = rte_get_timer_cycles();
+		bql[tc].num_queued = 0;
+		bql[tc].num_completed = 0;
+		bql[tc].limit = burst_conf.qos_dequeue; /* start permissive */
+		bql[tc].last_tick_cycles = rte_get_timer_cycles();
 	}
 	/* ------------------------------------------------------------------ */
 
@@ -536,8 +629,8 @@ void app_mixed_thread(struct thread_conf **confs)
 
 	/* Initialize pkts array programatically */
 	for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
-	pkts[tc] = tc_mbufs[tc];
-	tc_ov[tc] = burst_conf.qos_dequeue;
+		pkts[tc] = tc_mbufs[tc];
+		tc_ov[tc] = burst_conf.qos_dequeue;
 	}
 
 	while ((conf = confs[conf_idx])) {
@@ -560,6 +653,8 @@ void app_mixed_thread(struct thread_conf **confs)
 			if (now_cycles - bql[tc].last_tick_cycles < pab_tick_cycles)
 				continue;
 
+			// TX Burst Completion Feedback
+			// Get num of completed desc by the driver
 			int freed = rte_eth_tx_done_cleanup(conf->tx_port, tc, 0);
 
 			if (freed > 0) {

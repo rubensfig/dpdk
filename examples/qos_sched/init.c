@@ -16,6 +16,7 @@
 #include <rte_string_fns.h>
 #include <rte_cfgfile.h>
 #include <rte_malloc.h>
+#include <rte_tm.h>
 
 #include "main.h"
 #include "cfg_file.h"
@@ -202,6 +203,79 @@ struct port_hqos_state *port_hqos_table[MAXPORTS];
 */
 static void port_hqos_init(uint16_t port) {
 }
+static int
+app_init_port_tm(uint16_t port_id)
+{
+	struct rte_tm_error error;
+	struct rte_tm_shaper_params shaper_params;
+	struct rte_tm_node_params node_params;
+	const uint32_t root_id       = 1000;
+	const uint32_t nonleaf_id[3] = {900, 800, 700};
+	const uint32_t nonleaf_parent[3] = {root_id, nonleaf_id[0], nonleaf_id[1]};
+	const uint32_t leaf_parent   = nonleaf_id[2]; /* 700, level 3 */
+	uint32_t i;
+	int ret;
+
+	memset(&error, 0, sizeof(error));
+
+	memset(&shaper_params, 0, sizeof(shaper_params));
+	shaper_params.peak.rate = 25000000000 / 8;
+	shaper_params.peak.size = 1500;
+
+	ret = rte_tm_shaper_profile_add(port_id, 1, &shaper_params, &error);
+	if (ret != 0)
+		goto tm_error;
+
+	/* root: node 1000, level 0 */
+	memset(&node_params, 0, sizeof(node_params));
+	node_params.shaper_profile_id = 1;
+	node_params.nonleaf.n_sp_priorities = 0;
+	node_params.stats_mask = 1;
+
+	ret = rte_tm_node_add(port_id, root_id, RTE_TM_NODE_ID_NULL,
+		0, 1, 0, &node_params, &error);
+	if (ret != 0)
+		goto tm_error;
+
+	/* nonleaf chain: 900(lvl1) -> 800(lvl2) -> 700(lvl3) -- max depth for cnxk */
+	for (i = 0; i < RTE_DIM(nonleaf_id); i++) {
+		memset(&node_params, 0, sizeof(node_params));
+		node_params.shaper_profile_id = 1;
+		node_params.nonleaf.n_sp_priorities = 0;
+		node_params.stats_mask = 1;
+
+		ret = rte_tm_node_add(port_id, nonleaf_id[i], nonleaf_parent[i],
+			0, 1, i + 1, &node_params, &error);
+		if (ret != 0)
+			goto tm_error;
+	}
+
+	/* leaves parented directly to 700, level 4 -- this is the level cnxk accepts for leaves */
+	for (i = 0; i < N_TX_QUEUES; i++) {
+		memset(&node_params, 0, sizeof(node_params));
+		node_params.shaper_profile_id = 1;
+		node_params.leaf.cman = RTE_TM_CMAN_TAIL_DROP;
+		node_params.stats_mask = 0;
+
+		ret = rte_tm_node_add(port_id, i, leaf_parent,
+			0, 1, RTE_DIM(nonleaf_id) + 1, &node_params, &error);
+		if (ret != 0)
+			goto tm_error;
+	}
+
+	ret = rte_tm_hierarchy_commit(port_id, 0, &error);
+	if (ret != 0)
+		goto tm_error;
+
+	RTE_LOG(INFO, APP, "Port %u: TM hierarchy committed (root=%u)\n",
+		port_id, root_id);
+	return 0;
+
+tm_error:
+	RTE_LOG(ERR, APP, "TM config failed on port %u: %s\n",
+		port_id, error.message ? error.message : "unknown");
+	return ret;
+}
 
 static int
 app_init_port(uint16_t portid, struct rte_mempool *mp, bool hqos_init)
@@ -245,8 +319,8 @@ app_init_port(uint16_t portid, struct rte_mempool *mp, bool hqos_init)
 			"Error during getting device (port %u) info: %s\n",
 			portid, strerror(-ret));
 
-	local_port_conf.rxmode.offloads |=
-			RTE_ETH_RX_OFFLOAD_VLAN;
+	// local_port_conf.rxmode.offloads |=
+	// 		RTE_ETH_RX_OFFLOAD_VLAN;
 	if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
 		local_port_conf.txmode.offloads |=
 			RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
@@ -295,6 +369,8 @@ app_init_port(uint16_t portid, struct rte_mempool *mp, bool hqos_init)
 		if (ret < 0)
 		       	rte_exit(EXIT_FAILURE, "rte_eth_tx_queue_setup: err=%d, port=%u queue=%d\n", ret, portid, i);
 	}
+
+	app_init_port_tm(portid);
 
 	/* Start device */
 	ret = rte_eth_dev_start(portid);

@@ -23,8 +23,12 @@ extern "C" {
 #define MIXED_THREAD_PRIOBP 0
 #endif
 
+#ifndef MIXED_THREAD_PAB_COMP
+#define MIXED_THREAD_PAB_COMP 1
+#endif
+
 #ifndef MIXED_THREAD_PRIOBP_STATS
-#define MIXED_THREAD_PRIOBP_STATS 1
+#define MIXED_THREAD_PRIOBP_STATS 0
 #endif
 
 #ifndef MIXED_THREAD_AGGBP
