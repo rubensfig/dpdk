@@ -210,9 +210,9 @@ static inline int get_pkt_sched(struct rte_mbuf *m, uint32_t *subport, uint32_t 
  	/* Color */
  	*color = 0;
 
-	rte_ether_addr_copy(&eth_hdr->dst_addr, &addr);
-	rte_ether_addr_copy(&eth_hdr->src_addr, &eth_hdr->dst_addr);
-	rte_ether_addr_copy(&addr, &eth_hdr->src_addr);
+	// rte_ether_addr_copy(&eth_hdr->dst_addr, &addr);
+	// rte_ether_addr_copy(&eth_hdr->src_addr, &eth_hdr->dst_addr);
+	// rte_ether_addr_copy(&addr, &eth_hdr->src_addr);
 	//        uint16_t ether_type = rte_be_to_cpu_16(eth_hdr->ether_type);
 	//
 	/*
@@ -566,60 +566,58 @@ void app_mixed_thread(struct thread_conf **confs)
 				bql[tc].num_completed += (uint64_t)freed;
 			} 
 
-			int had_demand = (pending[tc].cnt > 0) || (tc_counts[tc] > 0);
+			int had_demand = (tc_counts[tc] > 0);
 			uint64_t inflight = bql[tc].num_queued - bql[tc].num_completed;
 
 			if (inflight == 0 && had_demand) {
 				bql[tc].limit += PAB_GROW_STEP;
-			if (bql[tc].limit > burst_conf.qos_dequeue)
-				bql[tc].limit = burst_conf.qos_dequeue;
+				if (bql[tc].limit > burst_conf.qos_dequeue)
+					bql[tc].limit = burst_conf.qos_dequeue;
 			} else if (inflight >= bql[tc].limit && had_demand) {
-				uint32_t unsent = pending[tc].cnt;
-				bql[tc].limit = (bql[tc].limit > unsent) ? bql[tc].limit - unsent : PAB_LIMIT_MIN;
+				bql[tc].limit = (bql[tc].limit > PAB_GROW_STEP) ? bql[tc].limit - PAB_GROW_STEP : PAB_LIMIT_MIN;
 
-			if (bql[tc].limit < PAB_LIMIT_MIN)
-				bql[tc].limit = PAB_LIMIT_MIN;
+				if (bql[tc].limit < PAB_LIMIT_MIN)
+					bql[tc].limit = PAB_LIMIT_MIN;
 			}
 
 			bql[tc].last_tick_cycles = now_cycles;
 		}
 		/* ------------------------------------------------------- */
 
-		/* ── TX path: drain pending ──────────────────────────── */
+		/* ── TX path: tc_ov calculation ──────────────────────────── */
 		for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
+
 			tc_counts[tc] = 0;
+			/*
 			uint16_t n = pending_peek(&pending[tc], mbufs, burst_conf.qos_dequeue);
 
 			if (n > 0) {
-			uint64_t t0 = rte_rdtsc();
-			uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, mbufs, n);
-			uint64_t t1 = rte_rdtsc();
-			if (sent) {
-			pending_consume_tracked(&pending[tc], &stats[tc], sent);
-			APP_STATS_ADD(conf->stat.nb_tx, sent);
-			stats[tc].cycles_retry += (t1 - t0);
-			stats[tc].pkts_tx_total += sent;
-			
-			bql[tc].num_queued += sent; /* ---- Added ---- */
-			}
-		}
-		
-		/* STATS: occupancy snapshot */
-		pstats_record_occupancy(&stats[tc], pending[tc].cnt);
-		
-		uint16_t used = pending[tc].cnt;
-		uint16_t headroom = (used < PENDING_MAX) ? (PENDING_MAX - used) : 0;
-		
-		/* ---- Added: combine burst-level ring headroom (existing)
-		* with the completion-rate-derived bql limit (new). Both
-		* gates apply -- whichever is tighter wins. */
-		uint64_t inflight_now = bql[tc].num_queued - bql[tc].num_completed;
-		uint32_t bql_space = (bql[tc].limit > inflight_now) ? (uint32_t)(bql[tc].limit - inflight_now) : 0;
+				uint64_t t0 = rte_rdtsc();
+				uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, mbufs, n);
+				uint64_t t1 = rte_rdtsc();
 
-		// if (tc < 2)
-		// printf("tc %d headroom %d bql_space %d dequeue %d\n\n", tc, headroom, bql_space, burst_conf.qos_dequeue);
+				if (sent) {
+					pending_consume_tracked(&pending[tc], &stats[tc], sent);
+					APP_STATS_ADD(conf->stat.nb_tx, sent);
+					stats[tc].cycles_retry += (t1 - t0);
+					stats[tc].pkts_tx_total += sent;
+					
+					bql[tc].num_queued += sent;
+				}
+			}
+				*/
 		
-		tc_ov[tc] = RTE_MIN(RTE_MIN(headroom, bql_space), burst_conf.qos_dequeue);
+			/* STATS: occupancy snapshot */
+			// pstats_record_occupancy(&stats[tc], pending[tc].cnt);
+			
+			uint64_t inflight_now = bql[tc].num_queued - bql[tc].num_completed;
+			uint32_t bql_space = (bql[tc].limit > inflight_now) ?
+			       		(uint32_t)(bql[tc].limit - inflight_now) : 0;
+
+			// if (tc < 2)
+			// printf("tc %d headroom %d bql_space %d dequeue %d\n\n", tc, headroom, bql_space, burst_conf.qos_dequeue);
+			
+			tc_ov[tc] = RTE_MIN(bql_space, burst_conf.qos_dequeue);
 		}
 		
 		/* ── Scheduler dequeue + fresh TX ───────────────────── */
@@ -638,8 +636,13 @@ void app_mixed_thread(struct thread_conf **confs)
 		bql[tc].num_queued += sent; /* ---- Added ---- */
 		
 		if (unlikely(sent < tc_counts[tc])) {
-			pending_enqueue_burst_tracked(&pending[tc], &stats[tc], &pkts[tc][sent], tc_counts[tc] - sent);
+			/* Not sent, and no pending queue to stash them in --
+			 *                                  * they must be freed or you'll leak mbufs. */
+			for (uint32_t i = sent; i < tc_counts[tc]; i++)
+				rte_pktmbuf_free(pkts[tc][i]);
+				APP_STATS_ADD(conf->stat.nb_drop, tc_counts[tc] - sent);
 		}
+
 		APP_STATS_ADD(conf->stat.nb_tx, sent);
 		}
 		
