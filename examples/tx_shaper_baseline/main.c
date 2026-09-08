@@ -16,9 +16,9 @@
  *   -m BURST       packets requested per tx_burst call (default 32, clamped
  *                  to MAX_PKT_BURST=128).
  *   -s SLEEP_NS    busy-loop pacing between bursts in nanoseconds (0 = max
- * offered load) 
+ * offered load)
  *   -c COUNT       number of samples to collect (per queue) before
- * dumping and exiting 
+ * dumping and exiting
  *   -o OUTFILE     base name for raw binary sample files;
  * each worker writes "<OUTFILE>_q<N>.bin" (uint16_t samples, one per tx_burst
  * call)
@@ -105,20 +105,20 @@ struct queue_stats {
   uint64_t tx_drops;
 
   /*
-   * 
+   *
    * Not submitted because descriptor occupancy gating
    * reduced the burst.
    */
   uint64_t occupancy_gated;
 
   /*
-  * Submitted to rte_eth_tx_burst(), but not accepted.
-  */
+   * Submitted to rte_eth_tx_burst(), but not accepted.
+   */
   uint64_t tx_not_accepted;
 
   /*
-  * Total mbufs explicitly freed by this benchmark.
-  */
+   * Total mbufs explicitly freed by this benchmark.
+   */
   uint64_t app_discarded;
 
   uint64_t used_polls;
@@ -132,14 +132,14 @@ struct queue_stats {
 };
 static struct queue_stats qstats[MAX_TX_QUEUES];
 
-#define PAB_LIMIT_MIN     4u          /* pkts; seed, refine empirically */
-#define PAB_GROW_STEP     16u          /* pkts, additive growth on starve */
-#define PAB_TICK_US       100         /* interval tick, microseconds */
+#define PAB_LIMIT_MIN 4u  /* pkts; seed, refine empirically */
+#define PAB_GROW_STEP 16u /* pkts, additive growth on starve */
+#define PAB_TICK_US 100   /* interval tick, microseconds */
 struct pab_bql {
-	uint64_t num_queued;      /* cumulative pkts accepted by tx_burst */
-	uint64_t num_completed;   /* cumulative pkts confirmed done by NIC */
-	uint32_t limit;           /* adaptive per-TC pkt budget */
-	uint64_t last_tick_cycles;
+  uint64_t num_queued;    /* cumulative pkts accepted by tx_burst */
+  uint64_t num_completed; /* cumulative pkts confirmed done by NIC */
+  uint32_t limit;         /* adaptive per-TC pkt budget */
+  uint64_t last_tick_cycles;
 };
 
 struct sample_record {
@@ -420,8 +420,8 @@ static int tx_worker_main(void *arg) {
 
   uint64_t used_hist[USED_HIST_MAX] = {0};
 
- struct pab_bql bql = {0};
- bql.limit = nb_tx_desc;   /* or some sane starting ceiling, not 0 */
+  struct pab_bql bql = {0};
+  bql.limit = nb_tx_desc; /* or some sane starting ceiling, not 0 */
 
   while (sample_idx < target_samples && !force_quit) {
     struct rte_mbuf *bufs[WORK_PKTS];
@@ -437,7 +437,7 @@ static int tx_worker_main(void *arg) {
 
     s->requested = work_packets;
 
-	s->used = UINT32_MAX; // no valid queue count observation
+    s->used = UINT32_MAX; // no valid queue count observation
 
     uint64_t loop_t0 = rte_rdtsc();
 
@@ -449,183 +449,176 @@ static int tx_worker_main(void *arg) {
     uint32_t total_to_send = 0;
     uint32_t total_sent = 0;
     uint32_t total_not_accepted = 0;
-	uint64_t total_gated = 0;
+    uint64_t total_gated = 0;
 
     uint64_t cycles_tx = 0;
     uint64_t cycles_count = 0;
 
-uint64_t pab_tick_cycles = (rte_get_timer_hz() * PAB_TICK_US) / 1000000;
+    uint64_t pab_tick_cycles = (rte_get_timer_hz() * PAB_TICK_US) / 1000000;
     uint16_t offset = 0;
 
     while (offset < work_packets && !force_quit) {
-        uint16_t remaining = (uint16_t)(work_packets - offset);
-	uint16_t requested = RTE_MIN(burst_size, remaining);
+      uint16_t remaining = (uint16_t)(work_packets - offset);
+      uint16_t requested = RTE_MIN(burst_size, remaining);
 
 #ifdef COMP
-	/*
-	 * ----------------------------------------------------------
-	 * Poll descriptor occupancy
-	 * ----------------------------------------------------------
-	 */
-	uint64_t t2 = rte_rdtsc();
-	int used = rte_eth_tx_queue_count(port_id, queue_id);
-	uint64_t t3 = rte_rdtsc();
-	cycles_count += t3 - t2;
+      /*
+       * ----------------------------------------------------------
+       * Poll descriptor occupancy
+       * ----------------------------------------------------------
+       */
+      uint64_t t2 = rte_rdtsc();
+      int used = rte_eth_tx_queue_count(port_id, queue_id);
+      uint64_t t3 = rte_rdtsc();
+      cycles_count += t3 - t2;
 
-	if (unlikely(used < 0)) {
-	  s->used = UINT32_MAX;
-	  break;
-	} 
-	
-	uint32_t raw_used = (uint32_t) used;
+      if (unlikely(used < 0)) {
+        s->used = UINT32_MAX;
+        break;
+      }
 
-	if (raw_used < USED_HIST_MAX)
-    		used_hist[raw_used]++;
+      uint32_t raw_used = (uint32_t)used;
 
-	  s->used = (uint32_t)used;
-	  qs->last_used = (uint16_t)used;
+      if (raw_used < USED_HIST_MAX)
+        used_hist[raw_used]++;
 
-	if (qs->used_polls == 0) {
-            qs->min_used = (uint16_t)raw_used;
-            qs->max_used = (uint16_t)raw_used;
-        } else {
-            if (raw_used < qs->min_used)
-                qs->min_used = (uint16_t)raw_used;
+      s->used = (uint32_t)used;
+      qs->last_used = (uint16_t)used;
 
-            if (raw_used > qs->max_used)
-                qs->max_used = (uint16_t)raw_used;
-        }
+      if (qs->used_polls == 0) {
+        qs->min_used = (uint16_t)raw_used;
+        qs->max_used = (uint16_t)raw_used;
+      } else {
+        if (raw_used < qs->min_used)
+          qs->min_used = (uint16_t)raw_used;
 
-	qs->sum_used += raw_used;
-	qs->used_polls++;
+        if (raw_used > qs->max_used)
+          qs->max_used = (uint16_t)raw_used;
+      }
 
-	//  2. Normalize the platform-specific occupancy floor.
-	uint32_t effective_used =
-            (raw_used > txq_used_floor)
-                ? raw_used - txq_used_floor
-                : 0U;
+      qs->sum_used += raw_used;
+      qs->used_polls++;
 
-	uint16_t free_space = (effective_used >= (uint32_t)nb_tx_desc)
-		? 0U
-		: (uint32_t) nb_tx_desc - effective_used;
+      //  2. Normalize the platform-specific occupancy floor.
+      uint32_t effective_used =
+          (raw_used > txq_used_floor) ? raw_used - txq_used_floor : 0U;
 
-        // uint16_t to_send = RTE_MIN(requested, free_space);
-        uint16_t to_send = requested;
+      uint16_t free_space = (effective_used >= (uint32_t)nb_tx_desc)
+                                ? 0U
+                                : (uint32_t)nb_tx_desc - effective_used;
 
-	uint16_t gated = requested - to_send;
+      // uint16_t to_send = RTE_MIN(requested, free_space);
+      uint16_t to_send = requested;
+      uint16_t gated = requested - to_send;
 
-	total_gated += gated;
+      total_gated += gated;
 #endif
 #ifdef BQL
-	        uint64_t t2 = rte_rdtsc();
+      uint64_t t2 = rte_rdtsc();
 
-		uint64_t now_cycles = rte_get_timer_cycles();
-		if (now_cycles - bql.last_tick_cycles >= pab_tick_cycles) {
-			int freed = rte_eth_tx_done_cleanup(port_id, queue_id, 0);
+      uint64_t now_cycles = rte_get_timer_cycles();
+      if (now_cycles - bql.last_tick_cycles >= pab_tick_cycles) {
+        int freed = rte_eth_tx_done_cleanup(port_id, queue_id, 0);
 
-			if (freed > 0)
-				bql.num_completed += (uint64_t)freed;
+        if (freed > 0)
+          bql.num_completed += (uint64_t)freed;
 
-			int had_demand = (requested > 0);
-			uint64_t inflight = bql.num_queued - bql.num_completed;
+        int had_demand = (requested > 0);
+        uint64_t inflight = bql.num_queued - bql.num_completed;
 
-			if (inflight == 0 && had_demand) {
-				bql.limit += PAB_GROW_STEP;	
-				if (bql.limit > nb_tx_desc)
-					bql.limit = nb_tx_desc;
+        if (inflight == 0 && had_demand) {
+          bql.limit += PAB_GROW_STEP;
+          if (bql.limit > nb_tx_desc)
+            bql.limit = nb_tx_desc;
 
-			} else if (inflight >= bql.limit && had_demand) {
-				bql.limit = (bql.limit > PAB_GROW_STEP)
-					? bql.limit - PAB_GROW_STEP
-					: PAB_LIMIT_MIN;
+        } else if (inflight >= bql.limit && had_demand) {
+          bql.limit = (bql.limit > PAB_GROW_STEP) ? bql.limit - PAB_GROW_STEP
+                                                  : PAB_LIMIT_MIN;
 
-				if (bql.limit < PAB_LIMIT_MIN)
-					bql.limit = PAB_LIMIT_MIN;
-			}
-
-			bql.last_tick_cycles = now_cycles;
-		}
-
-		uint64_t t3 = rte_rdtsc();
-		cycles_count += t3 - t2;
-
-
-		uint64_t inflight_now = bql.num_queued - bql.num_completed;
-		uint32_t raw_used = (inflight_now > UINT32_MAX) ? UINT32_MAX : (uint32_t)inflight_now;
-
-if (raw_used < USED_HIST_MAX)
-used_hist[raw_used]++;
-
-s->used = raw_used;
-qs->last_used = (uint16_t)raw_used;
-
-if (qs->used_polls == 0) {
-qs->min_used = (uint16_t)raw_used;
-qs->max_used = (uint16_t)raw_used;
-} else {
-if (raw_used < qs->min_used)
-qs->min_used = (uint16_t)raw_used;
-
-if (raw_used > qs->max_used)
-qs->max_used = (uint16_t)raw_used;
-}
-
-qs->sum_used += raw_used;
-qs->used_polls++;
-
-/* bql_space: room left under the adaptive limit, capped to desc ring */
-uint32_t bql_space = (bql.limit > inflight_now)
-? (uint32_t)(bql.limit - inflight_now)
-: 0U;
-
-uint16_t free_space = (uint32_t)nb_tx_desc < bql_space
-? (uint16_t)nb_tx_desc
-: (uint16_t)bql_space;
-
-uint16_t to_send = RTE_MIN(requested, free_space);
-
-uint16_t gated = requested - to_send;
-
-total_gated += gated;
-#endif
-
-total_to_send += to_send;
-        /*
-         * Measure only rte_eth_tx_burst().
-         */
-        uint64_t t4 = rte_rdtsc();
-
-        uint16_t sent =
-            rte_eth_tx_burst(port_id,
-                             queue_id,
-                             &bufs[offset],
-                             to_send);
-
-        uint64_t t5 = rte_rdtsc();
-
-#ifdef BQL
-	bql.num_queued += sent;
-#endif
-        cycles_tx += t5 - t4;
-        total_sent += sent;
-
-        uint16_t tx_not_accepted = to_send - sent;
-        total_not_accepted += tx_not_accepted;
-
-        if (unlikely(tx_not_accepted)) {
-            for (uint16_t i = sent; i < to_send; i++)
-                rte_pktmbuf_free(bufs[offset + i]);
+          if (bql.limit < PAB_LIMIT_MIN)
+            bql.limit = PAB_LIMIT_MIN;
         }
 
-        /*
-         * Move to the next group of packets.
-         *
-         * We advance by to_send, not sent, because rejected packets
-         * from this group have already been freed above.
-         */
-        offset += to_send;
+        bql.last_tick_cycles = now_cycles;
+      }
+
+      uint64_t t3 = rte_rdtsc();
+      cycles_count += t3 - t2;
+
+      uint64_t inflight_now = bql.num_queued - bql.num_completed;
+      uint32_t raw_used =
+          (inflight_now > UINT32_MAX) ? UINT32_MAX : (uint32_t)inflight_now;
+
+      if (raw_used < USED_HIST_MAX)
+        used_hist[raw_used]++;
+
+      s->used = raw_used;
+      qs->last_used = (uint16_t)raw_used;
+
+      if (qs->used_polls == 0) {
+        qs->min_used = (uint16_t)raw_used;
+        qs->max_used = (uint16_t)raw_used;
+      } else {
+        if (raw_used < qs->min_used)
+          qs->min_used = (uint16_t)raw_used;
+
+        if (raw_used > qs->max_used)
+          qs->max_used = (uint16_t)raw_used;
+      }
+
+      qs->sum_used += raw_used;
+      qs->used_polls++;
+
+      /* bql_space: room left under the adaptive limit, capped to desc ring */
+      uint32_t bql_space = (bql.limit > inflight_now)
+                               ? (uint32_t)(bql.limit - inflight_now)
+                               : 0U;
+
+      uint16_t free_space = (uint32_t)nb_tx_desc < bql_space
+                                ? (uint16_t)nb_tx_desc
+                                : (uint16_t)bql_space;
+
+      uint16_t to_send = RTE_MIN(requested, free_space);
+
+      uint16_t gated = requested - to_send;
+
+      total_gated += gated;
+#endif
+
+      total_to_send += to_send;
+      /*
+       * Measure only rte_eth_tx_burst().
+       */
+      uint64_t t4 = rte_rdtsc();
+
+      uint16_t sent =
+          rte_eth_tx_burst(port_id, queue_id, &bufs[offset], to_send);
+
+      uint64_t t5 = rte_rdtsc();
+
+#ifdef BQL
+      bql.num_queued += sent;
+#endif
+      cycles_tx += t5 - t4;
+      total_sent += sent;
+
+      uint16_t tx_not_accepted = to_send - sent;
+      total_not_accepted += tx_not_accepted;
+
+      if (unlikely(tx_not_accepted)) {
+        for (uint16_t i = sent; i < to_send; i++)
+          rte_pktmbuf_free(bufs[offset + i]);
+      }
+
+      /*
+       * Move to the next group of packets.
+       *
+       * We advance by to_send, not sent, because rejected packets
+       * from this group have already been freed above.
+       */
+      offset += to_send;
     }
-        /*
+    /*
      * ----------------------------------------------------------
      * Store completed sample results.
      * ----------------------------------------------------------
@@ -647,8 +640,7 @@ total_to_send += to_send;
      * ----------------------------------------------------------
      */
     qs->tx_pkts += total_sent;
-    qs->tx_bytes +=
-        (uint64_t)total_sent * PKT_LEN;
+    qs->tx_bytes += (uint64_t)total_sent * PKT_LEN;
 
     qs->tx_not_accepted += total_not_accepted;
 
@@ -682,7 +674,7 @@ total_to_send += to_send;
          "tx_bytes            : %" PRIu64 "\n"
          "app_discarded       : %" PRIu64 "\n"
          "\n"
-	 "occupancy_polls         : %" PRIu64 "\n"
+         "occupancy_polls         : %" PRIu64 "\n"
          "polls_per_sample        : %.2f\n"
          "\n"
          "occupancy_gated     : %" PRIu64 "\n"
@@ -704,11 +696,10 @@ total_to_send += to_send;
          queue_id,
 
          qs->samples, qs->tx_pkts, qs->tx_bytes, qs->app_discarded,
-	 qs->used_polls, qs->samples
-           ? (double)qs->used_polls / (double)qs->samples
-           : 0.0,
-         qs->occupancy_gated, qs->tx_not_accepted,
-         qs->last_used, qs->min_used, qs->max_used,
+         qs->used_polls,
+         qs->samples ? (double)qs->used_polls / (double)qs->samples : 0.0,
+         qs->occupancy_gated, qs->tx_not_accepted, qs->last_used, qs->min_used,
+         qs->max_used,
          qs->samples ? (double)qs->sum_used / (double)qs->used_polls : 0.0,
          qs->cycles_count, qs->cycles_tx, qs->cycles_total,
          qs->samples ? (double)qs->cycles_count / qs->used_polls : 0.0,
@@ -717,15 +708,12 @@ total_to_send += to_send;
 
   printf("\nTX queue-count histogram:\n");
 
-	for (uint32_t i = 0; i < USED_HIST_MAX; i++) {
-	    if (used_hist[i] != 0) {
-		printf("  used=%3u : %" PRIu64 " (%.4f%%)\n",
-		       i,
-		       used_hist[i],
-		       100.0 * (double)used_hist[i] /
-			   (double)qs->used_polls);
-	    }
-	}
+  for (uint32_t i = 0; i < USED_HIST_MAX; i++) {
+    if (used_hist[i] != 0) {
+      printf("  used=%3u : %" PRIu64 " (%.4f%%)\n", i, used_hist[i],
+             100.0 * (double)used_hist[i] / (double)qs->used_polls);
+    }
+  }
 
   char fname[300];
 
