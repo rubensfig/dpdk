@@ -57,6 +57,10 @@
 #define MAX_TX_QUEUES 64
 #define USED_HIST_MAX 4096
 
+#ifndef BQL
+#define BQL
+#endif
+
 /* ---- CLI-configurable params (with defaults) ---- */
 static uint16_t port_id = 0;
 static uint16_t nb_tx_q = 1; /* recomputed from worker lcore count */
@@ -130,7 +134,7 @@ static struct queue_stats qstats[MAX_TX_QUEUES];
 
 #define PAB_LIMIT_MIN     4u          /* pkts; seed, refine empirically */
 #define PAB_GROW_STEP     16u          /* pkts, additive growth on starve */
-#define PAB_TICK_US       200         /* interval tick, microseconds */
+#define PAB_TICK_US       100         /* interval tick, microseconds */
 struct pab_bql {
 	uint64_t num_queued;      /* cumulative pkts accepted by tx_burst */
 	uint64_t num_completed;   /* cumulative pkts confirmed done by NIC */
@@ -416,7 +420,8 @@ static int tx_worker_main(void *arg) {
 
   uint64_t used_hist[USED_HIST_MAX] = {0};
 
- struct pab_bql bql[N_TC];
+ struct pab_bql bql = {0};
+ bql.limit = nb_tx_desc;   /* or some sane starting ceiling, not 0 */
 
   while (sample_idx < target_samples && !force_quit) {
     struct rte_mbuf *bufs[WORK_PKTS];
@@ -436,7 +441,6 @@ static int tx_worker_main(void *arg) {
 
     uint64_t loop_t0 = rte_rdtsc();
 
-
     /*
      * ----------------------------------------------------------
      * TX fixed WORK_PKTS packets using burst_size chunks
@@ -450,13 +454,14 @@ static int tx_worker_main(void *arg) {
     uint64_t cycles_tx = 0;
     uint64_t cycles_count = 0;
 
+uint64_t pab_tick_cycles = (rte_get_timer_hz() * PAB_TICK_US) / 1000000;
     uint16_t offset = 0;
 
     while (offset < work_packets && !force_quit) {
         uint16_t remaining = (uint16_t)(work_packets - offset);
 	uint16_t requested = RTE_MIN(burst_size, remaining);
 
-#if COMP
+#ifdef COMP
 	/*
 	 * ----------------------------------------------------------
 	 * Poll descriptor occupancy
@@ -511,9 +516,10 @@ static int tx_worker_main(void *arg) {
 
 	total_gated += gated;
 #endif
-#if BQL
+#ifdef BQL
 	        uint64_t t2 = rte_rdtsc();
 
+		uint64_t now_cycles = rte_get_timer_cycles();
 		if (now_cycles - bql.last_tick_cycles >= pab_tick_cycles) {
 			int freed = rte_eth_tx_done_cleanup(port_id, queue_id, 0);
 
@@ -581,11 +587,9 @@ uint16_t to_send = RTE_MIN(requested, free_space);
 uint16_t gated = requested - to_send;
 
 total_gated += gated;
-
-
 #endif
 
-
+total_to_send += to_send;
         /*
          * Measure only rte_eth_tx_burst().
          */
@@ -599,6 +603,9 @@ total_gated += gated;
 
         uint64_t t5 = rte_rdtsc();
 
+#ifdef BQL
+	bql.num_queued += sent;
+#endif
         cycles_tx += t5 - t4;
         total_sent += sent;
 
