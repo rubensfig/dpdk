@@ -128,6 +128,16 @@ struct queue_stats {
 };
 static struct queue_stats qstats[MAX_TX_QUEUES];
 
+#define PAB_LIMIT_MIN     4u          /* pkts; seed, refine empirically */
+#define PAB_GROW_STEP     16u          /* pkts, additive growth on starve */
+#define PAB_TICK_US       200         /* interval tick, microseconds */
+struct pab_bql {
+	uint64_t num_queued;      /* cumulative pkts accepted by tx_burst */
+	uint64_t num_completed;   /* cumulative pkts confirmed done by NIC */
+	uint32_t limit;           /* adaptive per-TC pkt budget */
+	uint64_t last_tick_cycles;
+};
+
 struct sample_record {
   /*
    * Queue state.
@@ -406,7 +416,7 @@ static int tx_worker_main(void *arg) {
 
   uint64_t used_hist[USED_HIST_MAX] = {0};
 
-
+ struct pab_bql bql[N_TC];
 
   while (sample_idx < target_samples && !force_quit) {
     struct rte_mbuf *bufs[WORK_PKTS];
@@ -446,6 +456,7 @@ static int tx_worker_main(void *arg) {
         uint16_t remaining = (uint16_t)(work_packets - offset);
 	uint16_t requested = RTE_MIN(burst_size, remaining);
 
+#if COMP
 	/*
 	 * ----------------------------------------------------------
 	 * Poll descriptor occupancy
@@ -499,6 +510,81 @@ static int tx_worker_main(void *arg) {
 	uint16_t gated = requested - to_send;
 
 	total_gated += gated;
+#endif
+#if BQL
+	        uint64_t t2 = rte_rdtsc();
+
+		if (now_cycles - bql.last_tick_cycles >= pab_tick_cycles) {
+			int freed = rte_eth_tx_done_cleanup(port_id, queue_id, 0);
+
+			if (freed > 0)
+				bql.num_completed += (uint64_t)freed;
+
+			int had_demand = (requested > 0);
+			uint64_t inflight = bql.num_queued - bql.num_completed;
+
+			if (inflight == 0 && had_demand) {
+				bql.limit += PAB_GROW_STEP;	
+				if (bql.limit > nb_tx_desc)
+					bql.limit = nb_tx_desc;
+
+			} else if (inflight >= bql.limit && had_demand) {
+				bql.limit = (bql.limit > PAB_GROW_STEP)
+					? bql.limit - PAB_GROW_STEP
+					: PAB_LIMIT_MIN;
+
+				if (bql.limit < PAB_LIMIT_MIN)
+					bql.limit = PAB_LIMIT_MIN;
+			}
+
+			bql.last_tick_cycles = now_cycles;
+		}
+
+		uint64_t t3 = rte_rdtsc();
+		cycles_count += t3 - t2;
+
+
+		uint64_t inflight_now = bql.num_queued - bql.num_completed;
+		uint32_t raw_used = (inflight_now > UINT32_MAX) ? UINT32_MAX : (uint32_t)inflight_now;
+
+if (raw_used < USED_HIST_MAX)
+used_hist[raw_used]++;
+
+s->used = raw_used;
+qs->last_used = (uint16_t)raw_used;
+
+if (qs->used_polls == 0) {
+qs->min_used = (uint16_t)raw_used;
+qs->max_used = (uint16_t)raw_used;
+} else {
+if (raw_used < qs->min_used)
+qs->min_used = (uint16_t)raw_used;
+
+if (raw_used > qs->max_used)
+qs->max_used = (uint16_t)raw_used;
+}
+
+qs->sum_used += raw_used;
+qs->used_polls++;
+
+/* bql_space: room left under the adaptive limit, capped to desc ring */
+uint32_t bql_space = (bql.limit > inflight_now)
+? (uint32_t)(bql.limit - inflight_now)
+: 0U;
+
+uint16_t free_space = (uint32_t)nb_tx_desc < bql_space
+? (uint16_t)nb_tx_desc
+: (uint16_t)bql_space;
+
+uint16_t to_send = RTE_MIN(requested, free_space);
+
+uint16_t gated = requested - to_send;
+
+total_gated += gated;
+
+
+#endif
+
 
         /*
          * Measure only rte_eth_tx_burst().
