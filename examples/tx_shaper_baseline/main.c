@@ -55,6 +55,7 @@
 #define MBUF_CACHE_SIZE 256
 #define PKT_LEN 64
 #define MAX_TX_QUEUES 64
+#define USED_HIST_MAX 4096
 
 /* ---- CLI-configurable params (with defaults) ---- */
 static uint16_t port_id = 0;
@@ -115,6 +116,8 @@ struct queue_stats {
   * Total mbufs explicitly freed by this benchmark.
   */
   uint64_t app_discarded;
+
+  uint64_t used_polls;
 
   /*
    * Cycle counters.
@@ -399,20 +402,15 @@ static int tx_worker_main(void *arg) {
   uint64_t start_tsc = rte_get_timer_cycles();
   uint64_t last_tsc = start_tsc;
   uint64_t last_tx = 0;
+  const uint32_t txq_used_floor = 126U;
 
-  printf("lcore %u: TX worker started on queue %u (burst=%u)\n", rte_lcore_id(),
-         queue_id, burst_size);
+  uint64_t used_hist[USED_HIST_MAX] = {0};
+
+
 
   while (sample_idx < target_samples && !force_quit) {
     struct rte_mbuf *bufs[WORK_PKTS];
-    uint16_t to_alloc = burst_size;
 
-    /*
-     * Packet generation is intentionally outside cycles_total here.
-     * This measures:
-     *
-     *   generate -> occupancy query -> space calculation -> TX
-     */
     if (rte_pktmbuf_alloc_bulk(ctx->mbuf_pool, bufs, work_packets) != 0)
       continue;
 
@@ -422,27 +420,29 @@ static int tx_worker_main(void *arg) {
     struct sample_record *s = &ctx->samples[sample_idx];
     memset(s, 0, sizeof(*s));
 
-    s->requested = WORK_PKTS;
+    s->requested = work_packets;
+
+	s->used = UINT32_MAX; // no valid queue count observation
 
     uint64_t loop_t0 = rte_rdtsc();
 
-    /*
-     * If unsupported, encode UINT32_MAX in the sample.
-     */
 
     /*
      * ----------------------------------------------------------
      * TX fixed WORK_PKTS packets using burst_size chunks
      * ----------------------------------------------------------
      */
+    uint32_t total_to_send = 0;
     uint32_t total_sent = 0;
     uint32_t total_not_accepted = 0;
+	uint64_t total_gated = 0;
+
     uint64_t cycles_tx = 0;
     uint64_t cycles_count = 0;
 
     uint16_t offset = 0;
 
-    while (offset < work_packets) {
+    while (offset < work_packets && !force_quit) {
         uint16_t remaining = (uint16_t)(work_packets - offset);
 	uint16_t requested = RTE_MIN(burst_size, remaining);
 
@@ -457,24 +457,48 @@ static int tx_worker_main(void *arg) {
 	cycles_count += t3 - t2;
 
 	if (unlikely(used < 0)) {
-	  s->used = 0;
-	} else {
+	  s->used = UINT32_MAX;
+	  break;
+	} 
+	
+	uint32_t raw_used = (uint32_t) used;
+
+	if (raw_used < USED_HIST_MAX)
+    		used_hist[raw_used]++;
+
 	  s->used = (uint32_t)used;
 	  qs->last_used = (uint16_t)used;
-	  if (sample_idx == 0 || used < qs->min_used)
-	    qs->min_used = (uint16_t)used;
-	  if (used > qs->max_used)
-	    qs->max_used = (uint16_t)used;
-	  qs->sum_used += (uint16_t)used;
-	}
 
-	uint16_t nb_desc = nb_tx_desc;
-	uint16_t free_space = (used >= nb_desc) ? 0 : (uint16_t)(nb_desc - used);
+	if (qs->used_polls == 0) {
+            qs->min_used = (uint16_t)raw_used;
+            qs->max_used = (uint16_t)raw_used;
+        } else {
+            if (raw_used < qs->min_used)
+                qs->min_used = (uint16_t)raw_used;
 
-        uint16_t to_send = RTE_MIN(requested, free_space);
-        // uint16_t to_send = requested;
+            if (raw_used > qs->max_used)
+                qs->max_used = (uint16_t)raw_used;
+        }
+
+	qs->sum_used += raw_used;
+	qs->used_polls++;
+
+	//  2. Normalize the platform-specific occupancy floor.
+	uint32_t effective_used =
+            (raw_used > txq_used_floor)
+                ? raw_used - txq_used_floor
+                : 0U;
+
+	uint16_t free_space = (effective_used >= (uint32_t)nb_tx_desc)
+		? 0U
+		: (uint32_t) nb_tx_desc - effective_used;
+
+        // uint16_t to_send = RTE_MIN(requested, free_space);
+        uint16_t to_send = requested;
 
 	uint16_t gated = requested - to_send;
+
+	total_gated += gated;
 
         /*
          * Measure only rte_eth_tx_burst().
@@ -492,12 +516,7 @@ static int tx_worker_main(void *arg) {
         cycles_tx += t5 - t4;
         total_sent += sent;
 
-        /*
-         * Packets not accepted by this particular TX call still
-         * belong to the application and must be freed.
-         */
         uint16_t tx_not_accepted = to_send - sent;
-
         total_not_accepted += tx_not_accepted;
 
         if (unlikely(tx_not_accepted)) {
@@ -513,31 +532,47 @@ static int tx_worker_main(void *arg) {
          */
         offset += to_send;
     }
-
         /*
      * ----------------------------------------------------------
-     * Store sample results
+     * Store completed sample results.
      * ----------------------------------------------------------
      */
-    s->to_send = work_packets;
+    s->to_send = total_to_send;
     s->sent = total_sent;
     s->tx_not_accepted = total_not_accepted;
+
+    s->cycles_count = cycles_count;
     s->cycles_tx = cycles_tx;
-
-    /*
-     * ----------------------------------------------------------
-     * Accounting
-     * ----------------------------------------------------------
-     */
-    qs->tx_pkts += total_sent;
-    qs->tx_bytes += (uint64_t)total_sent * PKT_LEN;
-
-    qs->tx_not_accepted += total_not_accepted;
-    qs->app_discarded += total_not_accepted;
 
     uint64_t loop_t1 = rte_rdtsc();
 
     s->cycles_total = loop_t1 - loop_t0;
+
+    /*
+     * ----------------------------------------------------------
+     * Queue-level accounting
+     * ----------------------------------------------------------
+     */
+    qs->tx_pkts += total_sent;
+    qs->tx_bytes +=
+        (uint64_t)total_sent * PKT_LEN;
+
+    qs->tx_not_accepted += total_not_accepted;
+
+    /*
+     * Only TX-admitted-but-rejected packets were actually
+     * discarded by this benchmark.
+     *
+     * Proactively gated packets were deferred and eventually
+     * reconsidered, so they are NOT app_discarded.
+     */
+    qs->app_discarded += total_not_accepted;
+
+    /*
+     * This represents proactive gating decisions, not unique
+     * dropped packets.
+     */
+    qs->occupancy_gated += total_gated;
 
     qs->cycles_count += s->cycles_count;
     qs->cycles_tx += s->cycles_tx;
@@ -545,7 +580,6 @@ static int tx_worker_main(void *arg) {
 
     sample_idx++;
     qs->samples = sample_idx;
-
   }
 
   printf("\n"
@@ -554,6 +588,9 @@ static int tx_worker_main(void *arg) {
          "tx_pkts             : %" PRIu64 "\n"
          "tx_bytes            : %" PRIu64 "\n"
          "app_discarded       : %" PRIu64 "\n"
+         "\n"
+	 "occupancy_polls         : %" PRIu64 "\n"
+         "polls_per_sample        : %.2f\n"
          "\n"
          "occupancy_gated     : %" PRIu64 "\n"
          "tx_not_accepted     : %" PRIu64 "\n"
@@ -573,14 +610,29 @@ static int tx_worker_main(void *arg) {
          "=========================================\n",
          queue_id,
 
-         qs->samples, qs->tx_pkts, qs->tx_bytes, qs->tx_drops,
+         qs->samples, qs->tx_pkts, qs->tx_bytes, qs->app_discarded,
+	 qs->used_polls, qs->samples
+           ? (double)qs->used_polls / (double)qs->samples
+           : 0.0,
          qs->occupancy_gated, qs->tx_not_accepted,
          qs->last_used, qs->min_used, qs->max_used,
-         qs->samples ? (double)qs->sum_used / (double)qs->samples : 0.0,
+         qs->samples ? (double)qs->sum_used / (double)qs->used_polls : 0.0,
          qs->cycles_count, qs->cycles_tx, qs->cycles_total,
-         qs->samples ? (double)qs->cycles_count / qs->samples : 0.0,
+         qs->samples ? (double)qs->cycles_count / qs->used_polls : 0.0,
          qs->samples ? (double)qs->cycles_tx / qs->samples : 0.0,
          qs->samples ? (double)qs->cycles_total / qs->samples : 0.0);
+
+  printf("\nTX queue-count histogram:\n");
+
+	for (uint32_t i = 0; i < USED_HIST_MAX; i++) {
+	    if (used_hist[i] != 0) {
+		printf("  used=%3u : %" PRIu64 " (%.4f%%)\n",
+		       i,
+		       used_hist[i],
+		       100.0 * (double)used_hist[i] /
+			   (double)qs->used_polls);
+	    }
+	}
 
   char fname[300];
 
