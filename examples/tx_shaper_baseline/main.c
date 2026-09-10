@@ -90,7 +90,7 @@ static uint32_t work_packets = WORK_PKTS;
 
 // {
 #ifdef COMP
-#define COMP_RELAX_STREAK 8u
+#define COMP_RELAX_STREAK 64u
 #define COMP_NEAR_STEPS 2u
 #define COMP_REDUCED_DIV 4u
 
