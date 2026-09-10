@@ -427,6 +427,151 @@ static void parse_args(int argc, char **argv) {
   }
 }
 
+static void
+write_queue_json(uint16_t queue_id,
+                 const struct queue_stats *qs,
+                 uint64_t recorded_samples,
+                 uint64_t offered_pkts,
+                 uint64_t attempted_pkts,
+                 double gating_pct,
+                 double rejection_pct,
+                 double tx_pkts_per_second,
+                 const uint64_t used_hist[USED_HIST_MAX],
+                 const uint64_t watermark_hist[USED_HIST_MAX])
+{
+    char fname[300];
+    snprintf(fname, sizeof(fname), "%s_q%u.json",
+             outfile_base, queue_id);
+
+    FILE *f = fopen(fname, "w");
+    if (f == NULL) {
+        fprintf(stderr, "[q%u] Could not open %s for writing\n",
+                queue_id, fname);
+        return;
+    }
+
+    fprintf(f, "{\n");
+
+    fprintf(f, "  \"queue_id\": %u,\n", queue_id);
+    fprintf(f, "  \"nb_tx_desc\": %u,\n", nb_tx_desc);
+    fprintf(f, "  \"burst_size\": %u,\n", burst_size);
+    fprintf(f, "  \"timer_hz\": %" PRIu64 ",\n", rte_get_tsc_hz());
+
+    fprintf(f, "  \"samples\": %" PRIu64 ",\n", qs->samples);
+    fprintf(f, "  \"recorded_samples\": %" PRIu64 ",\n",
+            recorded_samples);
+
+    fprintf(f, "  \"tx_pkts\": %" PRIu64 ",\n", qs->tx_pkts);
+    fprintf(f, "  \"tx_bytes\": %" PRIu64 ",\n", qs->tx_bytes);
+    fprintf(f, "  \"app_discarded\": %" PRIu64 ",\n",
+            qs->app_discarded);
+
+    fprintf(f, "  \"occupancy_polls\": %" PRIu64 ",\n",
+            qs->used_polls);
+    fprintf(f, "  \"polls_per_sample\": %.6f,\n",
+            qs->samples
+                ? (double)qs->used_polls / (double)qs->samples
+                : 0.0);
+
+    fprintf(f, "  \"offered_pkts\": %" PRIu64 ",\n", offered_pkts);
+    fprintf(f, "  \"occupancy_gated\": %" PRIu64 ",\n",
+            qs->occupancy_gated);
+    fprintf(f, "  \"gating_pct\": %.6f,\n", gating_pct);
+
+    fprintf(f, "  \"attempted_pkts\": %" PRIu64 ",\n",
+            attempted_pkts);
+    fprintf(f, "  \"tx_not_accepted\": %" PRIu64 ",\n",
+            qs->tx_not_accepted);
+    fprintf(f, "  \"rejection_pct\": %.6f,\n", rejection_pct);
+    fprintf(f, "  \"tx_pkts_per_second\": %.2f,\n",
+            tx_pkts_per_second);
+
+    fprintf(f, "  \"reject_events\": %" PRIu64 ",\n",
+            qs->reject_events);
+
+    if (qs->reject_events) {
+        fprintf(f, "  \"first_reject_sample\": %" PRIu64 ",\n",
+                qs->first_reject_sample);
+        fprintf(f, "  \"last_reject_sample\": %" PRIu64 ",\n",
+                qs->last_reject_sample);
+    } else {
+        fprintf(f, "  \"first_reject_sample\": null,\n");
+        fprintf(f, "  \"last_reject_sample\": null,\n");
+    }
+
+    fprintf(f, "  \"last_used\": %u,\n", qs->last_used);
+    fprintf(f, "  \"min_used\": %u,\n", qs->min_used);
+    fprintf(f, "  \"max_used\": %u,\n", qs->max_used);
+    fprintf(f, "  \"avg_used\": %.6f,\n",
+            qs->used_polls
+                ? (double)qs->sum_used / (double)qs->used_polls
+                : 0.0);
+
+    fprintf(f, "  \"cycles_count\": %" PRIu64 ",\n",
+            qs->cycles_count);
+    fprintf(f, "  \"cycles_tx\": %" PRIu64 ",\n",
+            qs->cycles_tx);
+    fprintf(f, "  \"cycles_total\": %" PRIu64 ",\n",
+            qs->cycles_total);
+
+    fprintf(f, "  \"avg_cycles_count\": %.6f,\n",
+            qs->used_polls
+                ? (double)qs->cycles_count / (double)qs->used_polls
+                : 0.0);
+    fprintf(f, "  \"avg_cycles_tx\": %.6f,\n",
+            qs->samples
+                ? (double)qs->cycles_tx / (double)qs->samples
+                : 0.0);
+    fprintf(f, "  \"avg_cycles_total\": %.6f,\n",
+            qs->samples
+                ? (double)qs->cycles_total / (double)qs->samples
+                : 0.0);
+
+    /*
+     * Store histograms as:
+     *
+     *   [{"value": 32, "count": 100}, ...]
+     *
+     * rather than 4096 mostly-zero entries.
+     */
+    fprintf(f, "  \"used_histogram\": [\n");
+
+    bool first = true;
+    for (uint32_t i = 0; i < USED_HIST_MAX; i++) {
+        if (used_hist[i] == 0)
+            continue;
+
+        fprintf(f,
+                "%s    {\"value\": %u, \"count\": %" PRIu64 "}",
+                first ? "" : ",\n",
+                i, used_hist[i]);
+
+        first = false;
+    }
+
+    fprintf(f, "\n  ],\n");
+
+    fprintf(f, "  \"watermark_histogram\": [\n");
+
+    first = true;
+    for (uint32_t i = 0; i < USED_HIST_MAX; i++) {
+        if (watermark_hist[i] == 0)
+            continue;
+
+        fprintf(f,
+                "%s    {\"value\": %u, \"count\": %" PRIu64 "}",
+                first ? "" : ",\n",
+                i, watermark_hist[i]);
+
+        first = false;
+    }
+
+    fprintf(f, "\n  ]\n");
+    fprintf(f, "}\n");
+
+    fclose(f);
+}
+
 /*
  * rte_tm-based shaping setup (default path for cnxk/NIX, and the
  * spec-correct way to do hierarchical shaping in general).
@@ -663,8 +808,9 @@ static inline void tx_iteration(struct worker_ctx *ctx, struct comp_state *dpab,
   s->used = have_used ? raw_used : UINT32_MAX;
 
   uint16_t requested = burst_size;
-  uint16_t to_send =
-      have_used ? comp_admit(dpab, raw_used, requested) : requested;
+  // uint16_t to_send =
+  //     have_used ? comp_admit(dpab, raw_used, requested) : requested;
+  uint16_t to_send = requested;
 
   s->requested = requested;
   s->to_send = to_send;
@@ -934,14 +1080,14 @@ static int tx_worker_main(void *arg) {
    */
   uint64_t tsc_hz = rte_get_tsc_hz();
 
+#ifdef BQL
   uint64_t interval_cycles =
 	      (tsc_hz / 1000000ULL) * PAB_INTERVAL_US;
+#endif
 
   uint64_t next_tick = global_start_tsc;
 
   while (!force_quit && rte_rdtsc() < global_end_tsc) {
-	  next_tick += interval_cycles;
-
     struct sample_record *s = NULL;
     if (recorded_samples < target_samples)
       s = &ctx->samples[recorded_samples];
@@ -951,6 +1097,8 @@ static int tx_worker_main(void *arg) {
                  recorded_samples);
 #endif
 #ifdef BQL
+    next_tick += interval_cycles;
+
     spin_until_tsc(next_tick);
 
     tx_iteration(ctx, &cpab, s, qs, used_hist, watermark_hist, true,
@@ -1062,6 +1210,17 @@ static int tx_worker_main(void *arg) {
                  : 0.0);
     }
   }
+
+write_queue_json(queue_id,
+                 qs,
+                 recorded_samples,
+                 offered_pkts,
+                 attempted_pkts,
+                 gating_pct,
+                 rejection_pct,
+                 tx_pkts_per_second,
+                 used_hist,
+                 watermark_hist);
 
   char fname[300];
   snprintf(fname, sizeof(fname), "%s_q%u.bin", outfile_base, queue_id);
