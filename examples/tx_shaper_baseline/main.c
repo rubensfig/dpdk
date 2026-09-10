@@ -60,7 +60,7 @@
 #define MBUF_CACHE_SIZE 256
 #define PKT_LEN 64
 #define MAX_TX_QUEUES 64
-#define USED_HIST_MAX 4096
+#define USED_HIST_MAX 8192
 
 #if defined(COMP) && defined(BQL)
 #error "COMP and BQL cannot both be enabled"
@@ -90,7 +90,7 @@ static uint32_t work_packets = WORK_PKTS;
 
 // {
 #ifdef COMP
-#define COMP_RELAX_STREAK 1024u
+#define COMP_RELAX_STREAK 8u
 #define COMP_NEAR_STEPS 2u
 #define COMP_REDUCED_DIV 4u
 
@@ -330,6 +330,11 @@ struct sample_record {
    */
   uint32_t used;
   uint32_t space;
+
+  uint32_t high_wm;
+  uint32_t observed_step;
+  uint8_t  wm_valid;
+  uint8_t  reserved1[3];
 
   /*
    * Packet counts.
@@ -806,11 +811,14 @@ static inline void tx_iteration(struct worker_ctx *ctx, struct comp_state *dpab,
     }
   }
   s->used = have_used ? raw_used : UINT32_MAX;
+  s->wm_valid = dpab->wm_valid;
+  s->high_wm = dpab->wm_valid ? dpab->high_wm : UINT32_MAX;
+  s->observed_step = dpab->observed_step;
 
   uint16_t requested = burst_size;
-  // uint16_t to_send =
-  //     have_used ? comp_admit(dpab, raw_used, requested) : requested;
-  uint16_t to_send = requested;
+  uint16_t to_send =
+      have_used ? comp_admit(dpab, raw_used, requested) : requested;
+  // uint16_t to_send = requested;
 
   s->requested = requested;
   s->to_send = to_send;
