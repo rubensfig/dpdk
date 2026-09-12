@@ -87,7 +87,6 @@ static uint64_t measure_ms = 100;
 static char outfile_base[256] = "samples";
 static uint32_t work_packets = WORK_PKTS;
 
-
 // {
 #ifdef COMP
 #define COMP_RELAX_STREAK 64u
@@ -232,6 +231,7 @@ struct pab_bql {
   uint64_t num_completed;
 
   uint32_t limit;
+  bool limit_hit;
 
   uint64_t last_tick_cycles;
   uint64_t tick_cycles;
@@ -331,10 +331,13 @@ struct sample_record {
   uint32_t used;
   uint32_t space;
 
+  uint32_t limit;
+  uint32_t freed;
+
   uint32_t high_wm;
   uint32_t observed_step;
-  uint8_t  wm_valid;
-  uint8_t  reserved1[3];
+  uint8_t wm_valid;
+  uint8_t reserved1[3];
 
   /*
    * Packet counts.
@@ -432,149 +435,117 @@ static void parse_args(int argc, char **argv) {
   }
 }
 
-static void
-write_queue_json(uint16_t queue_id,
-                 const struct queue_stats *qs,
-                 uint64_t recorded_samples,
-                 uint64_t offered_pkts,
-                 uint64_t attempted_pkts,
-                 double gating_pct,
-                 double rejection_pct,
-                 double tx_pkts_per_second,
-                 const uint64_t used_hist[USED_HIST_MAX],
-                 const uint64_t watermark_hist[USED_HIST_MAX])
-{
-    char fname[300];
-    snprintf(fname, sizeof(fname), "%s_q%u.json",
-             outfile_base, queue_id);
+static void write_queue_json(uint16_t queue_id, const struct queue_stats *qs,
+                             uint64_t recorded_samples, uint64_t offered_pkts,
+                             uint64_t attempted_pkts, double gating_pct,
+                             double rejection_pct, double tx_pkts_per_second,
+                             const uint64_t used_hist[USED_HIST_MAX],
+                             const uint64_t watermark_hist[USED_HIST_MAX]) {
+  char fname[300];
+  snprintf(fname, sizeof(fname), "%s_q%u.json", outfile_base, queue_id);
 
-    FILE *f = fopen(fname, "w");
-    if (f == NULL) {
-        fprintf(stderr, "[q%u] Could not open %s for writing\n",
-                queue_id, fname);
-        return;
-    }
+  FILE *f = fopen(fname, "w");
+  if (f == NULL) {
+    fprintf(stderr, "[q%u] Could not open %s for writing\n", queue_id, fname);
+    return;
+  }
 
-    fprintf(f, "{\n");
+  fprintf(f, "{\n");
 
-    fprintf(f, "  \"queue_id\": %u,\n", queue_id);
-    fprintf(f, "  \"nb_tx_desc\": %u,\n", nb_tx_desc);
-    fprintf(f, "  \"burst_size\": %u,\n", burst_size);
-    fprintf(f, "  \"timer_hz\": %" PRIu64 ",\n", rte_get_tsc_hz());
+  fprintf(f, "  \"queue_id\": %u,\n", queue_id);
+  fprintf(f, "  \"nb_tx_desc\": %u,\n", nb_tx_desc);
+  fprintf(f, "  \"burst_size\": %u,\n", burst_size);
+  fprintf(f, "  \"timer_hz\": %" PRIu64 ",\n", rte_get_tsc_hz());
 
-    fprintf(f, "  \"samples\": %" PRIu64 ",\n", qs->samples);
-    fprintf(f, "  \"recorded_samples\": %" PRIu64 ",\n",
-            recorded_samples);
+  fprintf(f, "  \"samples\": %" PRIu64 ",\n", qs->samples);
+  fprintf(f, "  \"recorded_samples\": %" PRIu64 ",\n", recorded_samples);
 
-    fprintf(f, "  \"tx_pkts\": %" PRIu64 ",\n", qs->tx_pkts);
-    fprintf(f, "  \"tx_bytes\": %" PRIu64 ",\n", qs->tx_bytes);
-    fprintf(f, "  \"app_discarded\": %" PRIu64 ",\n",
-            qs->app_discarded);
+  fprintf(f, "  \"tx_pkts\": %" PRIu64 ",\n", qs->tx_pkts);
+  fprintf(f, "  \"tx_bytes\": %" PRIu64 ",\n", qs->tx_bytes);
+  fprintf(f, "  \"app_discarded\": %" PRIu64 ",\n", qs->app_discarded);
 
-    fprintf(f, "  \"occupancy_polls\": %" PRIu64 ",\n",
-            qs->used_polls);
-    fprintf(f, "  \"polls_per_sample\": %.6f,\n",
-            qs->samples
-                ? (double)qs->used_polls / (double)qs->samples
-                : 0.0);
+  fprintf(f, "  \"occupancy_polls\": %" PRIu64 ",\n", qs->used_polls);
+  fprintf(f, "  \"polls_per_sample\": %.6f,\n",
+          qs->samples ? (double)qs->used_polls / (double)qs->samples : 0.0);
 
-    fprintf(f, "  \"offered_pkts\": %" PRIu64 ",\n", offered_pkts);
-    fprintf(f, "  \"occupancy_gated\": %" PRIu64 ",\n",
-            qs->occupancy_gated);
-    fprintf(f, "  \"gating_pct\": %.6f,\n", gating_pct);
+  fprintf(f, "  \"offered_pkts\": %" PRIu64 ",\n", offered_pkts);
+  fprintf(f, "  \"occupancy_gated\": %" PRIu64 ",\n", qs->occupancy_gated);
+  fprintf(f, "  \"gating_pct\": %.6f,\n", gating_pct);
 
-    fprintf(f, "  \"attempted_pkts\": %" PRIu64 ",\n",
-            attempted_pkts);
-    fprintf(f, "  \"tx_not_accepted\": %" PRIu64 ",\n",
-            qs->tx_not_accepted);
-    fprintf(f, "  \"rejection_pct\": %.6f,\n", rejection_pct);
-    fprintf(f, "  \"tx_pkts_per_second\": %.2f,\n",
-            tx_pkts_per_second);
+  fprintf(f, "  \"attempted_pkts\": %" PRIu64 ",\n", attempted_pkts);
+  fprintf(f, "  \"tx_not_accepted\": %" PRIu64 ",\n", qs->tx_not_accepted);
+  fprintf(f, "  \"rejection_pct\": %.6f,\n", rejection_pct);
+  fprintf(f, "  \"tx_pkts_per_second\": %.2f,\n", tx_pkts_per_second);
 
-    fprintf(f, "  \"reject_events\": %" PRIu64 ",\n",
-            qs->reject_events);
+  fprintf(f, "  \"reject_events\": %" PRIu64 ",\n", qs->reject_events);
 
-    if (qs->reject_events) {
-        fprintf(f, "  \"first_reject_sample\": %" PRIu64 ",\n",
-                qs->first_reject_sample);
-        fprintf(f, "  \"last_reject_sample\": %" PRIu64 ",\n",
-                qs->last_reject_sample);
-    } else {
-        fprintf(f, "  \"first_reject_sample\": null,\n");
-        fprintf(f, "  \"last_reject_sample\": null,\n");
-    }
+  if (qs->reject_events) {
+    fprintf(f, "  \"first_reject_sample\": %" PRIu64 ",\n",
+            qs->first_reject_sample);
+    fprintf(f, "  \"last_reject_sample\": %" PRIu64 ",\n",
+            qs->last_reject_sample);
+  } else {
+    fprintf(f, "  \"first_reject_sample\": null,\n");
+    fprintf(f, "  \"last_reject_sample\": null,\n");
+  }
 
-    fprintf(f, "  \"last_used\": %u,\n", qs->last_used);
-    fprintf(f, "  \"min_used\": %u,\n", qs->min_used);
-    fprintf(f, "  \"max_used\": %u,\n", qs->max_used);
-    fprintf(f, "  \"avg_used\": %.6f,\n",
-            qs->used_polls
-                ? (double)qs->sum_used / (double)qs->used_polls
-                : 0.0);
+  fprintf(f, "  \"last_used\": %u,\n", qs->last_used);
+  fprintf(f, "  \"min_used\": %u,\n", qs->min_used);
+  fprintf(f, "  \"max_used\": %u,\n", qs->max_used);
+  fprintf(f, "  \"avg_used\": %.6f,\n",
+          qs->used_polls ? (double)qs->sum_used / (double)qs->used_polls : 0.0);
 
-    fprintf(f, "  \"cycles_count\": %" PRIu64 ",\n",
-            qs->cycles_count);
-    fprintf(f, "  \"cycles_tx\": %" PRIu64 ",\n",
-            qs->cycles_tx);
-    fprintf(f, "  \"cycles_total\": %" PRIu64 ",\n",
-            qs->cycles_total);
+  fprintf(f, "  \"cycles_count\": %" PRIu64 ",\n", qs->cycles_count);
+  fprintf(f, "  \"cycles_tx\": %" PRIu64 ",\n", qs->cycles_tx);
+  fprintf(f, "  \"cycles_total\": %" PRIu64 ",\n", qs->cycles_total);
 
-    fprintf(f, "  \"avg_cycles_count\": %.6f,\n",
-            qs->used_polls
-                ? (double)qs->cycles_count / (double)qs->used_polls
-                : 0.0);
-    fprintf(f, "  \"avg_cycles_tx\": %.6f,\n",
-            qs->samples
-                ? (double)qs->cycles_tx / (double)qs->samples
-                : 0.0);
-    fprintf(f, "  \"avg_cycles_total\": %.6f,\n",
-            qs->samples
-                ? (double)qs->cycles_total / (double)qs->samples
-                : 0.0);
+  fprintf(f, "  \"avg_cycles_count\": %.6f,\n",
+          qs->used_polls ? (double)qs->cycles_count / (double)qs->used_polls
+                         : 0.0);
+  fprintf(f, "  \"avg_cycles_tx\": %.6f,\n",
+          qs->samples ? (double)qs->cycles_tx / (double)qs->samples : 0.0);
+  fprintf(f, "  \"avg_cycles_total\": %.6f,\n",
+          qs->samples ? (double)qs->cycles_total / (double)qs->samples : 0.0);
 
-    /*
-     * Store histograms as:
-     *
-     *   [{"value": 32, "count": 100}, ...]
-     *
-     * rather than 4096 mostly-zero entries.
-     */
-    fprintf(f, "  \"used_histogram\": [\n");
+  /*
+   * Store histograms as:
+   *
+   *   [{"value": 32, "count": 100}, ...]
+   *
+   * rather than 4096 mostly-zero entries.
+   */
+  fprintf(f, "  \"used_histogram\": [\n");
 
-    bool first = true;
-    for (uint32_t i = 0; i < USED_HIST_MAX; i++) {
-        if (used_hist[i] == 0)
-            continue;
+  bool first = true;
+  for (uint32_t i = 0; i < USED_HIST_MAX; i++) {
+    if (used_hist[i] == 0)
+      continue;
 
-        fprintf(f,
-                "%s    {\"value\": %u, \"count\": %" PRIu64 "}",
-                first ? "" : ",\n",
-                i, used_hist[i]);
+    fprintf(f, "%s    {\"value\": %u, \"count\": %" PRIu64 "}",
+            first ? "" : ",\n", i, used_hist[i]);
 
-        first = false;
-    }
+    first = false;
+  }
 
-    fprintf(f, "\n  ],\n");
+  fprintf(f, "\n  ],\n");
 
-    fprintf(f, "  \"watermark_histogram\": [\n");
+  fprintf(f, "  \"watermark_histogram\": [\n");
 
-    first = true;
-    for (uint32_t i = 0; i < USED_HIST_MAX; i++) {
-        if (watermark_hist[i] == 0)
-            continue;
+  first = true;
+  for (uint32_t i = 0; i < USED_HIST_MAX; i++) {
+    if (watermark_hist[i] == 0)
+      continue;
 
-        fprintf(f,
-                "%s    {\"value\": %u, \"count\": %" PRIu64 "}",
-                first ? "" : ",\n",
-                i, watermark_hist[i]);
+    fprintf(f, "%s    {\"value\": %u, \"count\": %" PRIu64 "}",
+            first ? "" : ",\n", i, watermark_hist[i]);
 
-        first = false;
-    }
+    first = false;
+  }
 
-    fprintf(f, "\n  ]\n");
-    fprintf(f, "}\n");
+  fprintf(f, "\n  ]\n");
+  fprintf(f, "}\n");
 
-    fclose(f);
+  fclose(f);
 }
 
 /*
@@ -777,7 +748,8 @@ static inline void tx_iteration(struct worker_ctx *ctx, struct comp_state *dpab,
                                 struct sample_record *s, struct queue_stats *qs,
                                 uint64_t used_hist[USED_HIST_MAX],
                                 uint64_t watermark_hist[USED_HIST_MAX],
-                                bool collect_stats, uint64_t sample_idx) {
+                                bool collect_stats, uint64_t sample_idx,
+                                bool demand) {
   struct sample_record scratch;
   if (s == NULL)
     s = &scratch;
@@ -786,6 +758,7 @@ static inline void tx_iteration(struct worker_ctx *ctx, struct comp_state *dpab,
   uint64_t t0 = rte_rdtsc();
   int used = rte_eth_tx_queue_count(port_id, ctx->queue_id);
   uint64_t t1 = rte_rdtsc();
+  s->cycles_count = t1 - t0;
 
   bool have_used = (used >= 0);
   uint32_t raw_used = have_used ? (uint32_t)used : 0;
@@ -810,6 +783,7 @@ static inline void tx_iteration(struct worker_ctx *ctx, struct comp_state *dpab,
       qs->used_polls++;
     }
   }
+
   s->used = have_used ? raw_used : UINT32_MAX;
   s->wm_valid = dpab->wm_valid;
   s->high_wm = dpab->wm_valid ? dpab->high_wm : UINT32_MAX;
@@ -844,7 +818,7 @@ static inline void tx_iteration(struct worker_ctx *ctx, struct comp_state *dpab,
 
   s->sent = sent;
   s->tx_not_accepted = to_send - sent;
-  s->cycles_count = t1 - t0;
+  s->cycles_total = rte_rdtsc() - iter_start;
 
   if (s->tx_not_accepted > 0) {
 
@@ -865,495 +839,491 @@ static inline void tx_iteration(struct worker_ctx *ctx, struct comp_state *dpab,
              "step=%u high_wm=%u wm_valid=%u\n",
              sample_idx, used, to_send, sent, dpab->observed_step,
              dpab->high_wm, dpab->wm_valid);
+      watermark_hist[dpab->high_wm]++;
     }
-    watermark_hist[dpab->high_wm]++;
-  }
 
-  if (collect_stats) {
-    qs->tx_pkts += sent;
-    qs->tx_bytes += (uint64_t)sent * PKT_LEN;
-    qs->tx_not_accepted += s->tx_not_accepted;
-    qs->app_discarded += s->tx_not_accepted;
-    qs->occupancy_gated += s->occupancy_gated;
-    qs->cycles_count += s->cycles_count;
-    qs->cycles_tx += s->cycles_tx;
-    qs->samples++;
+    if (collect_stats) {
+      qs->tx_pkts += sent;
+      qs->tx_bytes += (uint64_t)sent * PKT_LEN;
+      qs->tx_not_accepted += s->tx_not_accepted;
+      qs->app_discarded += s->tx_not_accepted;
+      qs->occupancy_gated += s->occupancy_gated;
+      qs->cycles_count += s->cycles_count;
+      qs->cycles_tx += s->cycles_tx;
+      qs->samples++;
+    }
   }
-}
 #endif // }
 
 #ifdef BQL // {
 #define PAB_INTERVAL_US 20
-static inline void tx_iteration(struct worker_ctx *ctx, struct pab_bql *cpab,
-                                struct sample_record *s, struct queue_stats *qs,
-                                uint64_t used_hist[USED_HIST_MAX],
-                                uint64_t watermark_hist[USED_HIST_MAX],
-                                bool collect_stats, uint64_t sample_idx) {
-  struct sample_record scratch;
-  if (s == NULL)
-    s = &scratch;
-  memset(s, 0, sizeof(*s));
+  static inline void tx_iteration(
+      struct worker_ctx * ctx, struct pab_bql * cpab, struct sample_record * s,
+      struct queue_stats * qs, uint64_t used_hist[USED_HIST_MAX],
+      uint64_t watermark_hist[USED_HIST_MAX], bool collect_stats,
+      uint64_t sample_idx, bool demand) {
+    struct sample_record scratch;
 
-  const uint16_t requested = burst_size;
-  uint64_t iter_start = rte_rdtsc();
-  uint64_t now_cycles = rte_get_timer_cycles();
+    if (s == NULL)
+      s = &scratch;
+    memset(s, 0, sizeof(*s));
 
-  if (now_cycles - cpab->last_tick_cycles >= cpab->tick_cycles) {
-    uint64_t cleanup_start = rte_rdtsc();
-    int freed = rte_eth_tx_done_cleanup(port_id, ctx->queue_id, 0);
-    uint64_t cleanup_end = rte_rdtsc();
-    s->cycles_count = cleanup_end - cleanup_start;
+    const uint16_t requested = demand ? burst_size : 0;
+    uint64_t iter_start = rte_rdtsc();
+    uint64_t now_cycles = rte_get_timer_cycles();
 
-    if (freed > 0) {
-      uint64_t completed = cpab->num_completed + (uint64_t)freed;
-          cpab->num_completed =
-		          completed > cpab->num_queued
-			              ? cpab->num_queued
-				                  : completed;
+    if (now_cycles - cpab->last_tick_cycles >= cpab->tick_cycles) {
+      uint64_t cleanup_start = rte_rdtsc();
+      int freed = rte_eth_tx_done_cleanup(port_id, ctx->queue_id, 0);
+      uint64_t cleanup_end = rte_rdtsc();
 
-      uint64_t inflight = cpab->num_queued - cpab->num_completed;
+      s->cycles_count = cleanup_end - cleanup_start;
+      s->freed = freed;
 
-      if (inflight == 0) {
-      	cpab->limit += PAB_GROW_STEP;
-	if (cpab->limit > nb_tx_desc)
-		cpab->limit = nb_tx_desc;
-      } else if (inflight >= cpab->limit) {
-      	cpab->limit = (cpab->limit > PAB_GROW_STEP) ? cpab->limit - PAB_GROW_STEP : PAB_LIMIT_MIN;
+      uint64_t before_inflight = cpab->num_queued - cpab->num_completed;
 
-	if (cpab->limit < PAB_LIMIT_MIN)
-		cpab->limit = PAB_LIMIT_MIN;
+      if (freed > 0) {
+        uint64_t completed = cpab->num_completed + (uint64_t)freed;
+
+        cpab->num_completed =
+            completed > cpab->num_queued ? cpab->num_queued : completed;
+
+        uint64_t inflight = cpab->num_queued - cpab->num_completed;
+
+        if (inflight == 0) {
+          cpab->limit += PAB_GROW_STEP;
+          if (cpab->limit > nb_tx_desc)
+            cpab->limit = nb_tx_desc;
+        } else if (inflight >= cpab->limit) {
+          cpab->limit = (cpab->limit > PAB_GROW_STEP)
+                            ? cpab->limit - PAB_GROW_STEP
+                            : PAB_LIMIT_MIN;
+
+          if (cpab->limit < PAB_LIMIT_MIN)
+            cpab->limit = PAB_LIMIT_MIN;
+        }
       }
 
       cpab->last_tick_cycles = now_cycles;
     }
 
-    uint64_t inflight = cpab->num_queued - cpab->num_completed;
+    uint64_t inflight_now = cpab->num_queued - cpab->num_completed;
+    uint32_t bql_space = (cpab->limit > inflight_now)
+                             ? (uint32_t)(cpab->limit - inflight_now)
+                             : 0;
 
-    cpab->last_tick_cycles = now_cycles;
-  }
+    uint16_t to_send = RTE_MIN(bql_space, requested);
 
-  uint64_t inflight_now = cpab->num_queued - cpab->num_completed;
-  uint32_t bql_space = (cpab->limit > inflight_now) 
-	  ? (uint32_t)(cpab->limit - inflight_now)
-	  : 0;
+    s->used = inflight_now > UINT32_MAX ? UINT32_MAX : (uint32_t)inflight_now;
+    s->space = bql_space;
+    s->requested = requested;
+    s->limit = cpab->limit;
+    s->to_send = to_send;
+    s->occupancy_gated = requested - to_send;
 
-  uint16_t to_send = RTE_MIN(bql_space, burst_size);
+    if (collect_stats) {
+      if (s->used < USED_HIST_MAX)
+        used_hist[s->used]++;
+      if (cpab->limit < USED_HIST_MAX)
+        watermark_hist[cpab->limit]++;
 
-  s->used = inflight_now > UINT32_MAX ? UINT32_MAX : (uint32_t)inflight_now;
-  s->space = inflight_now;
-  s->requested = requested;
-  s->to_send = to_send;
-  s->occupancy_gated = requested - to_send;
-
-  if (collect_stats) {
-    if (s->used < USED_HIST_MAX)
-      used_hist[s->used]++;
-    if (cpab->limit < USED_HIST_MAX)
-      watermark_hist[cpab->limit]++;
-
-    qs->last_used = (uint16_t)RTE_MIN(s->used, (uint32_t)UINT16_MAX);
-    if (qs->used_polls == 0) {
-      qs->min_used = qs->max_used = qs->last_used;
-    } else {
-      if (qs->last_used < qs->min_used)
-        qs->min_used = qs->last_used;
-      if (qs->last_used > qs->max_used)
-        qs->max_used = qs->last_used;
-    }
-    qs->sum_used += s->used;
-    qs->used_polls++;
-  }
-
-  struct rte_mbuf *bufs[MAX_PKT_BURST];
-  uint16_t sent = 0;
-
-  if (!force_quit && to_send > 0 &&
-      rte_pktmbuf_alloc_bulk(ctx->mbuf_pool, bufs, to_send) == 0) {
-
-    for (uint16_t i = 0; i < to_send; i++)
-      fill_dummy_packet(bufs[i]);
-
-
-    uint64_t tx_start = rte_rdtsc();
-    sent = rte_eth_tx_burst(port_id, ctx->queue_id, bufs, to_send);
-    uint64_t tx_end = rte_rdtsc();
-    s->cycles_tx = tx_end - tx_start;
-
-    /* Only packets accepted by the PMD become BQL in-flight packets. */
-    cpab->num_queued += sent;
-
-    for (uint16_t i = sent; i < to_send; i++)
-      rte_pktmbuf_free(bufs[i]);
-  }
-
-  s->sent = sent;
-  s->tx_not_accepted = to_send - sent;
-  s->cycles_total = rte_rdtsc() - iter_start;
-
-  if (s->tx_not_accepted > 0) {
-    qs->reject_events++;
-    if (qs->first_reject_sample == UINT64_MAX)
-      qs->first_reject_sample = sample_idx;
-    qs->last_reject_sample = sample_idx;
-  }
-
-  if (sent < to_send) {
-    uint64_t observed_full = inflight_now + sent;
-
-    if (observed_full < cpab->limit) {
-      cpab->limit = observed_full < PAB_LIMIT_MIN ? PAB_LIMIT_MIN
-                                                  : (uint32_t)observed_full;
+      qs->last_used = (uint16_t)RTE_MIN(s->used, (uint32_t)UINT16_MAX);
+      if (qs->used_polls == 0) {
+        qs->min_used = qs->max_used = qs->last_used;
+      } else {
+        if (qs->last_used < qs->min_used)
+          qs->min_used = qs->last_used;
+        if (qs->last_used > qs->max_used)
+          qs->max_used = qs->last_used;
+      }
+      qs->sum_used += s->used;
+      qs->used_polls++;
     }
 
-  }
+    struct rte_mbuf *bufs[MAX_PKT_BURST];
+    uint16_t sent = 0;
 
-  if (collect_stats) {
-    qs->tx_pkts += sent;
-    qs->tx_bytes += (uint64_t)sent * PKT_LEN;
-    qs->tx_not_accepted += s->tx_not_accepted;
-    qs->app_discarded += s->tx_not_accepted;
-    qs->occupancy_gated += s->occupancy_gated;
-    qs->cycles_count += s->cycles_count;
-    qs->cycles_tx += s->cycles_tx;
-    qs->cycles_total += s->cycles_total;
-    qs->samples++;
+    if (!force_quit && to_send > 0 &&
+        rte_pktmbuf_alloc_bulk(ctx->mbuf_pool, bufs, to_send) == 0) {
+
+      for (uint16_t i = 0; i < to_send; i++)
+        fill_dummy_packet(bufs[i]);
+
+      uint64_t tx_start = rte_rdtsc();
+      sent = rte_eth_tx_burst(port_id, ctx->queue_id, bufs, to_send);
+      uint64_t tx_end = rte_rdtsc();
+      s->cycles_tx = tx_end - tx_start;
+
+      /* Only packets accepted by the PMD become BQL in-flight packets. */
+      cpab->num_queued += sent;
+
+      for (uint16_t i = sent; i < to_send; i++)
+        rte_pktmbuf_free(bufs[i]);
+    }
+
+    s->sent = sent;
+    s->tx_not_accepted = to_send - sent;
+    s->cycles_total = rte_rdtsc() - iter_start;
+
+    if (s->tx_not_accepted > 0) {
+      qs->reject_events++;
+      if (qs->first_reject_sample == UINT64_MAX)
+        qs->first_reject_sample = sample_idx;
+      qs->last_reject_sample = sample_idx;
+    }
+
+    if (sent < to_send) {
+      uint64_t observed_full = inflight_now + sent;
+
+      if (observed_full < cpab->limit) {
+        cpab->limit = observed_full < PAB_LIMIT_MIN ? PAB_LIMIT_MIN
+                                                    : (uint32_t)observed_full;
+      }
+    }
+
+    if (collect_stats) {
+      qs->tx_pkts += sent;
+      qs->tx_bytes += (uint64_t)sent * PKT_LEN;
+      qs->tx_not_accepted += s->tx_not_accepted;
+      qs->app_discarded += s->tx_not_accepted;
+      qs->occupancy_gated += s->occupancy_gated;
+      qs->cycles_count += s->cycles_count;
+      qs->cycles_tx += s->cycles_tx;
+      qs->cycles_total += s->cycles_total;
+      qs->samples++;
+    }
   }
-}
 #endif // }
 
-static int tx_worker_main(void *arg) {
-  struct worker_ctx *ctx = (struct worker_ctx *)arg;
-  uint16_t queue_id = ctx->queue_id;
-  uint64_t recorded_samples = 0;
-  struct queue_stats *qs = &qstats[queue_id];
-  uint64_t used_hist[USED_HIST_MAX] = {0};
-  uint64_t watermark_hist[USED_HIST_MAX] = {0};
-#ifdef COMP
-  struct comp_state dpab = {0};
-#endif
-#ifdef BQL
-  struct pab_bql cpab = {0};
-  cpab.num_queued = 0;
-  cpab.num_completed = 0;
-  cpab.limit = burst_size;
-  cpab.last_tick_cycles = rte_get_timer_cycles();
-#endif
-
-  qs->first_reject_sample = UINT64_MAX;
-
-  /* Barrier 1: all workers are alive before any one of them starts traffic. */
-  uint32_t ready = __atomic_add_fetch(&sync_workers_ready, 1, __ATOMIC_ACQ_REL);
-  if (ready == sync_n_workers) {
-    uint64_t now = rte_rdtsc();
-    global_warmup_start_tsc = now + ms_to_tsc(SYNC_LEAD_MS);
-    global_warmup_end_tsc = global_warmup_start_tsc + ms_to_tsc(warmup_ms);
-    __atomic_store_n(&sync_warmup_schedule_ready, 1, __ATOMIC_RELEASE);
-  }
-
-  while (!force_quit &&
-         !__atomic_load_n(&sync_warmup_schedule_ready, __ATOMIC_ACQUIRE))
-    rte_pause();
-
-  spin_until_tsc(global_warmup_start_tsc);
-
-  while (!force_quit && rte_rdtsc() < global_warmup_end_tsc)
-    ;
-  // tx_iteration(ctx, &dpab, NULL, qs, used_hist, false);
-
-  /*
-   * Barrier 2: no queue begins measurement until every queue has left the
-   * warm-up loop. The last worker publishes one shared start/end deadline.
-   */
-  uint32_t warmed = __atomic_add_fetch(&sync_warmup_done, 1, __ATOMIC_ACQ_REL);
-  if (warmed == sync_n_workers) {
-    uint64_t now = rte_rdtsc();
-    global_start_tsc = now + ms_to_tsc(SYNC_LEAD_MS);
-    global_end_tsc = global_start_tsc + ms_to_tsc(measure_ms);
-    __atomic_store_n(&sync_measure_schedule_ready, 1, __ATOMIC_RELEASE);
-  }
-
-  while (!force_quit &&
-         !__atomic_load_n(&sync_measure_schedule_ready, __ATOMIC_ACQUIRE))
-    rte_pause();
-
-  spin_until_tsc(global_start_tsc);
-#ifdef COMP
-  memset(&dpab, 0, sizeof(dpab)); // reset state
-#endif
-
-  /*
-   * Timed measurement: all queues use the same global_end_tsc. Reaching the
-   * raw-record capacity never stops traffic or statistics; it only truncates
-   * the per-iteration binary record stream.
-   */
-  uint64_t tsc_hz = rte_get_tsc_hz();
-
-#ifdef BQL
-  uint64_t interval_cycles =
-	      (tsc_hz / 1000000ULL) * PAB_INTERVAL_US;
-#endif
-
-  uint64_t next_tick = global_start_tsc;
-
-  while (!force_quit && rte_rdtsc() < global_end_tsc) {
-    struct sample_record *s = NULL;
-    if (recorded_samples < target_samples)
-      s = &ctx->samples[recorded_samples];
+  static int tx_worker_main(void *arg) {
+    struct worker_ctx *ctx = (struct worker_ctx *)arg;
+    uint16_t queue_id = ctx->queue_id;
+    uint64_t recorded_samples = 0;
+    struct queue_stats *qs = &qstats[queue_id];
+    uint64_t used_hist[USED_HIST_MAX] = {0};
+    uint64_t watermark_hist[USED_HIST_MAX] = {0};
 
 #ifdef COMP
-    tx_iteration(ctx, &dpab, s, qs, used_hist, watermark_hist, true,
-                 recorded_samples);
+    struct comp_state dpab = {0};
 #endif
 #ifdef BQL
-    next_tick += interval_cycles;
-
-    spin_until_tsc(next_tick);
-
-    tx_iteration(ctx, &cpab, s, qs, used_hist, watermark_hist, true,
-                 recorded_samples);
+    struct pab_bql cpab = {0};
+    cpab.num_queued = 0;
+    cpab.num_completed = 0;
+    cpab.limit = nb_tx_desc;
+    cpab.last_tick_cycles = rte_get_timer_cycles();
+    cpab.tick_cycles = (rte_get_timer_hz() / 1000000ULL) * PAB_INTERVAL_US;
 #endif
 
-    if (recorded_samples < target_samples)
-      recorded_samples++;
-  }
+    qs->first_reject_sample = UINT64_MAX;
 
-  uint64_t offered_pkts = qs->samples * (uint64_t)burst_size;
-  uint64_t attempted_pkts = offered_pkts >= qs->occupancy_gated
-                                ? offered_pkts - qs->occupancy_gated
-                                : 0;
-
-  double gating_pct =
-      offered_pkts ? 100.0 * (double)qs->occupancy_gated / (double)offered_pkts
-                   : 0.0;
-
-  double rejection_pct = attempted_pkts ? 100.0 * (double)qs->tx_not_accepted /
-                                              (double)attempted_pkts
-                                        : 0.0;
-
-  double measure_seconds =
-      (double)(global_end_tsc - global_start_tsc) / (double)rte_get_timer_hz();
-
-  double tx_pkts_per_second =
-      measure_seconds > 0.0 ? (double)qs->tx_pkts / measure_seconds : 0.0;
-
-  printf("reject_events       : %" PRIu64 "\n", qs->reject_events);
-
-  if (qs->reject_events > 0) {
-    printf("first_reject_sample : %" PRIu64 "\n", qs->first_reject_sample);
-    printf("last_reject_sample  : %" PRIu64 "\n", qs->last_reject_sample);
-  } else {
-    printf("first_reject_sample : none\n");
-    printf("last_reject_sample  : none\n");
-  }
-
-  printf("\n"
-         "========== Queue %u benchmark ==========\n"
-         "samples             : %" PRIu64 "\n"
-         "recorded_samples    : %" PRIu64 "\n"
-         "tx_pkts             : %" PRIu64 "\n"
-         "tx_bytes            : %" PRIu64 "\n"
-         "app_discarded       : %" PRIu64 "\n"
-         "\n"
-         "occupancy_polls     : %" PRIu64 "\n"
-         "polls_per_sample    : %.2f\n"
-         "\n"
-         "occupancy_gated     : %" PRIu64 "\n"
-         "gating_pct          : %.6f\n"
-         "attempted_pkts      : %" PRIu64 "\n"
-         "tx_not_accepted     : %" PRIu64 "\n"
-         "rejection_pct       : %.6f\n"
-         "tx_pkts_per_second  : %.2f\n"
-         "\n"
-         "last_used           : %u\n"
-         "min_used            : %u\n"
-         "max_used            : %u\n"
-         "avg_used            : %.2f\n"
-         "\n"
-         "cycles_count        : %" PRIu64 "\n"
-         "cycles_tx           : %" PRIu64 "\n"
-         "cycles_total        : %" PRIu64 "\n"
-         "\n"
-         "avg_cycles_count    : %.2f\n"
-         "avg_cycles_tx       : %.2f\n"
-         "avg_cycles_total    : %.2f\n"
-         "=========================================\n",
-         queue_id, qs->samples, recorded_samples, qs->tx_pkts, qs->tx_bytes,
-         qs->app_discarded, qs->used_polls,
-         qs->samples ? (double)qs->used_polls / (double)qs->samples : 0.0,
-         qs->occupancy_gated, gating_pct, attempted_pkts, qs->tx_not_accepted,
-         rejection_pct, tx_pkts_per_second, qs->last_used, qs->min_used,
-         qs->max_used,
-         qs->used_polls ? (double)qs->sum_used / (double)qs->used_polls : 0.0,
-         qs->cycles_count, qs->cycles_tx, qs->cycles_total,
-         qs->used_polls ? (double)qs->cycles_count / (double)qs->used_polls
-                        : 0.0,
-         qs->samples ? (double)qs->cycles_tx / (double)qs->samples : 0.0,
-         qs->samples ? (double)qs->cycles_total / (double)qs->samples : 0.0);
-
-  if (qs->samples > recorded_samples) {
-    printf("[q%u] WARNING: raw sample capacity reached: stored %" PRIu64
-           " of %" PRIu64 " measurement iterations. Increase -c to keep "
-           "the complete time series.\n",
-           queue_id, recorded_samples, qs->samples);
-  }
-
-  printf("\nTX queue-count histogram:\n");
-  for (uint32_t i = 0; i < USED_HIST_MAX; i++) {
-    if (used_hist[i] != 0) {
-      printf("queue %d  used=%3u : %" PRIu64 " (%.4f%%)\n", queue_id, i,
-             used_hist[i],
-             qs->used_polls
-                 ? 100.0 * (double)used_hist[i] / (double)qs->used_polls
-                 : 0.0);
+    /* Barrier 1: all workers are alive before any one of them starts traffic.
+     */
+    uint32_t ready =
+        __atomic_add_fetch(&sync_workers_ready, 1, __ATOMIC_ACQ_REL);
+    if (ready == sync_n_workers) {
+      uint64_t now = rte_rdtsc();
+      global_warmup_start_tsc = now + ms_to_tsc(SYNC_LEAD_MS);
+      global_warmup_end_tsc = global_warmup_start_tsc + ms_to_tsc(warmup_ms);
+      __atomic_store_n(&sync_warmup_schedule_ready, 1, __ATOMIC_RELEASE);
     }
-  }
 
-  printf("\nhigh_wm histogram:\n");
-  for (uint32_t i = 0; i < USED_HIST_MAX; i++) {
-    if (watermark_hist[i] != 0) {
-      printf("queue %d  watermark=%3u : %" PRIu64 " (%.4f%%)\n", queue_id, i,
-             watermark_hist[i],
-             qs->used_polls
-                 ? 100.0 * (double)watermark_hist[i] / (double)qs->used_polls
-                 : 0.0);
+    while (!force_quit &&
+           !__atomic_load_n(&sync_warmup_schedule_ready, __ATOMIC_ACQUIRE))
+      rte_pause();
+
+    spin_until_tsc(global_warmup_start_tsc);
+
+    while (!force_quit && rte_rdtsc() < global_warmup_end_tsc)
+      ;
+    // tx_iteration(ctx, &dpab, NULL, qs, used_hist, false);
+
+    /*
+     * Barrier 2: no queue begins measurement until every queue has left the
+     * warm-up loop. The last worker publishes one shared start/end deadline.
+     */
+    uint32_t warmed =
+        __atomic_add_fetch(&sync_warmup_done, 1, __ATOMIC_ACQ_REL);
+    if (warmed == sync_n_workers) {
+      uint64_t now = rte_rdtsc();
+      global_start_tsc = now + ms_to_tsc(SYNC_LEAD_MS);
+      global_end_tsc = global_start_tsc + ms_to_tsc(measure_ms);
+      __atomic_store_n(&sync_measure_schedule_ready, 1, __ATOMIC_RELEASE);
     }
-  }
 
-write_queue_json(queue_id,
-                 qs,
-                 recorded_samples,
-                 offered_pkts,
-                 attempted_pkts,
-                 gating_pct,
-                 rejection_pct,
-                 tx_pkts_per_second,
-                 used_hist,
-                 watermark_hist);
+    while (!force_quit &&
+           !__atomic_load_n(&sync_measure_schedule_ready, __ATOMIC_ACQUIRE))
+      rte_pause();
 
-  char fname[300];
-  snprintf(fname, sizeof(fname), "%s_q%u.bin", outfile_base, queue_id);
+    spin_until_tsc(global_start_tsc);
+#ifdef COMP
+    memset(&dpab, 0, sizeof(dpab)); // reset state
+#endif
 
-  FILE *f = fopen(fname, "wb");
-  if (f == NULL) {
-    fprintf(stderr, "[q%u] Could not open %s for writing\n", queue_id, fname);
-  } else {
-    struct sample_file_header hdr = {
-        .magic = SAMPLE_FILE_MAGIC,
-        .version = SAMPLE_FILE_VERSION,
-        .queue_id = queue_id,
-        .record_size = sizeof(struct sample_record),
-        .stats_size = sizeof(struct queue_stats),
-        .num_records = recorded_samples,
-        .nb_tx_desc = nb_tx_desc,
-        .burst_size = burst_size,
-        .timer_hz = rte_get_tsc_hz(),
-    };
+    // while (!force_quit && rte_rdtsc() < global_end_tsc) {
+    while (!force_quit && recorded_samples < target_samples) {
+      struct sample_record *s = NULL;
+      if (recorded_samples < target_samples)
+        s = &ctx->samples[recorded_samples];
 
-    fwrite(&hdr, sizeof(hdr), 1, f);
-    fwrite(qs, sizeof(*qs), 1, f);
-    fwrite(ctx->samples, sizeof(struct sample_record), recorded_samples, f);
-    fclose(f);
+      uint64_t now = rte_rdtsc();
+      uint64_t elapsed = now - global_start_tsc;
 
-    printf("[q%u] wrote %" PRIu64 " raw samples + queue stats to %s "
-           "(record=%zu bytes, stats=%zu bytes)\n",
-           queue_id, recorded_samples, fname, sizeof(struct sample_record),
-           sizeof(struct queue_stats));
-  }
+      bool demand = true;
 
-  return 0;
-}
+      if (elapsed >= ms_to_tsc(5) && elapsed < ms_to_tsc(15)) {
+        demand = false;
+      }
 
-int main(int argc, char **argv) {
-  int ret = rte_eal_init(argc, argv);
-  if (ret < 0)
-    rte_exit(EXIT_FAILURE, "EAL init failed\n");
-  argc -= ret;
-  argv += ret;
+#ifdef COMP
+      tx_iteration(ctx, &dpab, s, qs, used_hist, watermark_hist, true,
+                   recorded_samples, demand);
+#endif
+#ifdef BQL
+      tx_iteration(ctx, &cpab, s, qs, used_hist, watermark_hist, true,
+                   recorded_samples, demand);
+#endif
 
-  parse_args(argc, argv);
-
-  /* ---- Derive tx queue count from worker lcores ---- */
-  unsigned worker_lcores[MAX_TX_QUEUES];
-  unsigned n_workers = 0;
-  unsigned lc;
-  RTE_LCORE_FOREACH_WORKER(lc) {
-    if (n_workers >= MAX_TX_QUEUES) {
-      fprintf(stderr, "Too many worker lcores, capping at %d\n", MAX_TX_QUEUES);
-      break;
+      if (recorded_samples < target_samples)
+        recorded_samples++;
     }
-    worker_lcores[n_workers++] = lc;
-  }
 
-  if (n_workers == 0) {
-    /* Only the main lcore was given (-l <one core>); use it as the
-     * sole TX worker instead of refusing to run. */
-    worker_lcores[0] = rte_lcore_id();
-    n_workers = 1;
-    printf("Only one lcore available; running single TX worker on the "
-           "main lcore.\n");
-  }
+    uint64_t offered_pkts = qs->samples * (uint64_t)burst_size;
+    uint64_t attempted_pkts = offered_pkts >= qs->occupancy_gated
+                                  ? offered_pkts - qs->occupancy_gated
+                                  : 0;
 
-  nb_tx_q = (uint16_t)n_workers;
-  sync_n_workers = n_workers;
+    double gating_pct = offered_pkts ? 100.0 * (double)qs->occupancy_gated /
+                                           (double)offered_pkts
+                                     : 0.0;
 
-  struct rte_mempool *mbuf_pool =
-      rte_pktmbuf_pool_create("MBUF_POOL", MBUF_POOL_SIZE, MBUF_CACHE_SIZE, 0,
-                              RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
-  if (mbuf_pool == NULL)
-    rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
+    double rejection_pct =
+        attempted_pkts
+            ? 100.0 * (double)qs->tx_not_accepted / (double)attempted_pkts
+            : 0.0;
 
-  if (port_init(port_id, mbuf_pool) != 0)
-    rte_exit(EXIT_FAILURE, "Port init failed\n");
+    uint64_t actual_end_tsc = rte_rdtsc();
 
-  // register_telemetry();
+    double measure_seconds =
+	        (double)(actual_end_tsc - global_start_tsc) /
+		    (double)rte_get_tsc_hz();
 
-  printf("Port %u up. workers=%u nb_tx_q=%u nb_tx_desc=%u burst=%u "
-         "method=%s shaped_rate=%" PRIu64 " Bps pacing_ns=%" PRIu64 " "
-         "warmup_ms=%" PRIu64 " measure_ms=%" PRIu64 " raw_capacity=%" PRIu64
-         "\n",
-         port_id, n_workers, nb_tx_q, nb_tx_desc, burst_size,
-         use_tm ? "rte_tm" : "legacy", shaped_rate_bps, pacing_ns, warmup_ms,
-         measure_ms, target_samples);
+    double tx_pkts_per_second =
+        measure_seconds > 0.0 ? (double)qs->tx_pkts / measure_seconds : 0.0;
 
-  /* ---- Allocate per-queue sample buffers and launch workers ---- */
-  for (unsigned i = 0; i < n_workers; i++) {
-    uint16_t q = (uint16_t)i;
+    printf("reject_events       : %" PRIu64 "\n", qs->reject_events);
 
-    struct sample_record *samples =
-        rte_zmalloc("samples", target_samples * sizeof(struct sample_record),
-                    RTE_CACHE_LINE_SIZE);
-
-    if (samples == NULL)
-      rte_exit(EXIT_FAILURE, "Cannot allocate sample buffer for queue %u\n", q);
-
-    worker_ctx[i].queue_id = q;
-    worker_ctx[i].mbuf_pool = mbuf_pool;
-    worker_ctx[i].samples = samples;
-
-    if (worker_lcores[i] == rte_lcore_id()) {
-      /* Single-worker fallback case: run inline on main lcore. */
-      tx_worker_main(&worker_ctx[i]);
+    if (qs->reject_events > 0) {
+      printf("first_reject_sample : %" PRIu64 "\n", qs->first_reject_sample);
+      printf("last_reject_sample  : %" PRIu64 "\n", qs->last_reject_sample);
     } else {
-      ret = rte_eal_remote_launch(tx_worker_main, &worker_ctx[i],
-                                  worker_lcores[i]);
-      if (ret != 0)
-        fprintf(stderr, "Failed to launch worker on lcore %u: %d\n",
-                worker_lcores[i], ret);
+      printf("first_reject_sample : none\n");
+      printf("last_reject_sample  : none\n");
     }
+
+    printf("\n"
+           "========== Queue %u benchmark ==========\n"
+           "samples             : %" PRIu64 "\n"
+           "recorded_samples    : %" PRIu64 "\n"
+           "tx_pkts             : %" PRIu64 "\n"
+           "tx_bytes            : %" PRIu64 "\n"
+           "app_discarded       : %" PRIu64 "\n"
+           "\n"
+           "occupancy_polls     : %" PRIu64 "\n"
+           "polls_per_sample    : %.2f\n"
+           "\n"
+           "occupancy_gated     : %" PRIu64 "\n"
+           "gating_pct          : %.6f\n"
+           "attempted_pkts      : %" PRIu64 "\n"
+           "tx_not_accepted     : %" PRIu64 "\n"
+           "rejection_pct       : %.6f\n"
+           "tx_pkts_per_second  : %.2f\n"
+           "\n"
+           "last_used           : %u\n"
+           "min_used            : %u\n"
+           "max_used            : %u\n"
+           "avg_used            : %.2f\n"
+           "\n"
+           "cycles_count        : %" PRIu64 "\n"
+           "cycles_tx           : %" PRIu64 "\n"
+           "cycles_total        : %" PRIu64 "\n"
+           "\n"
+           "avg_cycles_count    : %.2f\n"
+           "avg_cycles_tx       : %.2f\n"
+           "avg_cycles_total    : %.2f\n"
+           "=========================================\n",
+           queue_id, qs->samples, recorded_samples, qs->tx_pkts, qs->tx_bytes,
+           qs->app_discarded, qs->used_polls,
+           qs->samples ? (double)qs->used_polls / (double)qs->samples : 0.0,
+           qs->occupancy_gated, gating_pct, attempted_pkts, qs->tx_not_accepted,
+           rejection_pct, tx_pkts_per_second, qs->last_used, qs->min_used,
+           qs->max_used,
+           qs->used_polls ? (double)qs->sum_used / (double)qs->used_polls : 0.0,
+           qs->cycles_count, qs->cycles_tx, qs->cycles_total,
+           qs->used_polls ? (double)qs->cycles_count / (double)qs->used_polls
+                          : 0.0,
+           qs->samples ? (double)qs->cycles_tx / (double)qs->samples : 0.0,
+           qs->samples ? (double)qs->cycles_total / (double)qs->samples : 0.0);
+
+    if (qs->samples > recorded_samples) {
+      printf("[q%u] WARNING: raw sample capacity reached: stored %" PRIu64
+             " of %" PRIu64 " measurement iterations. Increase -c to keep "
+             "the complete time series.\n",
+             queue_id, recorded_samples, qs->samples);
+    }
+
+    printf("\nTX queue-count histogram:\n");
+    for (uint32_t i = 0; i < USED_HIST_MAX; i++) {
+      if (used_hist[i] != 0) {
+        printf("queue %d  used=%3u : %" PRIu64 " (%.4f%%)\n", queue_id, i,
+               used_hist[i],
+               qs->used_polls
+                   ? 100.0 * (double)used_hist[i] / (double)qs->used_polls
+                   : 0.0);
+      }
+    }
+
+    printf("\nhigh_wm histogram:\n");
+    for (uint32_t i = 0; i < USED_HIST_MAX; i++) {
+      if (watermark_hist[i] != 0) {
+        printf("queue %d  watermark=%3u : %" PRIu64 " (%.4f%%)\n", queue_id, i,
+               watermark_hist[i],
+               qs->used_polls
+                   ? 100.0 * (double)watermark_hist[i] / (double)qs->used_polls
+                   : 0.0);
+      }
+    }
+
+    write_queue_json(queue_id, qs, recorded_samples, offered_pkts,
+                     attempted_pkts, gating_pct, rejection_pct,
+                     tx_pkts_per_second, used_hist, watermark_hist);
+
+    char fname[300];
+    snprintf(fname, sizeof(fname), "%s_q%u.bin", outfile_base, queue_id);
+
+    FILE *f = fopen(fname, "wb");
+    if (f == NULL) {
+      fprintf(stderr, "[q%u] Could not open %s for writing\n", queue_id, fname);
+    } else {
+      struct sample_file_header hdr = {
+          .magic = SAMPLE_FILE_MAGIC,
+          .version = SAMPLE_FILE_VERSION,
+          .queue_id = queue_id,
+          .record_size = sizeof(struct sample_record),
+          .stats_size = sizeof(struct queue_stats),
+          .num_records = recorded_samples,
+          .nb_tx_desc = nb_tx_desc,
+          .burst_size = burst_size,
+          .timer_hz = rte_get_tsc_hz(),
+      };
+
+      fwrite(&hdr, sizeof(hdr), 1, f);
+      fwrite(qs, sizeof(*qs), 1, f);
+      fwrite(ctx->samples, sizeof(struct sample_record), recorded_samples, f);
+      fclose(f);
+
+      printf("[q%u] wrote %" PRIu64 " raw samples + queue stats to %s "
+             "(record=%zu bytes, stats=%zu bytes)\n",
+             queue_id, recorded_samples, fname, sizeof(struct sample_record),
+             sizeof(struct queue_stats));
+    }
+
+    return 0;
   }
 
-  rte_eal_mp_wait_lcore();
+  int main(int argc, char **argv) {
+    int ret = rte_eal_init(argc, argv);
+    if (ret < 0)
+      rte_exit(EXIT_FAILURE, "EAL init failed\n");
+    argc -= ret;
+    argv += ret;
 
-  printf("Synchronized windows: warmup=[%" PRIu64 ", %" PRIu64 ") "
-         "measure=[%" PRIu64 ", %" PRIu64 ") measure_cycles=%" PRIu64 "\n",
-         global_warmup_start_tsc, global_warmup_end_tsc, global_start_tsc,
-         global_end_tsc, global_end_tsc - global_start_tsc);
+    parse_args(argc, argv);
 
-  for (unsigned i = 0; i < n_workers; i++)
-    rte_free(worker_ctx[i].samples);
+    /* ---- Derive tx queue count from worker lcores ---- */
+    unsigned worker_lcores[MAX_TX_QUEUES];
+    unsigned n_workers = 0;
+    unsigned lc;
+    RTE_LCORE_FOREACH_WORKER(lc) {
+      if (n_workers >= MAX_TX_QUEUES) {
+        fprintf(stderr, "Too many worker lcores, capping at %d\n",
+                MAX_TX_QUEUES);
+        break;
+      }
+      worker_lcores[n_workers++] = lc;
+    }
 
-  rte_eth_dev_stop(port_id);
-  rte_eth_dev_close(port_id);
-  rte_eal_cleanup();
-  return 0;
-}
+    if (n_workers == 0) {
+      /* Only the main lcore was given (-l <one core>); use it as the
+       * sole TX worker instead of refusing to run. */
+      worker_lcores[0] = rte_lcore_id();
+      n_workers = 1;
+      printf("Only one lcore available; running single TX worker on the "
+             "main lcore.\n");
+    }
+
+    nb_tx_q = (uint16_t)n_workers;
+    sync_n_workers = n_workers;
+
+    struct rte_mempool *mbuf_pool =
+        rte_pktmbuf_pool_create("MBUF_POOL", MBUF_POOL_SIZE, MBUF_CACHE_SIZE, 0,
+                                RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
+    if (mbuf_pool == NULL)
+      rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
+
+    if (port_init(port_id, mbuf_pool) != 0)
+      rte_exit(EXIT_FAILURE, "Port init failed\n");
+
+    // register_telemetry();
+
+    printf("Port %u up. workers=%u nb_tx_q=%u nb_tx_desc=%u burst=%u "
+           "method=%s shaped_rate=%" PRIu64 " Bps pacing_ns=%" PRIu64 " "
+           "warmup_ms=%" PRIu64 " measure_ms=%" PRIu64 " raw_capacity=%" PRIu64
+           "\n",
+           port_id, n_workers, nb_tx_q, nb_tx_desc, burst_size,
+           use_tm ? "rte_tm" : "legacy", shaped_rate_bps, pacing_ns, warmup_ms,
+           measure_ms, target_samples);
+
+    /* ---- Allocate per-queue sample buffers and launch workers ---- */
+    for (unsigned i = 0; i < n_workers; i++) {
+      uint16_t q = (uint16_t)i;
+
+      struct sample_record *samples =
+          rte_zmalloc("samples", target_samples * sizeof(struct sample_record),
+                      RTE_CACHE_LINE_SIZE);
+
+      if (samples == NULL)
+        rte_exit(EXIT_FAILURE, "Cannot allocate sample buffer for queue %u\n",
+                 q);
+
+      worker_ctx[i].queue_id = q;
+      worker_ctx[i].mbuf_pool = mbuf_pool;
+      worker_ctx[i].samples = samples;
+
+      if (worker_lcores[i] == rte_lcore_id()) {
+        /* Single-worker fallback case: run inline on main lcore. */
+        tx_worker_main(&worker_ctx[i]);
+      } else {
+        ret = rte_eal_remote_launch(tx_worker_main, &worker_ctx[i],
+                                    worker_lcores[i]);
+        if (ret != 0)
+          fprintf(stderr, "Failed to launch worker on lcore %u: %d\n",
+                  worker_lcores[i], ret);
+      }
+    }
+
+    rte_eal_mp_wait_lcore();
+
+    printf("Synchronized windows: warmup=[%" PRIu64 ", %" PRIu64 ") "
+           "measure=[%" PRIu64 ", %" PRIu64 ") measure_cycles=%" PRIu64 "\n",
+           global_warmup_start_tsc, global_warmup_end_tsc, global_start_tsc,
+           global_end_tsc, global_end_tsc - global_start_tsc);
+
+    for (unsigned i = 0; i < n_workers; i++)
+      rte_free(worker_ctx[i].samples);
+
+    rte_eth_dev_stop(port_id);
+    rte_eth_dev_close(port_id);
+    rte_eal_cleanup();
+    return 0;
+  }
