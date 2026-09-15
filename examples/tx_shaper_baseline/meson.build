@@ -6,13 +6,16 @@
 # To build this example as a standalone application with an already-installed
 # DPDK instance, use 'make'
 
-# Select either 'comp' or 'bql'
-tx_controller = 'bql'
+tx_controller = 'pq'
 
 if tx_controller == 'comp'
   cflags += ['-DCOMP=1']
 elif tx_controller == 'bql'
   cflags += ['-DBQL=1']
+elif tx_controller == 'rej'
+  cflags += ['-DREJ=1']
+elif tx_controller == 'pq'
+  cflags += ['-DPQ=1']
 else
   error('tx_controller must be either comp or bql')
 endif
