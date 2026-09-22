@@ -346,7 +346,7 @@ struct sample_file_header {
 static void parse_args(int argc, char **argv) {
   int opt;
   while ((opt = getopt(argc, argv,
-                     "p:n:t:r:b:m:s:c:o:w:d:x:T:N:I:G:")) != -1) {
+                     "p:n:t:r:b:m:s:c:o:w:d:x:T:N:I:G:A:K:")) != -1) {
     switch (opt) {
     case 'p':
       port_id = (uint16_t)atoi(optarg);
@@ -425,6 +425,22 @@ case 'G':
     fprintf(stderr, "-G is only meaningful for BQL\n");
 #endif
     break;
+    case 'A':
+#ifdef REJ
+    rej_add_step = (uint32_t)strtoul(optarg, NULL, 10);
+#else
+    fprintf(stderr, "-A is only meaningful for REJ\n");
+#endif
+    break;
+
+case 'K':
+#ifdef REJ
+    rej_grow_streak = (uint32_t)strtoul(optarg, NULL, 10);
+#else
+    fprintf(stderr, "-K is only meaningful for REJ\n");
+#endif
+    break;
+
     default:
       fprintf(stderr, "Unknown app option, ignoring.\n");
     }
@@ -440,6 +456,18 @@ if (bql_grow_step == 0 || bql_grow_step > nb_tx_desc) {
     rte_exit(EXIT_FAILURE,
              "BQL grow step (-G) must be in [1, %u]\n",
              nb_tx_desc);
+}
+#endif
+
+#ifdef REJ
+if (rej_add_step == 0) {
+    rte_exit(EXIT_FAILURE,
+             "REJ add step (-A) must be > 0\n");
+}
+
+if (rej_grow_streak == 0) {
+    rte_exit(EXIT_FAILURE,
+             "REJ grow streak (-K) must be > 0\n");
 }
 #endif
 }
@@ -481,6 +509,15 @@ fprintf(f, "  \"bql_grow_step\": %u,\n",
         bql_grow_step);
 fprintf(f, "  \"bql_limit_min\": %u,\n",
         PAB_LIMIT_MIN);
+#endif
+#ifdef REJ
+fprintf(f, "  \"mechanism\": \"REJ\",\n");
+fprintf(f, "  \"rej_add_step\": %u,\n",
+        rej_add_step);
+fprintf(f, "  \"rej_grow_streak\": %u,\n",
+        rej_grow_streak);
+fprintf(f, "  \"rej_min\": %u,\n",
+        REJ_MIN);
 #endif
 
   fprintf(f, "  \"samples\": %" PRIu64 ",\n", qs->samples);
@@ -984,8 +1021,8 @@ static inline void tx_iteration(struct worker_ctx *ctx, struct pq_pending_q *pq,
  */
 #ifdef REJ
 
-#define REJ_ADD_STEP 8u     /* additive increase per full-success streak */
-#define REJ_GROW_STREAK 32u /* consecutive full bursts before growing */
+static uint32_t rej_add_step = 8u;       /* evaluation parameter */
+static uint32_t rej_grow_streak = 32u;   /* evaluation parameter */
 #define REJ_MIN 1u
 
 struct rej_state {
@@ -1022,8 +1059,8 @@ static inline void rej_feedback(struct rej_state *r, uint16_t attempted,
     return;
   }
 
-  if (++r->success_streak >= REJ_GROW_STREAK) {
-    uint32_t next = r->window + REJ_ADD_STEP;
+  if (++r->success_streak >= rej_grow_streak) {
+    uint32_t next = r->window + rej_add_step;
 
     r->window = RTE_MIN(next, (uint32_t)burst_size);
 
@@ -1050,7 +1087,7 @@ static inline void tx_iteration(struct worker_ctx *ctx, struct rej_state *rs,
 
   s->used = rs->success_streak; /* reused: "how close to growing" */
   s->high_wm = this_window;     /* reused: current predicted capacity */
-  s->observed_step = REJ_ADD_STEP;
+  s->observed_step = rej_add_step;
   s->wm_valid = rs->window > 0;
 
   s->requested = requested;
