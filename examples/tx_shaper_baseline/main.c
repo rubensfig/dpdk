@@ -61,7 +61,7 @@
 #define USED_HIST_MAX 8192
 
 #define GATE_START_SAMPLE 20000
-#define GATE_LEN_SAMPLES 10000
+#define GATE_LEN_SAMPLES 5000
 
 #if defined(COMP) && defined(BQL)
 #error "COMP and BQL cannot both be enabled"
@@ -76,6 +76,7 @@ static uint64_t shaped_rate_bps = 0;  /* rte_tm API, bytes/sec, 0 = disabled */
 static uint64_t legacy_rate_kbps = 0; /* legacy API, kbit/s */
 static int use_tm = 1;         /* default: use rte_tm hierarchical shaper */
 static uint64_t pacing_ns = 0; /* 0 = no pacing, max offered load */
+static uint64_t transient_type = 0; // 0: pause; 1: duty cycle; 2: drain_burst
 /*
  * In synchronized mode, -c is a raw-record capacity, not a stop condition.
  * Statistics continue for the entire common measurement window even if a
@@ -90,8 +91,7 @@ static uint32_t work_packets = WORK_PKTS;
 
 // {
 #ifdef COMP
-#define COMP_RELAX_STREAK 64u
-#define COMP_NEAR_STEPS 2u
+#define COMP_NEAR_STEPS 16u // default
 #define COMP_REDUCED_DIV 4u
 
 struct comp_state {
@@ -143,15 +143,6 @@ static inline bool comp_near_high(const struct comp_state *c, uint32_t used) {
   return distance <= margin;
 }
 
-/*
- * Queue-count units are opaque.
- *
- * We never calculate:
- *
- *     high_wm - used == number of packets available
- *
- * The signal is only used to classify queue pressure.
- */
 static inline uint16_t comp_admit(const struct comp_state *c, uint32_t used,
                                   uint16_t requested) {
   if (requested == 0)
@@ -296,6 +287,7 @@ struct queue_stats {
   uint64_t cycles_tx;
   uint64_t cycles_total;
 };
+
 static struct queue_stats qstats[MAX_TX_QUEUES];
 
 struct sample_record {
@@ -330,6 +322,8 @@ struct sample_record {
   uint64_t cycles_count;
   uint64_t cycles_tx;
   uint64_t cycles_total;
+
+  uint64_t tsc;
 };
 
 struct sample_file_header {
@@ -350,7 +344,7 @@ struct sample_file_header {
 
 static void parse_args(int argc, char **argv) {
   int opt;
-  while ((opt = getopt(argc, argv, "p:n:t:r:b:m:s:c:o:w:d:x:L")) != -1) {
+  while ((opt = getopt(argc, argv, "p:n:t:r:b:m:s:c:o:w:d:x:T:")) != -1) {
     switch (opt) {
     case 'p':
       port_id = (uint16_t)atoi(optarg);
@@ -402,6 +396,9 @@ static void parse_args(int argc, char **argv) {
       break;
     case 'x':
       work_packets = (uint64_t)atoll(optarg);
+      break;
+    case 'T': // transient_type
+      transient_type = (uint64_t)atoll(optarg);
       break;
     default:
       fprintf(stderr, "Unknown app option, ignoring.\n");
@@ -936,371 +933,229 @@ static inline void tx_iteration(struct worker_ctx *ctx, struct pq_pending_q *pq,
 #define REJ_GROW_STREAK 32u /* consecutive full bursts before growing */
 #define REJ_MIN 1u
 
-  struct rej_state {
-    uint32_t window; /* predicted next-burst capacity */
-    uint32_t success_streak;
-    uint64_t reject_count; /* cumulative rejects seen (the other named input) */
-  };
+struct rej_state {
+  uint32_t window; /* predicted next-burst capacity */
+  uint32_t success_streak;
+  uint64_t reject_count; /* cumulative rejects seen (the other named input) */
+};
 
-  static inline void rej_init(struct rej_state * r, uint16_t start_burst) {
-    memset(r, 0, sizeof(*r));
-    r->window =
-        start_burst; /* optimistic: start at the configured burst size */
+static inline void rej_init(struct rej_state *r, uint16_t start_burst) {
+  memset(r, 0, sizeof(*r));
+  r->window = start_burst; /* optimistic: start at the configured burst size */
+}
+
+/* Predict how much to offer this iteration, given what's requested. */
+static inline uint16_t rej_admit(const struct rej_state *r,
+                                 uint16_t requested) {
+  return (uint16_t)RTE_MIN((uint32_t)requested, r->window);
+}
+
+/* Update the window after seeing the actual outcome of this burst. */
+static inline void rej_feedback(struct rej_state *r, uint16_t attempted,
+                                uint16_t sent) {
+  if (attempted == 0) {
+    r->success_streak = 0;
+    r->window = burst_size;
+    return;
   }
 
-  /* Predict how much to offer this iteration, given what's requested. */
-  static inline uint16_t rej_admit(const struct rej_state *r,
-                                   uint16_t requested) {
-    return (uint16_t)RTE_MIN((uint32_t)requested, r->window);
+  if (sent < attempted) {
+    r->reject_count++;
+    r->success_streak = 0;
+
+    r->window = RTE_MAX((uint32_t)sent, (uint32_t)REJ_MIN);
+    return;
   }
 
-  /* Update the window after seeing the actual outcome of this burst. */
-  static inline void rej_feedback(struct rej_state * r, uint16_t attempted,
-                                  uint16_t sent) {
-    if (attempted == 0) {
-      r->success_streak = 0;
-      r->window = burst_size;
-      return;
-    }
+  if (++r->success_streak >= REJ_GROW_STREAK) {
+    uint32_t next = r->window + REJ_ADD_STEP;
 
-    if (sent < attempted) {
-      r->reject_count++;
-      r->success_streak = 0;
+    r->window = RTE_MIN(next, (uint32_t)burst_size);
 
-      r->window = RTE_MAX((uint32_t)sent, (uint32_t)REJ_MIN);
-      return;
-    }
+    r->success_streak = 0;
+  }
+}
 
-    if (++r->success_streak >= REJ_GROW_STREAK) {
-      uint32_t next = r->window + REJ_ADD_STEP;
+static inline void tx_iteration(struct worker_ctx *ctx, struct rej_state *rs,
+                                struct sample_record *s, struct queue_stats *qs,
+                                uint64_t used_hist[USED_HIST_MAX],
+                                uint64_t watermark_hist[USED_HIST_MAX],
+                                bool collect_stats, uint64_t sample_idx,
+                                uint16_t requested, struct rte_mbuf **bufs) {
+  struct sample_record scratch;
+  if (s == NULL)
+    s = &scratch;
+  memset(s, 0, sizeof(*s));
 
-      r->window = RTE_MIN(next, (uint32_t)burst_size);
+  uint64_t iter_start = rte_rdtsc();
 
-      r->success_streak = 0;
-    }
+  uint32_t this_window = rs->window;
+
+  uint16_t to_send = rej_admit(rs, requested);
+
+  s->used = rs->success_streak; /* reused: "how close to growing" */
+  s->high_wm = this_window;     /* reused: current predicted capacity */
+  s->observed_step = REJ_ADD_STEP;
+  s->wm_valid = rs->window > 0;
+
+  s->requested = requested;
+  s->to_send = to_send;
+  s->occupancy_gated = requested - to_send;
+
+  uint16_t sent = 0;
+
+  if (to_send > 0) {
+    uint64_t t2 = rte_rdtsc();
+    sent = rte_eth_tx_burst(port_id, ctx->queue_id, bufs, to_send);
+    uint64_t t3 = rte_rdtsc();
+    s->cycles_tx = t3 - t2;
   }
 
-  static inline void tx_iteration(
-      struct worker_ctx * ctx, struct rej_state * rs, struct sample_record * s,
-      struct queue_stats * qs, uint64_t used_hist[USED_HIST_MAX],
-      uint64_t watermark_hist[USED_HIST_MAX], bool collect_stats,
-      uint64_t sample_idx, uint16_t requested, struct rte_mbuf **bufs) {
-    struct sample_record scratch;
-    if (s == NULL)
-      s = &scratch;
-    memset(s, 0, sizeof(*s));
+  for (uint16_t i = sent; i < requested; i++)
+    rte_pktmbuf_free(bufs[i]);
 
-    uint64_t iter_start = rte_rdtsc();
+  s->sent = sent;
+  s->tx_not_accepted = to_send - sent;
+  s->cycles_total = rte_rdtsc() - iter_start;
 
-    uint32_t this_window = rs->window;
+  if (s->tx_not_accepted > 0) {
+    qs->reject_events++;
+    if (qs->first_reject_sample == UINT64_MAX)
+      qs->first_reject_sample = sample_idx;
+    qs->last_reject_sample = sample_idx;
 
-    uint16_t to_send = rej_admit(rs, requested);
-
-    s->used = rs->success_streak; /* reused: "how close to growing" */
-    s->high_wm = this_window;     /* reused: current predicted capacity */
-    s->observed_step = REJ_ADD_STEP;
-    s->wm_valid = rs->window > 0;
-
-    s->requested = requested;
-    s->to_send = to_send;
-    s->occupancy_gated = requested - to_send;
-
-    uint16_t sent = 0;
-
-    if (to_send > 0) {
-      uint64_t t2 = rte_rdtsc();
-      sent = rte_eth_tx_burst(port_id, ctx->queue_id, bufs, to_send);
-      uint64_t t3 = rte_rdtsc();
-      s->cycles_tx = t3 - t2;
-    }
-
-    for (uint16_t i = sent; i < requested; i++)
-      rte_pktmbuf_free(bufs[i]);
-
-    s->sent = sent;
-    s->tx_not_accepted = to_send - sent;
-    s->cycles_total = rte_rdtsc() - iter_start;
-
-    if (s->tx_not_accepted > 0) {
-      qs->reject_events++;
-      if (qs->first_reject_sample == UINT64_MAX)
-        qs->first_reject_sample = sample_idx;
-      qs->last_reject_sample = sample_idx;
-
-      watermark_hist[RTE_MIN(rs->window, (uint32_t)USED_HIST_MAX - 1)]++;
-    }
-
-    rej_feedback(rs, to_send, sent);
-
-    if (collect_stats) {
-      if (rs->window < USED_HIST_MAX)
-        used_hist[this_window]++;
-
-      qs->last_used = (uint16_t)RTE_MIN(this_window, (uint32_t)UINT16_MAX);
-      if (qs->used_polls == 0) {
-        qs->min_used = qs->max_used = qs->last_used;
-      } else {
-        if (qs->last_used < qs->min_used)
-          qs->min_used = qs->last_used;
-        if (qs->last_used > qs->max_used)
-          qs->max_used = qs->last_used;
-      }
-      qs->sum_used += this_window;
-      qs->used_polls++;
-
-      qs->tx_pkts += sent;
-      qs->tx_bytes += (uint64_t)sent * PKT_LEN;
-      qs->tx_not_accepted += s->tx_not_accepted;
-      qs->app_discarded +=
-          (uint64_t)s->occupancy_gated + (uint64_t)s->tx_not_accepted;
-      qs->occupancy_gated += s->occupancy_gated;
-      qs->cycles_tx += s->cycles_tx;
-      qs->cycles_total += s->cycles_total;
-      qs->samples++;
-    }
+    watermark_hist[RTE_MIN(rs->window, (uint32_t)USED_HIST_MAX - 1)]++;
   }
+
+  rej_feedback(rs, to_send, sent);
+
+  if (collect_stats) {
+    if (rs->window < USED_HIST_MAX)
+      used_hist[this_window]++;
+
+    qs->last_used = (uint16_t)RTE_MIN(this_window, (uint32_t)UINT16_MAX);
+    if (qs->used_polls == 0) {
+      qs->min_used = qs->max_used = qs->last_used;
+    } else {
+      if (qs->last_used < qs->min_used)
+        qs->min_used = qs->last_used;
+      if (qs->last_used > qs->max_used)
+        qs->max_used = qs->last_used;
+    }
+    qs->sum_used += this_window;
+    qs->used_polls++;
+
+    qs->tx_pkts += sent;
+    qs->tx_bytes += (uint64_t)sent * PKT_LEN;
+    qs->tx_not_accepted += s->tx_not_accepted;
+    qs->app_discarded +=
+        (uint64_t)s->occupancy_gated + (uint64_t)s->tx_not_accepted;
+    qs->occupancy_gated += s->occupancy_gated;
+    qs->cycles_tx += s->cycles_tx;
+    qs->cycles_total += s->cycles_total;
+    qs->samples++;
+  }
+}
 
 #endif /* REJ */
 
 /*
  * Execute one offered-load iteration. */
 #ifdef COMP // {
-  static inline void tx_iteration(
-      struct worker_ctx * ctx, struct comp_state * dpab,
-      struct sample_record * s, struct queue_stats * qs,
-      uint64_t used_hist[USED_HIST_MAX], uint64_t watermark_hist[USED_HIST_MAX],
-      bool collect_stats, uint64_t sample_idx, uint16_t requested,
-      struct rte_mbuf **bufs) {
+static inline void tx_iteration(struct worker_ctx *ctx, struct comp_state *dpab,
+                                struct sample_record *s, struct queue_stats *qs,
+                                uint64_t used_hist[USED_HIST_MAX],
+                                uint64_t watermark_hist[USED_HIST_MAX],
+                                bool collect_stats, uint64_t sample_idx,
+                                uint16_t requested, struct rte_mbuf **bufs) {
 
-    struct sample_record scratch;
-    if (s == NULL)
-      s = &scratch;
-    memset(s, 0, sizeof(*s));
+  struct sample_record scratch;
+  if (s == NULL)
+    s = &scratch;
+  memset(s, 0, sizeof(*s));
 
-    uint64_t t0 = rte_rdtsc();
-    int used = rte_eth_tx_queue_count(port_id, ctx->queue_id);
-    uint64_t t1 = rte_rdtsc();
-    s->cycles_count = t1 - t0;
+  uint64_t t0 = rte_rdtsc();
+  int used = rte_eth_tx_queue_count(port_id, ctx->queue_id);
+  uint64_t t1 = rte_rdtsc();
+  s->cycles_count = t1 - t0;
 
-    bool have_used = (used >= 0);
-    uint32_t raw_used = have_used ? (uint32_t)used : 0;
+  bool have_used = (used >= 0);
+  uint32_t raw_used = have_used ? (uint32_t)used : 0;
 
-    if (have_used) {
-      comp_observe(dpab, raw_used);
-
-      if (collect_stats) {
-        if (raw_used < USED_HIST_MAX)
-          used_hist[raw_used]++;
-
-        qs->last_used = (uint16_t)raw_used;
-        if (qs->used_polls == 0) {
-          qs->min_used = qs->max_used = (uint16_t)raw_used;
-        } else {
-          if (raw_used < qs->min_used)
-            qs->min_used = (uint16_t)raw_used;
-          if (raw_used > qs->max_used)
-            qs->max_used = (uint16_t)raw_used;
-        }
-        qs->sum_used += raw_used;
-        qs->used_polls++;
-      }
-    }
-
-    s->used = have_used ? raw_used : UINT32_MAX;
-    s->wm_valid = dpab->wm_valid;
-    s->high_wm = dpab->high_wm;
-    s->observed_step = dpab->observed_step;
-
-    const uint16_t requested = demand ? burst_size : 0;
-    uint16_t to_send =
-        have_used ? comp_admit(dpab, raw_used, requested) : requested;
-
-    s->requested = requested;
-    s->to_send = to_send;
-    s->occupancy_gated = requested - to_send;
-
-    struct rte_mbuf *bufs[MAX_PKT_BURST];
-    uint16_t sent = 0;
-
-    if (to_send > 0) {
-      uint64_t t2 = rte_rdtsc();
-      sent = rte_eth_tx_burst(port_id, ctx->queue_id, bufs, to_send);
-      uint64_t t3 = rte_rdtsc();
-
-      s->cycles_tx = t3 - t2;
-
-      for (uint16_t i = sent; i < requested; i++)
-        rte_pktmbuf_free(bufs[i]);
-    }
-
-    s->sent = sent;
-    s->tx_not_accepted = to_send - sent;
-    s->cycles_total = rte_rdtsc() - t0;
-
-    if (s->tx_not_accepted > 0) {
-      qs->reject_events++;
-
-      if (qs->first_reject_sample == UINT64_MAX)
-        qs->first_reject_sample = sample_idx;
-
-      qs->last_reject_sample = sample_idx;
-    }
-
-    if (have_used) {
-      uint32_t pre_high_wm = dpab->high_wm;
-      bool pre_wm_valid = dpab->wm_valid;
-
-      comp_feedback(dpab, raw_used, to_send, sent);
-
-      if (sent < to_send) {
-        printf("[q=%u sample=%" PRIu64 "] reject: "
-               "used=%u attempted=%u sent=%u step=%u "
-               "pre_high_wm=%u pre_valid=%u "
-               "post_high_wm=%u post_valid=%u\n",
-               ctx->queue_id, sample_idx, raw_used, to_send, sent,
-               dpab->observed_step, pre_high_wm, pre_wm_valid, dpab->high_wm,
-               dpab->wm_valid);
-        watermark_hist[dpab->high_wm]++;
-      }
-
-      if (collect_stats) {
-        qs->tx_pkts += sent;
-        qs->tx_bytes += (uint64_t)sent * PKT_LEN;
-        qs->tx_not_accepted += s->tx_not_accepted;
-        qs->app_discarded += s->tx_not_accepted;
-        qs->occupancy_gated += s->occupancy_gated;
-        qs->cycles_count += s->cycles_count;
-        qs->cycles_tx += s->cycles_tx;
-        qs->samples++;
-      }
-    }
-  }
-#endif // }
-
-#ifdef BQL // {
-#define PAB_INTERVAL_US 20
-  static inline void tx_iteration(
-      struct worker_ctx * ctx, struct pab_bql * cpab, struct sample_record * s,
-      struct queue_stats * qs, uint64_t used_hist[USED_HIST_MAX],
-      uint64_t watermark_hist[USED_HIST_MAX], bool collect_stats,
-      uint64_t sample_idx, uint16_t requested, struct rte_mbuf **bufs) {
-    struct sample_record scratch;
-
-    if (s == NULL)
-      s = &scratch;
-    memset(s, 0, sizeof(*s));
-
-    const uint16_t requested = demand ? burst_size : 0;
-    uint64_t iter_start = rte_rdtsc();
-    uint64_t now_cycles = rte_get_timer_cycles();
-
-    if (now_cycles - cpab->last_tick_cycles >= cpab->tick_cycles) {
-      uint64_t cleanup_start = rte_rdtsc();
-      int freed = rte_eth_tx_done_cleanup(port_id, ctx->queue_id, 0);
-      uint64_t cleanup_end = rte_rdtsc();
-
-      s->cycles_count = cleanup_end - cleanup_start;
-      s->freed = freed;
-
-      uint64_t before_inflight = cpab->num_queued - cpab->num_completed;
-
-      if (freed > 0) {
-        uint64_t completed = cpab->num_completed + (uint64_t)freed;
-
-        cpab->num_completed =
-            completed > cpab->num_queued ? cpab->num_queued : completed;
-
-        uint64_t inflight = cpab->num_queued - cpab->num_completed;
-
-        if (inflight == 0) {
-          cpab->limit += PAB_GROW_STEP;
-          if (cpab->limit > nb_tx_desc)
-            cpab->limit = nb_tx_desc;
-        } else if (inflight >= cpab->limit) {
-          cpab->limit = (cpab->limit > PAB_GROW_STEP)
-                            ? cpab->limit - PAB_GROW_STEP
-                            : PAB_LIMIT_MIN;
-
-          if (cpab->limit < PAB_LIMIT_MIN)
-            cpab->limit = PAB_LIMIT_MIN;
-        }
-      }
-
-      cpab->last_tick_cycles = now_cycles;
-    }
-
-    uint64_t inflight_now = cpab->num_queued - cpab->num_completed;
-    uint32_t bql_space = (cpab->limit > inflight_now)
-                             ? (uint32_t)(cpab->limit - inflight_now)
-                             : 0;
-
-    uint16_t to_send = RTE_MIN(bql_space, requested);
-
-    s->used = inflight_now > UINT32_MAX ? UINT32_MAX : (uint32_t)inflight_now;
-    s->space = bql_space;
-    s->requested = requested;
-    s->limit = cpab->limit;
-    s->to_send = to_send;
-    s->occupancy_gated = requested - to_send;
+  if (have_used) {
+    comp_observe(dpab, raw_used);
 
     if (collect_stats) {
-      if (s->used < USED_HIST_MAX)
-        used_hist[s->used]++;
-      if (cpab->limit < USED_HIST_MAX)
-        watermark_hist[cpab->limit]++;
+      if (raw_used < USED_HIST_MAX)
+        used_hist[raw_used]++;
 
-      qs->last_used = (uint16_t)RTE_MIN(s->used, (uint32_t)UINT16_MAX);
+      qs->last_used = (uint16_t)raw_used;
       if (qs->used_polls == 0) {
-        qs->min_used = qs->max_used = qs->last_used;
+        qs->min_used = qs->max_used = (uint16_t)raw_used;
       } else {
-        if (qs->last_used < qs->min_used)
-          qs->min_used = qs->last_used;
-        if (qs->last_used > qs->max_used)
-          qs->max_used = qs->last_used;
+        if (raw_used < qs->min_used)
+          qs->min_used = (uint16_t)raw_used;
+        if (raw_used > qs->max_used)
+          qs->max_used = (uint16_t)raw_used;
       }
-      qs->sum_used += s->used;
+      qs->sum_used += raw_used;
       qs->used_polls++;
     }
+  }
 
-    struct rte_mbuf *bufs[MAX_PKT_BURST];
-    uint16_t sent = 0;
+  s->used = have_used ? raw_used : UINT32_MAX;
+  s->wm_valid = dpab->wm_valid;
+  s->high_wm = dpab->high_wm;
+  s->observed_step = dpab->observed_step;
 
-    if (!force_quit && to_send > 0 &&
-        rte_pktmbuf_alloc_bulk(ctx->mbuf_pool, bufs, to_send) == 0) {
+  uint16_t to_send =
+      have_used ? comp_admit(dpab, raw_used, requested) : requested;
 
-      for (uint16_t i = 0; i < to_send; i++)
-        fill_dummy_packet(bufs[i]);
+  s->requested = requested;
+  s->to_send = to_send;
+  s->occupancy_gated = requested - to_send;
 
-      uint64_t tx_start = rte_rdtsc();
-      sent = rte_eth_tx_burst(port_id, ctx->queue_id, bufs, to_send);
-      uint64_t tx_end = rte_rdtsc();
-      s->cycles_tx = tx_end - tx_start;
+  uint16_t sent = 0;
 
-      /* Only packets accepted by the PMD become BQL in-flight packets. */
-      cpab->num_queued += sent;
+  if (to_send > 0) {
+    uint64_t t2 = rte_rdtsc();
+    sent = rte_eth_tx_burst(port_id, ctx->queue_id, bufs, to_send);
+    uint64_t t3 = rte_rdtsc();
 
-      for (uint16_t i = sent; i < to_send; i++)
-        rte_pktmbuf_free(bufs[i]);
-    }
+    s->cycles_tx = t3 - t2;
+  }
 
-    s->sent = sent;
-    s->tx_not_accepted = to_send - sent;
-    s->cycles_total = rte_rdtsc() - iter_start;
+  for (uint16_t i = sent; i < requested; i++)
+    rte_pktmbuf_free(bufs[i]);
 
-    if (s->tx_not_accepted > 0) {
-      qs->reject_events++;
-      if (qs->first_reject_sample == UINT64_MAX)
-        qs->first_reject_sample = sample_idx;
-      qs->last_reject_sample = sample_idx;
-    }
+  s->sent = sent;
+  s->tx_not_accepted = to_send - sent;
+  s->cycles_total = rte_rdtsc() - t0;
+
+  if (s->tx_not_accepted > 0) {
+    qs->reject_events++;
+
+    if (qs->first_reject_sample == UINT64_MAX)
+      qs->first_reject_sample = sample_idx;
+
+    qs->last_reject_sample = sample_idx;
+  }
+
+  if (have_used) {
+    uint32_t pre_high_wm = dpab->high_wm;
+    bool pre_wm_valid = dpab->wm_valid;
+
+    comp_feedback(dpab, raw_used, to_send, sent);
 
     if (sent < to_send) {
-      uint64_t observed_full = inflight_now + sent;
-
-      if (observed_full < cpab->limit) {
-        cpab->limit = observed_full < PAB_LIMIT_MIN ? PAB_LIMIT_MIN
-                                                    : (uint32_t)observed_full;
-      }
+      printf("[q=%u sample=%" PRIu64 "] reject: "
+             "used=%u attempted=%u sent=%u step=%u "
+             "pre_high_wm=%u pre_valid=%u "
+             "post_high_wm=%u post_valid=%u\n",
+             ctx->queue_id, sample_idx, raw_used, to_send, sent,
+             dpab->observed_step, pre_high_wm, pre_wm_valid, dpab->high_wm,
+             dpab->wm_valid);
+      watermark_hist[dpab->high_wm]++;
     }
 
     if (collect_stats) {
@@ -1311,375 +1166,548 @@ static inline void tx_iteration(struct worker_ctx *ctx, struct pq_pending_q *pq,
       qs->occupancy_gated += s->occupancy_gated;
       qs->cycles_count += s->cycles_count;
       qs->cycles_tx += s->cycles_tx;
-      qs->cycles_total += s->cycles_total;
       qs->samples++;
     }
   }
+}
 #endif // }
 
-  static int tx_worker_main(void *arg) {
-    struct worker_ctx *ctx = (struct worker_ctx *)arg;
-    uint16_t queue_id = ctx->queue_id;
-    struct queue_stats *qs = &qstats[queue_id];
-    uint64_t used_hist[USED_HIST_MAX] = {0};
-    uint64_t watermark_hist[USED_HIST_MAX] = {0};
+#ifdef BQL // {
+#define PAB_INTERVAL_US 20
+static inline void tx_iteration(struct worker_ctx *ctx, struct pab_bql *cpab,
+                                struct sample_record *s, struct queue_stats *qs,
+                                uint64_t used_hist[USED_HIST_MAX],
+                                uint64_t watermark_hist[USED_HIST_MAX],
+                                bool collect_stats, uint64_t sample_idx,
+                                uint16_t requested, struct rte_mbuf **bufs) {
+  struct sample_record scratch;
 
-#ifdef COMP
-    struct comp_state dpab = {0};
-#endif
-#ifdef BQL
-    struct pab_bql cpab = {0};
-    cpab.num_queued = 0;
-    cpab.num_completed = 0;
-    cpab.limit = nb_tx_desc;
-    cpab.last_tick_cycles = rte_get_timer_cycles();
-    cpab.tick_cycles = (rte_get_timer_hz() / 1000000ULL) * PAB_INTERVAL_US;
-#endif
-#ifdef REJ
-    struct rej_state rjs;
-    rej_init(&rjs, burst_size);
-#endif
-#ifdef PQ
-    struct pq_pending_q pq;
-    pq_pending_init(&pq);
-#endif
+  if (s == NULL)
+    s = &scratch;
+  memset(s, 0, sizeof(*s));
 
-    qs->first_reject_sample = UINT64_MAX;
+  uint64_t iter_start = rte_rdtsc();
+  uint64_t now_cycles = rte_get_timer_cycles();
 
-    /* Barrier 1: all workers are alive before any one of them starts traffic.
-     */
-    uint32_t ready =
-        __atomic_add_fetch(&sync_workers_ready, 1, __ATOMIC_ACQ_REL);
-    if (ready == sync_n_workers) {
-      uint64_t now = rte_rdtsc();
-      global_warmup_start_tsc = now + ms_to_tsc(SYNC_LEAD_MS);
-      global_warmup_end_tsc = global_warmup_start_tsc + ms_to_tsc(warmup_ms);
-      __atomic_store_n(&sync_warmup_schedule_ready, 1, __ATOMIC_RELEASE);
-    }
+  if (now_cycles - cpab->last_tick_cycles >= cpab->tick_cycles) {
+    uint64_t cleanup_start = rte_rdtsc();
+    int freed = rte_eth_tx_done_cleanup(port_id, ctx->queue_id, 0);
+    uint64_t cleanup_end = rte_rdtsc();
 
-    while (!force_quit &&
-           !__atomic_load_n(&sync_warmup_schedule_ready, __ATOMIC_ACQUIRE))
-      rte_pause();
+    s->cycles_count = cleanup_end - cleanup_start;
+    s->freed = freed;
 
-    spin_until_tsc(global_warmup_start_tsc);
+    uint64_t before_inflight = cpab->num_queued - cpab->num_completed;
 
-    while (!force_quit && rte_rdtsc() < global_warmup_end_tsc)
-      ;
+    if (freed > 0) {
+      uint64_t completed = cpab->num_completed + (uint64_t)freed;
 
-    uint32_t warmed =
-        __atomic_add_fetch(&sync_warmup_done, 1, __ATOMIC_ACQ_REL);
-    if (warmed == sync_n_workers) {
-      uint64_t now = rte_rdtsc();
-      global_start_tsc = now + ms_to_tsc(SYNC_LEAD_MS);
-      global_end_tsc = global_start_tsc + ms_to_tsc(measure_ms);
-      __atomic_store_n(&sync_measure_schedule_ready, 1, __ATOMIC_RELEASE);
-    }
+      cpab->num_completed =
+          completed > cpab->num_queued ? cpab->num_queued : completed;
 
-    while (!force_quit &&
-           !__atomic_load_n(&sync_measure_schedule_ready, __ATOMIC_ACQUIRE))
-      rte_pause();
+      uint64_t inflight = cpab->num_queued - cpab->num_completed;
 
-    spin_until_tsc(global_start_tsc);
+      if (inflight == 0) {
+        cpab->limit += PAB_GROW_STEP;
+        if (cpab->limit > nb_tx_desc)
+          cpab->limit = nb_tx_desc;
+      } else if (inflight >= cpab->limit) {
+        cpab->limit = (cpab->limit > PAB_GROW_STEP)
+                          ? cpab->limit - PAB_GROW_STEP
+                          : PAB_LIMIT_MIN;
 
-    uint64_t span = global_end_tsc - global_start_tsc;
-    uint64_t record_start = global_start_tsc + span / 4;
-    uint64_t record_end = global_end_tsc - span / 4;
-
-    uint64_t recorded_samples = 0;
-    uint64_t sample_idx = 0;
-
-    static uint32_t workers_done = 0;
-
-    bool announced_done = false;
-
-    while (!force_quit &&
-           __atomic_load_n(&workers_done, __ATOMIC_ACQUIRE) < sync_n_workers) {
-
-      bool store = recorded_samples < target_samples;
-      struct sample_record *s = store ? &ctx->samples[recorded_samples] : NULL;
-      bool demand = true;
-
-      if (recorded_samples >= GATE_START_SAMPLE &&
-          recorded_samples < GATE_START_SAMPLE + GATE_LEN_SAMPLES)
-        demand = false;
-
-      const uint16_t requested = demand ? burst_size : 0;
-      struct rte_mbuf *bufs[MAX_PKT_BURST];
-
-      if (requested > 0) {
-        if (rte_pktmbuf_alloc_bulk(ctx->mbuf_pool, bufs, requested) != 0)
-          rte_exit(EXIT_FAILURE, "mbuf allocation failed\n");
-
-        for (uint16_t i = 0; i < requested; i++)
-          fill_dummy_packet(bufs[i]);
-      }
-
-#ifdef REJ
-      tx_iteration(ctx, &rjs, s, qs, used_hist, watermark_hist, store,
-                   recorded_samples, requested, bufs);
-#endif
-
-#ifdef COMP
-      tx_iteration(ctx, &dpab, s, qs, used_hist, watermark_hist, store,
-                   recorded_samples, requested, bufs);
-#endif
-
-#ifdef BQL
-      tx_iteration(ctx, &cpab, s, qs, used_hist, watermark_hist, store,
-                   recorded_samples, requested, bufs);
-#endif
-
-#ifdef PQ
-      tx_iteration(ctx, &pq, s, qs, used_hist, watermark_hist, store,
-                   recorded_samples, requested, bufs);
-#endif
-
-      if (store)
-        recorded_samples++;
-
-      if (!announced_done && recorded_samples == target_samples) {
-
-        __atomic_add_fetch(&workers_done, 1, __ATOMIC_ACQ_REL);
-        announced_done = true;
-      }
-
-      sample_idx++;
-    }
-
-    // uint64_t offered_pkts = qs->samples * (uint64_t)burst_size;
-    uint64_t attempted_pkts = qs->tx_pkts + qs->tx_not_accepted;
-
-    uint64_t offered_pkts = attempted_pkts + qs->occupancy_gated;
-
-    double gating_pct = offered_pkts ? 100.0 * (double)qs->occupancy_gated /
-                                           (double)offered_pkts
-                                     : 0.0;
-
-    double rejection_pct =
-        attempted_pkts
-            ? 100.0 * (double)qs->tx_not_accepted / (double)attempted_pkts
-            : 0.0;
-    uint64_t actual_end_tsc = rte_rdtsc();
-
-    double measure_seconds =
-        (double)(actual_end_tsc - global_start_tsc) / (double)rte_get_tsc_hz();
-
-    double tx_pkts_per_second =
-        measure_seconds > 0.0 ? (double)qs->tx_pkts / measure_seconds : 0.0;
-
-    printf("reject_events       : %" PRIu64 "\n", qs->reject_events);
-
-    if (qs->reject_events > 0) {
-      printf("first_reject_sample : %" PRIu64 "\n", qs->first_reject_sample);
-      printf("last_reject_sample  : %" PRIu64 "\n", qs->last_reject_sample);
-    } else {
-      printf("first_reject_sample : none\n");
-      printf("last_reject_sample  : none\n");
-    }
-
-    printf("\n"
-           "========== Queue %u benchmark ==========\n"
-           "samples             : %" PRIu64 "\n"
-           "recorded_samples    : %" PRIu64 "\n"
-           "tx_pkts             : %" PRIu64 "\n"
-           "tx_bytes            : %" PRIu64 "\n"
-           "app_discarded       : %" PRIu64 "\n"
-           "\n"
-           "occupancy_polls     : %" PRIu64 "\n"
-           "polls_per_sample    : %.2f\n"
-           "\n"
-           "occupancy_gated     : %" PRIu64 "\n"
-           "gating_pct          : %.6f\n"
-           "attempted_pkts      : %" PRIu64 "\n"
-           "tx_not_accepted     : %" PRIu64 "\n"
-           "rejection_pct       : %.6f\n"
-           "tx_pkts_per_second  : %.2f\n"
-           "\n"
-           "last_used           : %u\n"
-           "min_used            : %u\n"
-           "max_used            : %u\n"
-           "avg_used            : %.2f\n"
-           "\n"
-           "cycles_count        : %" PRIu64 "\n"
-           "cycles_tx           : %" PRIu64 "\n"
-           "cycles_total        : %" PRIu64 "\n"
-           "\n"
-           "avg_cycles_count    : %.2f\n"
-           "avg_cycles_tx       : %.2f\n"
-           "avg_cycles_total    : %.2f\n"
-           "=========================================\n",
-           queue_id, qs->samples, recorded_samples, qs->tx_pkts, qs->tx_bytes,
-           qs->app_discarded, qs->used_polls,
-           qs->samples ? (double)qs->used_polls / (double)qs->samples : 0.0,
-           qs->occupancy_gated, gating_pct, attempted_pkts, qs->tx_not_accepted,
-           rejection_pct, tx_pkts_per_second, qs->last_used, qs->min_used,
-           qs->max_used,
-           qs->used_polls ? (double)qs->sum_used / (double)qs->used_polls : 0.0,
-           qs->cycles_count, qs->cycles_tx, qs->cycles_total,
-           qs->used_polls ? (double)qs->cycles_count / (double)qs->used_polls
-                          : 0.0,
-           qs->samples ? (double)qs->cycles_tx / (double)qs->samples : 0.0,
-           qs->samples ? (double)qs->cycles_total / (double)qs->samples : 0.0);
-
-    if (qs->samples > recorded_samples) {
-      printf("[q%u] WARNING: raw sample capacity reached: stored %" PRIu64
-             " of %" PRIu64 " measurement iterations. Increase -c to keep "
-             "the complete time series.\n",
-             queue_id, recorded_samples, qs->samples);
-    }
-
-    printf("\nTX queue-count histogram:\n");
-    for (uint32_t i = 0; i < USED_HIST_MAX; i++) {
-      if (used_hist[i] != 0) {
-        printf("queue %d  used=%3u : %" PRIu64 " (%.4f%%)\n", queue_id, i,
-               used_hist[i],
-               qs->used_polls
-                   ? 100.0 * (double)used_hist[i] / (double)qs->used_polls
-                   : 0.0);
+        if (cpab->limit < PAB_LIMIT_MIN)
+          cpab->limit = PAB_LIMIT_MIN;
       }
     }
 
-    printf("\nhigh_wm histogram:\n");
-    for (uint32_t i = 0; i < USED_HIST_MAX; i++) {
-      if (watermark_hist[i] != 0) {
-        printf("queue %d  watermark=%3u : %" PRIu64 " (%.4f%%)\n", queue_id, i,
-               watermark_hist[i],
-               qs->used_polls
-                   ? 100.0 * (double)watermark_hist[i] / (double)qs->used_polls
-                   : 0.0);
-      }
-    }
-
-    write_queue_json(queue_id, qs, recorded_samples, offered_pkts,
-                     attempted_pkts, gating_pct, rejection_pct,
-                     tx_pkts_per_second, used_hist, watermark_hist);
-
-    char fname[300];
-    snprintf(fname, sizeof(fname), "%s_q%u.bin", outfile_base, queue_id);
-
-    FILE *f = fopen(fname, "wb");
-    if (f == NULL) {
-      fprintf(stderr, "[q%u] Could not open %s for writing\n", queue_id, fname);
-    } else {
-      struct sample_file_header hdr = {
-          .magic = SAMPLE_FILE_MAGIC,
-          .version = SAMPLE_FILE_VERSION,
-          .queue_id = queue_id,
-          .record_size = sizeof(struct sample_record),
-          .stats_size = sizeof(struct queue_stats),
-          .num_records = recorded_samples,
-          .nb_tx_desc = nb_tx_desc,
-          .burst_size = burst_size,
-          .timer_hz = rte_get_tsc_hz(),
-      };
-
-      fwrite(&hdr, sizeof(hdr), 1, f);
-      fwrite(qs, sizeof(*qs), 1, f);
-      fwrite(ctx->samples, sizeof(struct sample_record), recorded_samples, f);
-      fclose(f);
-
-      printf("[q%u] wrote %" PRIu64 " raw samples + queue stats to %s "
-             "(record=%zu bytes, stats=%zu bytes)\n",
-             queue_id, recorded_samples, fname, sizeof(struct sample_record),
-             sizeof(struct queue_stats));
-    }
-
-    return 0;
+    cpab->last_tick_cycles = now_cycles;
   }
 
-  int main(int argc, char **argv) {
-    int ret = rte_eal_init(argc, argv);
-    if (ret < 0)
-      rte_exit(EXIT_FAILURE, "EAL init failed\n");
-    argc -= ret;
-    argv += ret;
+  uint64_t inflight_now = cpab->num_queued - cpab->num_completed;
+  uint32_t bql_space =
+      (cpab->limit > inflight_now) ? (uint32_t)(cpab->limit - inflight_now) : 0;
 
-    parse_args(argc, argv);
+  uint16_t to_send = RTE_MIN(bql_space, requested);
 
-    /* ---- Derive tx queue count from worker lcores ---- */
-    unsigned worker_lcores[MAX_TX_QUEUES];
-    unsigned n_workers = 0;
-    unsigned lc;
-    RTE_LCORE_FOREACH_WORKER(lc) {
-      if (n_workers >= MAX_TX_QUEUES) {
-        fprintf(stderr, "Too many worker lcores, capping at %d\n",
-                MAX_TX_QUEUES);
+  s->used = inflight_now > UINT32_MAX ? UINT32_MAX : (uint32_t)inflight_now;
+  s->space = bql_space;
+  s->requested = requested;
+  s->limit = cpab->limit;
+  s->to_send = to_send;
+  s->occupancy_gated = requested - to_send;
+
+  if (collect_stats) {
+    if (s->used < USED_HIST_MAX)
+      used_hist[s->used]++;
+    if (cpab->limit < USED_HIST_MAX)
+      watermark_hist[cpab->limit]++;
+
+    qs->last_used = (uint16_t)RTE_MIN(s->used, (uint32_t)UINT16_MAX);
+    if (qs->used_polls == 0) {
+      qs->min_used = qs->max_used = qs->last_used;
+    } else {
+      if (qs->last_used < qs->min_used)
+        qs->min_used = qs->last_used;
+      if (qs->last_used > qs->max_used)
+        qs->max_used = qs->last_used;
+    }
+    qs->sum_used += s->used;
+    qs->used_polls++;
+  }
+
+  struct rte_mbuf *bufs[MAX_PKT_BURST];
+  uint16_t sent = 0;
+
+  if (!force_quit && to_send > 0 &&
+      rte_pktmbuf_alloc_bulk(ctx->mbuf_pool, bufs, to_send) == 0) {
+
+    for (uint16_t i = 0; i < to_send; i++)
+      fill_dummy_packet(bufs[i]);
+
+    uint64_t tx_start = rte_rdtsc();
+    sent = rte_eth_tx_burst(port_id, ctx->queue_id, bufs, to_send);
+    uint64_t tx_end = rte_rdtsc();
+    s->cycles_tx = tx_end - tx_start;
+
+    /* Only packets accepted by the PMD become BQL in-flight packets. */
+    cpab->num_queued += sent;
+
+    for (uint16_t i = sent; i < to_send; i++)
+      rte_pktmbuf_free(bufs[i]);
+  }
+
+  s->sent = sent;
+  s->tx_not_accepted = to_send - sent;
+  s->cycles_total = rte_rdtsc() - iter_start;
+  s->tsc = rte_rdtsc();
+
+  if (s->tx_not_accepted > 0) {
+    qs->reject_events++;
+    if (qs->first_reject_sample == UINT64_MAX)
+      qs->first_reject_sample = sample_idx;
+    qs->last_reject_sample = sample_idx;
+  }
+
+  if (sent < to_send) {
+    uint64_t observed_full = inflight_now + sent;
+
+    if (observed_full < cpab->limit) {
+      cpab->limit = observed_full < PAB_LIMIT_MIN ? PAB_LIMIT_MIN
+                                                  : (uint32_t)observed_full;
+    }
+  }
+
+  if (collect_stats) {
+    qs->tx_pkts += sent;
+    qs->tx_bytes += (uint64_t)sent * PKT_LEN;
+    qs->tx_not_accepted += s->tx_not_accepted;
+    qs->app_discarded += s->tx_not_accepted;
+    qs->occupancy_gated += s->occupancy_gated;
+    qs->cycles_count += s->cycles_count;
+    qs->cycles_tx += s->cycles_tx;
+    qs->cycles_total += s->cycles_total;
+    qs->samples++;
+  }
+}
+#endif // }
+
+static int tx_worker_main(void *arg) {
+  struct worker_ctx *ctx = (struct worker_ctx *)arg;
+  uint16_t queue_id = ctx->queue_id;
+  struct queue_stats *qs = &qstats[queue_id];
+  uint64_t used_hist[USED_HIST_MAX] = {0};
+  uint64_t watermark_hist[USED_HIST_MAX] = {0};
+
+#ifdef COMP
+  struct comp_state dpab = {0};
+#endif
+#ifdef BQL
+  struct pab_bql cpab = {0};
+  cpab.num_queued = 0;
+  cpab.num_completed = 0;
+  cpab.limit = nb_tx_desc;
+  cpab.last_tick_cycles = rte_get_timer_cycles();
+  cpab.tick_cycles = (rte_get_timer_hz() / 1000000ULL) * PAB_INTERVAL_US;
+#endif
+#ifdef REJ
+  struct rej_state rjs;
+  rej_init(&rjs, burst_size);
+#endif
+#ifdef PQ
+  struct pq_pending_q pq;
+  pq_pending_init(&pq);
+#endif
+
+  qs->first_reject_sample = UINT64_MAX;
+
+  /* Barrier 1: all workers are alive before any one of them starts traffic.
+   */
+  uint32_t ready = __atomic_add_fetch(&sync_workers_ready, 1, __ATOMIC_ACQ_REL);
+  if (ready == sync_n_workers) {
+    uint64_t now = rte_rdtsc();
+    global_warmup_start_tsc = now + ms_to_tsc(SYNC_LEAD_MS);
+    global_warmup_end_tsc = global_warmup_start_tsc + ms_to_tsc(warmup_ms);
+    __atomic_store_n(&sync_warmup_schedule_ready, 1, __ATOMIC_RELEASE);
+  }
+
+  while (!force_quit &&
+         !__atomic_load_n(&sync_warmup_schedule_ready, __ATOMIC_ACQUIRE))
+    rte_pause();
+
+  spin_until_tsc(global_warmup_start_tsc);
+
+  while (!force_quit && rte_rdtsc() < global_warmup_end_tsc)
+    ;
+
+  uint32_t warmed = __atomic_add_fetch(&sync_warmup_done, 1, __ATOMIC_ACQ_REL);
+  if (warmed == sync_n_workers) {
+    uint64_t now = rte_rdtsc();
+    global_start_tsc = now + ms_to_tsc(SYNC_LEAD_MS);
+    global_end_tsc = global_start_tsc + ms_to_tsc(measure_ms);
+    __atomic_store_n(&sync_measure_schedule_ready, 1, __ATOMIC_RELEASE);
+  }
+
+  while (!force_quit &&
+         !__atomic_load_n(&sync_measure_schedule_ready, __ATOMIC_ACQUIRE))
+    rte_pause();
+
+  spin_until_tsc(global_start_tsc);
+
+  uint64_t span = global_end_tsc - global_start_tsc;
+  uint64_t record_start = global_start_tsc + span / 4;
+  uint64_t record_end = global_end_tsc - span / 4;
+
+  uint64_t recorded_samples = 0;
+  uint64_t sample_idx = 0;
+
+  static uint32_t workers_done = 0;
+
+  bool announced_done = false;
+
+  while (!force_quit &&
+         __atomic_load_n(&workers_done, __ATOMIC_ACQUIRE) < sync_n_workers) {
+
+    bool store = recorded_samples < target_samples;
+    struct sample_record *s = store ? &ctx->samples[recorded_samples] : NULL;
+    bool demand = true;
+
+    bool in_transient = recorded_samples >= GATE_START_SAMPLE &&
+                        recorded_samples < GATE_START_SAMPLE + GATE_LEN_SAMPLES;
+
+    uint16_t requested = burst_size;
+    uint16_t drain_burst = 32;
+
+    if (in_transient) {
+      switch (transient_type) {
+      case 0:
+        /*
+         * Full pause:
+         * no new packets are submitted, so the TX queue drains.
+         */
+        requested = 0;
+        break;
+
+      case 1:
+        /*
+         * Duty-cycle drain:
+         * transmit one full burst every 64 iterations.
+         * Equivalent to 25% offered duty cycle.
+         */
+        requested =
+            ((recorded_samples - GATE_START_SAMPLE) % 64 == 0) ? burst_size : 0;
+        break;
+
+      case 2:
+        /*
+         * Partial-load drain:
+         * continuously submit a smaller burst.
+         */
+        requested = RTE_MIN((uint16_t)drain_burst, burst_size);
+        break;
+
+      default:
+        /*
+         * Unknown transient type:
+         * keep normal traffic.
+         */
+        requested = burst_size;
         break;
       }
-      worker_lcores[n_workers++] = lc;
+    }
+    struct rte_mbuf *bufs[MAX_PKT_BURST];
+
+    if (requested > 0) {
+      if (rte_pktmbuf_alloc_bulk(ctx->mbuf_pool, bufs, requested) != 0)
+        rte_exit(EXIT_FAILURE, "mbuf allocation failed\n");
+
+      for (uint16_t i = 0; i < requested; i++)
+        fill_dummy_packet(bufs[i]);
     }
 
-    if (n_workers == 0) {
-      /* Only the main lcore was given (-l <one core>); use it as the
-       * sole TX worker instead of refusing to run. */
-      worker_lcores[0] = rte_lcore_id();
-      n_workers = 1;
-      printf("Only one lcore available; running single TX worker on the "
-             "main lcore.\n");
+#ifdef REJ
+    tx_iteration(ctx, &rjs, s, qs, used_hist, watermark_hist, store,
+                 recorded_samples, requested, bufs);
+#endif
+
+#ifdef COMP
+    tx_iteration(ctx, &dpab, s, qs, used_hist, watermark_hist, store,
+                 recorded_samples, requested, bufs);
+#endif
+
+#ifdef BQL
+    tx_iteration(ctx, &cpab, s, qs, used_hist, watermark_hist, store,
+                 recorded_samples, requested, bufs);
+#endif
+
+#ifdef PQ
+    tx_iteration(ctx, &pq, s, qs, used_hist, watermark_hist, store,
+                 recorded_samples, requested, bufs);
+#endif
+
+    if (store)
+      recorded_samples++;
+
+    if (!announced_done && recorded_samples == target_samples) {
+
+      __atomic_add_fetch(&workers_done, 1, __ATOMIC_ACQ_REL);
+      announced_done = true;
     }
 
-    nb_tx_q = (uint16_t)n_workers;
-    sync_n_workers = n_workers;
-
-    struct rte_mempool *mbuf_pool =
-        rte_pktmbuf_pool_create("MBUF_POOL", MBUF_POOL_SIZE, MBUF_CACHE_SIZE, 0,
-                                RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
-    if (mbuf_pool == NULL)
-      rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
-
-    if (port_init(port_id, mbuf_pool) != 0)
-      rte_exit(EXIT_FAILURE, "Port init failed\n");
-
-    // register_telemetry();
-
-    printf("Port %u up. workers=%u nb_tx_q=%u nb_tx_desc=%u burst=%u "
-           "method=%s shaped_rate=%" PRIu64 " Bps pacing_ns=%" PRIu64 " "
-           "warmup_ms=%" PRIu64 " measure_ms=%" PRIu64 " raw_capacity=%" PRIu64
-           "\n",
-           port_id, n_workers, nb_tx_q, nb_tx_desc, burst_size,
-           use_tm ? "rte_tm" : "legacy", shaped_rate_bps, pacing_ns, warmup_ms,
-           measure_ms, target_samples);
-
-    /* ---- Allocate per-queue sample buffers and launch workers ---- */
-    for (unsigned i = 0; i < n_workers; i++) {
-      uint16_t q = (uint16_t)i;
-
-      struct sample_record *samples =
-          rte_zmalloc("samples", target_samples * sizeof(struct sample_record),
-                      RTE_CACHE_LINE_SIZE);
-
-      if (samples == NULL)
-        rte_exit(EXIT_FAILURE, "Cannot allocate sample buffer for queue %u\n",
-                 q);
-
-      worker_ctx[i].queue_id = q;
-      worker_ctx[i].mbuf_pool = mbuf_pool;
-      worker_ctx[i].samples = samples;
-
-      if (worker_lcores[i] == rte_lcore_id()) {
-        /* Single-worker fallback case: run inline on main lcore. */
-        tx_worker_main(&worker_ctx[i]);
-      } else {
-        ret = rte_eal_remote_launch(tx_worker_main, &worker_ctx[i],
-                                    worker_lcores[i]);
-        if (ret != 0)
-          fprintf(stderr, "Failed to launch worker on lcore %u: %d\n",
-                  worker_lcores[i], ret);
-      }
-    }
-
-    rte_eal_mp_wait_lcore();
-
-    printf("Synchronized windows: warmup=[%" PRIu64 ", %" PRIu64 ") "
-           "measure=[%" PRIu64 ", %" PRIu64 ") measure_cycles=%" PRIu64 "\n",
-           global_warmup_start_tsc, global_warmup_end_tsc, global_start_tsc,
-           global_end_tsc, global_end_tsc - global_start_tsc);
-
-    for (unsigned i = 0; i < n_workers; i++)
-      rte_free(worker_ctx[i].samples);
-
-    rte_eth_dev_stop(port_id);
-    rte_eth_dev_close(port_id);
-    rte_eal_cleanup();
-    return 0;
+    sample_idx++;
   }
+
+  // uint64_t offered_pkts = qs->samples * (uint64_t)burst_size;
+  uint64_t attempted_pkts = qs->tx_pkts + qs->tx_not_accepted;
+
+  uint64_t offered_pkts = attempted_pkts + qs->occupancy_gated;
+
+  double gating_pct =
+      offered_pkts ? 100.0 * (double)qs->occupancy_gated / (double)offered_pkts
+                   : 0.0;
+
+  double rejection_pct = attempted_pkts ? 100.0 * (double)qs->tx_not_accepted /
+                                              (double)attempted_pkts
+                                        : 0.0;
+  uint64_t actual_end_tsc = rte_rdtsc();
+
+  double measure_seconds =
+      (double)(actual_end_tsc - global_start_tsc) / (double)rte_get_tsc_hz();
+
+  double tx_pkts_per_second =
+      measure_seconds > 0.0 ? (double)qs->tx_pkts / measure_seconds : 0.0;
+
+  printf("reject_events       : %" PRIu64 "\n", qs->reject_events);
+
+  if (qs->reject_events > 0) {
+    printf("first_reject_sample : %" PRIu64 "\n", qs->first_reject_sample);
+    printf("last_reject_sample  : %" PRIu64 "\n", qs->last_reject_sample);
+  } else {
+    printf("first_reject_sample : none\n");
+    printf("last_reject_sample  : none\n");
+  }
+
+  printf("\n"
+         "========== Queue %u benchmark ==========\n"
+         "samples             : %" PRIu64 "\n"
+         "recorded_samples    : %" PRIu64 "\n"
+         "tx_pkts             : %" PRIu64 "\n"
+         "tx_bytes            : %" PRIu64 "\n"
+         "app_discarded       : %" PRIu64 "\n"
+         "\n"
+         "occupancy_polls     : %" PRIu64 "\n"
+         "polls_per_sample    : %.2f\n"
+         "\n"
+         "occupancy_gated     : %" PRIu64 "\n"
+         "gating_pct          : %.6f\n"
+         "attempted_pkts      : %" PRIu64 "\n"
+         "tx_not_accepted     : %" PRIu64 "\n"
+         "rejection_pct       : %.6f\n"
+         "tx_pkts_per_second  : %.2f\n"
+         "\n"
+         "last_used           : %u\n"
+         "min_used            : %u\n"
+         "max_used            : %u\n"
+         "avg_used            : %.2f\n"
+         "\n"
+         "cycles_count        : %" PRIu64 "\n"
+         "cycles_tx           : %" PRIu64 "\n"
+         "cycles_total        : %" PRIu64 "\n"
+         "\n"
+         "avg_cycles_count    : %.2f\n"
+         "avg_cycles_tx       : %.2f\n"
+         "avg_cycles_total    : %.2f\n"
+         "=========================================\n",
+         queue_id, qs->samples, recorded_samples, qs->tx_pkts, qs->tx_bytes,
+         qs->app_discarded, qs->used_polls,
+         qs->samples ? (double)qs->used_polls / (double)qs->samples : 0.0,
+         qs->occupancy_gated, gating_pct, attempted_pkts, qs->tx_not_accepted,
+         rejection_pct, tx_pkts_per_second, qs->last_used, qs->min_used,
+         qs->max_used,
+         qs->used_polls ? (double)qs->sum_used / (double)qs->used_polls : 0.0,
+         qs->cycles_count, qs->cycles_tx, qs->cycles_total,
+         qs->used_polls ? (double)qs->cycles_count / (double)qs->used_polls
+                        : 0.0,
+         qs->samples ? (double)qs->cycles_tx / (double)qs->samples : 0.0,
+         qs->samples ? (double)qs->cycles_total / (double)qs->samples : 0.0);
+
+  if (qs->samples > recorded_samples) {
+    printf("[q%u] WARNING: raw sample capacity reached: stored %" PRIu64
+           " of %" PRIu64 " measurement iterations. Increase -c to keep "
+           "the complete time series.\n",
+           queue_id, recorded_samples, qs->samples);
+  }
+
+  printf("\nTX queue-count histogram:\n");
+  for (uint32_t i = 0; i < USED_HIST_MAX; i++) {
+    if (used_hist[i] != 0) {
+      printf("queue %d  used=%3u : %" PRIu64 " (%.4f%%)\n", queue_id, i,
+             used_hist[i],
+             qs->used_polls
+                 ? 100.0 * (double)used_hist[i] / (double)qs->used_polls
+                 : 0.0);
+    }
+  }
+
+  printf("\nhigh_wm histogram:\n");
+  for (uint32_t i = 0; i < USED_HIST_MAX; i++) {
+    if (watermark_hist[i] != 0) {
+      printf("queue %d  watermark=%3u : %" PRIu64 " (%.4f%%)\n", queue_id, i,
+             watermark_hist[i],
+             qs->used_polls
+                 ? 100.0 * (double)watermark_hist[i] / (double)qs->used_polls
+                 : 0.0);
+    }
+  }
+
+  write_queue_json(queue_id, qs, recorded_samples, offered_pkts, attempted_pkts,
+                   gating_pct, rejection_pct, tx_pkts_per_second, used_hist,
+                   watermark_hist);
+
+  char fname[300];
+  snprintf(fname, sizeof(fname), "%s_q%u.bin", outfile_base, queue_id);
+
+  FILE *f = fopen(fname, "wb");
+  if (f == NULL) {
+    fprintf(stderr, "[q%u] Could not open %s for writing\n", queue_id, fname);
+  } else {
+    struct sample_file_header hdr = {
+        .magic = SAMPLE_FILE_MAGIC,
+        .version = SAMPLE_FILE_VERSION,
+        .queue_id = queue_id,
+        .record_size = sizeof(struct sample_record),
+        .stats_size = sizeof(struct queue_stats),
+        .num_records = recorded_samples,
+        .nb_tx_desc = nb_tx_desc,
+        .burst_size = burst_size,
+        .timer_hz = rte_get_tsc_hz(),
+    };
+
+    fwrite(&hdr, sizeof(hdr), 1, f);
+    fwrite(qs, sizeof(*qs), 1, f);
+    fwrite(ctx->samples, sizeof(struct sample_record), recorded_samples, f);
+    fclose(f);
+
+    printf("[q%u] wrote %" PRIu64 " raw samples + queue stats to %s "
+           "(record=%zu bytes, stats=%zu bytes)\n",
+           queue_id, recorded_samples, fname, sizeof(struct sample_record),
+           sizeof(struct queue_stats));
+  }
+
+  return 0;
+}
+
+int main(int argc, char **argv) {
+  int ret = rte_eal_init(argc, argv);
+  if (ret < 0)
+    rte_exit(EXIT_FAILURE, "EAL init failed\n");
+  argc -= ret;
+  argv += ret;
+
+  parse_args(argc, argv);
+
+  /* ---- Derive tx queue count from worker lcores ---- */
+  unsigned worker_lcores[MAX_TX_QUEUES];
+  unsigned n_workers = 0;
+  unsigned lc;
+  RTE_LCORE_FOREACH_WORKER(lc) {
+    if (n_workers >= MAX_TX_QUEUES) {
+      fprintf(stderr, "Too many worker lcores, capping at %d\n", MAX_TX_QUEUES);
+      break;
+    }
+    worker_lcores[n_workers++] = lc;
+  }
+
+  if (n_workers == 0) {
+    /* Only the main lcore was given (-l <one core>); use it as the
+     * sole TX worker instead of refusing to run. */
+    worker_lcores[0] = rte_lcore_id();
+    n_workers = 1;
+    printf("Only one lcore available; running single TX worker on the "
+           "main lcore.\n");
+  }
+
+  nb_tx_q = (uint16_t)n_workers;
+  sync_n_workers = n_workers;
+
+  struct rte_mempool *mbuf_pool =
+      rte_pktmbuf_pool_create("MBUF_POOL", MBUF_POOL_SIZE, MBUF_CACHE_SIZE, 0,
+                              RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
+  if (mbuf_pool == NULL)
+    rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
+
+  if (port_init(port_id, mbuf_pool) != 0)
+    rte_exit(EXIT_FAILURE, "Port init failed\n");
+
+  // register_telemetry();
+
+  printf("Port %u up. workers=%u nb_tx_q=%u nb_tx_desc=%u burst=%u "
+         "method=%s shaped_rate=%" PRIu64 " Bps pacing_ns=%" PRIu64 " "
+         "warmup_ms=%" PRIu64 " measure_ms=%" PRIu64 " raw_capacity=%" PRIu64
+         "\n",
+         port_id, n_workers, nb_tx_q, nb_tx_desc, burst_size,
+         use_tm ? "rte_tm" : "legacy", shaped_rate_bps, pacing_ns, warmup_ms,
+         measure_ms, target_samples);
+
+  /* ---- Allocate per-queue sample buffers and launch workers ---- */
+  for (unsigned i = 0; i < n_workers; i++) {
+    uint16_t q = (uint16_t)i;
+
+    struct sample_record *samples =
+        rte_zmalloc("samples", target_samples * sizeof(struct sample_record),
+                    RTE_CACHE_LINE_SIZE);
+
+    if (samples == NULL)
+      rte_exit(EXIT_FAILURE, "Cannot allocate sample buffer for queue %u\n", q);
+
+    worker_ctx[i].queue_id = q;
+    worker_ctx[i].mbuf_pool = mbuf_pool;
+    worker_ctx[i].samples = samples;
+
+    if (worker_lcores[i] == rte_lcore_id()) {
+      /* Single-worker fallback case: run inline on main lcore. */
+      tx_worker_main(&worker_ctx[i]);
+    } else {
+      ret = rte_eal_remote_launch(tx_worker_main, &worker_ctx[i],
+                                  worker_lcores[i]);
+      if (ret != 0)
+        fprintf(stderr, "Failed to launch worker on lcore %u: %d\n",
+                worker_lcores[i], ret);
+    }
+  }
+
+  rte_eal_mp_wait_lcore();
+
+  printf("Synchronized windows: warmup=[%" PRIu64 ", %" PRIu64 ") "
+         "measure=[%" PRIu64 ", %" PRIu64 ") measure_cycles=%" PRIu64 "\n",
+         global_warmup_start_tsc, global_warmup_end_tsc, global_start_tsc,
+         global_end_tsc, global_end_tsc - global_start_tsc);
+
+  for (unsigned i = 0; i < n_workers; i++)
+    rte_free(worker_ctx[i].samples);
+
+  rte_eth_dev_stop(port_id);
+  rte_eth_dev_close(port_id);
+  rte_eal_cleanup();
+  return 0;
+}
