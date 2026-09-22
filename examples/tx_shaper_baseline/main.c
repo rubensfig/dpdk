@@ -91,7 +91,7 @@ static uint32_t work_packets = WORK_PKTS;
 
 // {
 #ifdef COMP
-#define COMP_NEAR_STEPS 16u // default
+static uint32_t comp_near_steps = 16u;   /* evaluation parameter */
 #define COMP_REDUCED_DIV 4u
 
 struct comp_state {
@@ -138,7 +138,7 @@ static inline bool comp_near_high(const struct comp_state *c, uint32_t used) {
     return false;
 
   uint64_t distance = (uint64_t)c->high_wm - used;
-  uint64_t margin = (uint64_t)c->observed_step * COMP_NEAR_STEPS;
+  uint64_t margin = (uint64_t)c->observed_step * comp_near_steps;
 
   return distance <= margin;
 }
@@ -189,8 +189,8 @@ static inline void comp_feedback(struct comp_state *c, uint32_t used,
 #ifdef BQL
 
 #define PAB_LIMIT_MIN 2u
-#define PAB_GROW_STEP 64u
-#define PAB_INTERVAL_US 10
+static uint32_t bql_grow_step   = 64u;  /* evaluation parameter */
+static uint32_t bql_interval_us = 10u;  /* evaluation parameter */
 
 struct pab_bql {
   uint64_t num_queued;
@@ -345,7 +345,8 @@ struct sample_file_header {
 
 static void parse_args(int argc, char **argv) {
   int opt;
-  while ((opt = getopt(argc, argv, "p:n:t:r:b:m:s:c:o:w:d:x:T:")) != -1) {
+  while ((opt = getopt(argc, argv,
+                     "p:n:t:r:b:m:s:c:o:w:d:x:T:N:I:G:")) != -1) {
     switch (opt) {
     case 'p':
       port_id = (uint16_t)atoi(optarg);
@@ -401,10 +402,46 @@ static void parse_args(int argc, char **argv) {
     case 'T': // transient_type
       transient_type = (uint64_t)atoll(optarg);
       break;
+    case 'N':
+#ifdef COMP
+    comp_near_steps = (uint32_t)strtoul(optarg, NULL, 10);
+#else
+    fprintf(stderr, "-N is only meaningful for COMP\n");
+#endif
+    break;
+
+case 'I':
+#ifdef BQL
+    bql_interval_us = (uint32_t)strtoul(optarg, NULL, 10);
+#else
+    fprintf(stderr, "-I is only meaningful for BQL\n");
+#endif
+    break;
+
+case 'G':
+#ifdef BQL
+    bql_grow_step = (uint32_t)strtoul(optarg, NULL, 10);
+#else
+    fprintf(stderr, "-G is only meaningful for BQL\n");
+#endif
+    break;
     default:
       fprintf(stderr, "Unknown app option, ignoring.\n");
     }
   }
+
+#ifdef BQL
+if (bql_interval_us == 0) {
+    rte_exit(EXIT_FAILURE,
+             "BQL interval (-I) must be > 0 us\n");
+}
+
+if (bql_grow_step == 0 || bql_grow_step > nb_tx_desc) {
+    rte_exit(EXIT_FAILURE,
+             "BQL grow step (-G) must be in [1, %u]\n",
+             nb_tx_desc);
+}
+#endif
 }
 
 static void write_queue_json(uint16_t queue_id, const struct queue_stats *qs,
@@ -428,6 +465,23 @@ static void write_queue_json(uint16_t queue_id, const struct queue_stats *qs,
   fprintf(f, "  \"nb_tx_desc\": %u,\n", nb_tx_desc);
   fprintf(f, "  \"burst_size\": %u,\n", burst_size);
   fprintf(f, "  \"timer_hz\": %" PRIu64 ",\n", rte_get_tsc_hz());
+  #ifdef COMP
+fprintf(f, "  \"mechanism\": \"COMP\",\n");
+fprintf(f, "  \"comp_near_steps\": %u,\n",
+        comp_near_steps);
+fprintf(f, "  \"comp_reduced_div\": %u,\n",
+        COMP_REDUCED_DIV);
+#endif
+
+#ifdef BQL
+fprintf(f, "  \"mechanism\": \"BQL\",\n");
+fprintf(f, "  \"bql_interval_us\": %u,\n",
+        bql_interval_us);
+fprintf(f, "  \"bql_grow_step\": %u,\n",
+        bql_grow_step);
+fprintf(f, "  \"bql_limit_min\": %u,\n",
+        PAB_LIMIT_MIN);
+#endif
 
   fprintf(f, "  \"samples\": %" PRIu64 ",\n", qs->samples);
   fprintf(f, "  \"recorded_samples\": %" PRIu64 ",\n", recorded_samples);
@@ -1208,12 +1262,12 @@ static inline void tx_iteration(struct worker_ctx *ctx, struct pab_bql *cpab,
       uint64_t inflight = cpab->num_queued - cpab->num_completed;
 
       if (inflight == 0) {
-        cpab->limit += PAB_GROW_STEP;
+        cpab->limit += bql_grow_step;
         if (cpab->limit > nb_tx_desc)
           cpab->limit = nb_tx_desc;
       } else if (inflight >= cpab->limit) {
-        cpab->limit = (cpab->limit > PAB_GROW_STEP)
-                          ? cpab->limit - PAB_GROW_STEP
+        cpab->limit = (cpab->limit > bql_grow_step)
+                          ? cpab->limit - bql_grow_step
                           : PAB_LIMIT_MIN;
 
         if (cpab->limit < PAB_LIMIT_MIN)
@@ -1323,7 +1377,8 @@ static int tx_worker_main(void *arg) {
   cpab.num_completed = 0;
   cpab.limit = nb_tx_desc;
   cpab.last_tick_cycles = rte_get_timer_cycles();
-  cpab.tick_cycles = (rte_get_timer_hz() / 1000000ULL) * PAB_INTERVAL_US;
+  cpab.tick_cycles =
+    (rte_get_timer_hz() * (uint64_t)bql_interval_us) / 1000000ULL;
 #endif
 #ifdef REJ
   struct rej_state rjs;
@@ -1620,6 +1675,15 @@ int main(int argc, char **argv) {
   argv += ret;
 
   parse_args(argc, argv);
+  #ifdef COMP
+printf("COMP parameters: near_steps=%u reduced_div=%u\n",
+       comp_near_steps, COMP_REDUCED_DIV);
+#endif
+
+#ifdef BQL
+printf("BQL parameters: interval_us=%u grow_step=%u limit_min=%u\n",
+       bql_interval_us, bql_grow_step, PAB_LIMIT_MIN);
+#endif
 
   /* ---- Derive tx queue count from worker lcores ---- */
   unsigned worker_lcores[MAX_TX_QUEUES];
