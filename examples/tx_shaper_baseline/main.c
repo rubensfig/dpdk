@@ -199,6 +199,7 @@ static inline void comp_feedback(struct comp_state *c, uint32_t used,
 
 #define PAB_LIMIT_MIN 2u
 #define PAB_GROW_STEP 64u
+#define PAB_INTERVAL_US 10
 
 struct pab_bql {
   uint64_t num_queued;
@@ -1178,7 +1179,6 @@ static inline void tx_iteration(struct worker_ctx *ctx, struct pq_pending_q *pq,
 #endif // }
 
 #ifdef BQL // {
-#define PAB_INTERVAL_US 20
   static inline void tx_iteration(
       struct worker_ctx * ctx, struct pab_bql * cpab, struct sample_record * s,
       struct queue_stats * qs, uint64_t used_hist[USED_HIST_MAX],
@@ -1190,7 +1190,6 @@ static inline void tx_iteration(struct worker_ctx *ctx, struct pq_pending_q *pq,
       s = &scratch;
     memset(s, 0, sizeof(*s));
 
-    const uint16_t requested = demand ? burst_size : 0;
     uint64_t iter_start = rte_rdtsc();
     uint64_t now_cycles = rte_get_timer_cycles();
 
@@ -1262,15 +1261,9 @@ static inline void tx_iteration(struct worker_ctx *ctx, struct pq_pending_q *pq,
       qs->used_polls++;
     }
 
-    struct rte_mbuf *bufs[MAX_PKT_BURST];
     uint16_t sent = 0;
 
-    if (!force_quit && to_send > 0 &&
-        rte_pktmbuf_alloc_bulk(ctx->mbuf_pool, bufs, to_send) == 0) {
-
-      for (uint16_t i = 0; i < to_send; i++)
-        fill_dummy_packet(bufs[i]);
-
+    if (to_send > 0) {
       uint64_t tx_start = rte_rdtsc();
       sent = rte_eth_tx_burst(port_id, ctx->queue_id, bufs, to_send);
       uint64_t tx_end = rte_rdtsc();
@@ -1279,9 +1272,10 @@ static inline void tx_iteration(struct worker_ctx *ctx, struct pq_pending_q *pq,
       /* Only packets accepted by the PMD become BQL in-flight packets. */
       cpab->num_queued += sent;
 
-      for (uint16_t i = sent; i < to_send; i++)
-        rte_pktmbuf_free(bufs[i]);
     }
+
+      for (uint16_t i = sent; i < requested; i++)
+        rte_pktmbuf_free(bufs[i]);
 
     s->sent = sent;
     s->tx_not_accepted = to_send - sent;
