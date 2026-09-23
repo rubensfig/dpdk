@@ -89,6 +89,13 @@ static uint64_t measure_ms = 100;
 static char outfile_base[256] = "samples";
 static uint32_t work_packets = WORK_PKTS;
 
+
+#ifdef REJ
+static uint32_t rej_add_step = 8u;       /* evaluation parameter */
+static uint32_t rej_grow_streak = 32u;   /* evaluation parameter */
+#define REJ_MIN 1u
+#endif
+
 // {
 #ifdef COMP
 static uint32_t comp_near_steps = 16u;   /* evaluation parameter */
@@ -816,7 +823,7 @@ static inline void spin_until_tsc(uint64_t deadline) {
  *
  */
 #ifndef PQ_PENDING_MAX
-#define PQ_PENDING_MAX 4096
+#define PQ_PENDING_MAX 512
 #endif
 
 #if (PQ_PENDING_MAX == 0) || ((PQ_PENDING_MAX & (PQ_PENDING_MAX - 1u)) != 0)
@@ -1020,10 +1027,6 @@ static inline void tx_iteration(struct worker_ctx *ctx, struct pq_pending_q *pq,
  *
  */
 #ifdef REJ
-
-static uint32_t rej_add_step = 8u;       /* evaluation parameter */
-static uint32_t rej_grow_streak = 32u;   /* evaluation parameter */
-#define REJ_MIN 1u
 
 struct rej_state {
   uint32_t window; /* predicted next-burst capacity */
@@ -1394,7 +1397,6 @@ static inline void tx_iteration(struct worker_ctx *ctx, struct pab_bql *cpab,
       qs->cycles_total += s->cycles_total;
       qs->samples++;
     }
-  }
 }
 #endif // }
 
