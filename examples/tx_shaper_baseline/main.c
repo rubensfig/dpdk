@@ -1261,6 +1261,7 @@ static inline void tx_iteration(struct worker_ctx *ctx, struct comp_state *dpab,
       qs->occupancy_gated += s->occupancy_gated;
       qs->cycles_count += s->cycles_count;
       qs->cycles_tx += s->cycles_tx;
+      qs->cycles_total += s->cycles_total;
       qs->samples++;
     }
   }
