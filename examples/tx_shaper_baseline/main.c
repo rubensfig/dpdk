@@ -61,7 +61,7 @@
 #define USED_HIST_MAX 8192
 
 #define GATE_START_SAMPLE 20000
-#define GATE_LEN_SAMPLES 5000
+#define GATE_LEN_SAMPLES 400000
 
 #if defined(COMP) && defined(BQL)
 #error "COMP and BQL cannot both be enabled"
@@ -89,6 +89,7 @@ static uint64_t measure_ms = 100;
 static char outfile_base[256] = "samples";
 static uint32_t work_packets = WORK_PKTS;
 
+static uint32_t duty_cycle = 1;
 
 #ifdef REJ
 static uint32_t rej_add_step = 8u;       /* evaluation parameter */
@@ -99,7 +100,6 @@ static uint32_t rej_grow_streak = 32u;   /* evaluation parameter */
 // {
 #ifdef COMP
 static uint32_t comp_near_steps = 16u;   /* evaluation parameter */
-#define COMP_REDUCED_DIV 4u
 
 struct comp_state {
   uint32_t high_wm;
@@ -162,20 +162,24 @@ static inline uint16_t comp_admit(const struct comp_state *c, uint32_t used,
     return 0;
 
   if (comp_near_high(c, used)) {
-    uint16_t reduced = requested / COMP_REDUCED_DIV;
 
+    // uint16_t reduced = requested / COMP_REDUCED_DIV;
+    uint16_t reduced = (uint16_t)(c->high_wm - used);
     if (reduced == 0)
       reduced = 1;
 
-    return reduced;
+    return RTE_MIN(requested, reduced);
   }
 
   return requested;
 }
+
 static inline void comp_feedback(struct comp_state *c, uint32_t used,
                                  uint16_t attempted, uint16_t sent) {
   if (attempted == 0)
     return;
+
+  uint32_t observed = used + sent;
 
   if (sent < attempted) {
     if (c->observed_step == 0)
@@ -186,6 +190,12 @@ static inline void comp_feedback(struct comp_state *c, uint32_t used,
 
     c->wm_valid = true;
     return;
+  }
+
+  /* Successful probe gives a lower-bound observation. */
+  if (!c->wm_valid || observed > c->high_wm) {
+        c->high_wm = observed;
+        c->wm_valid = true;
   }
 }
 
@@ -353,7 +363,7 @@ struct sample_file_header {
 static void parse_args(int argc, char **argv) {
   int opt;
   while ((opt = getopt(argc, argv,
-                     "p:n:t:r:b:m:s:c:o:w:d:x:T:N:I:G:A:K:")) != -1) {
+                     "p:n:t:r:b:m:s:c:o:w:d:x:T:N:I:G:A:K:D:")) != -1) {
     switch (opt) {
     case 'p':
       port_id = (uint16_t)atoi(optarg);
@@ -448,6 +458,10 @@ case 'K':
 #endif
     break;
 
+case 'D':
+    duty_cycle = (uint64_t)atoll(optarg);
+    break;
+
     default:
       fprintf(stderr, "Unknown app option, ignoring.\n");
     }
@@ -500,6 +514,7 @@ static void write_queue_json(uint16_t queue_id, const struct queue_stats *qs,
   fprintf(f, "  \"nb_tx_desc\": %u,\n", nb_tx_desc);
   fprintf(f, "  \"burst_size\": %u,\n", burst_size);
   fprintf(f, "  \"timer_hz\": %" PRIu64 ",\n", rte_get_tsc_hz());
+  fprintf(f, "  \"duty_cycle\": %" PRIu64 ",\n", duty_cycle);
   #ifdef COMP
 fprintf(f, "  \"mechanism\": \"COMP\",\n");
 fprintf(f, "  \"comp_near_steps\": %u,\n",
@@ -1084,6 +1099,8 @@ static inline void tx_iteration(struct worker_ctx *ctx, struct rej_state *rs,
 
   uint64_t iter_start = rte_rdtsc();
 
+  s->tsc  = iter_start;
+
   uint32_t this_window = rs->window;
 
   uint16_t to_send = rej_admit(rs, requested);
@@ -1169,7 +1186,9 @@ static inline void tx_iteration(struct worker_ctx *ctx, struct comp_state *dpab,
     s = &scratch;
   memset(s, 0, sizeof(*s));
 
+
   uint64_t t0 = rte_rdtsc();
+  s->tsc  = t0;
   int used = rte_eth_tx_queue_count(port_id, ctx->queue_id);
   uint64_t t1 = rte_rdtsc();
   s->cycles_count = t1 - t0;
@@ -1243,6 +1262,7 @@ static inline void tx_iteration(struct worker_ctx *ctx, struct comp_state *dpab,
     comp_feedback(dpab, raw_used, to_send, sent);
 
     if (sent < to_send) {
+	    /*
       printf("[q=%u sample=%" PRIu64 "] reject: "
              "used=%u attempted=%u sent=%u step=%u "
              "pre_high_wm=%u pre_valid=%u "
@@ -1250,6 +1270,7 @@ static inline void tx_iteration(struct worker_ctx *ctx, struct comp_state *dpab,
              ctx->queue_id, sample_idx, raw_used, to_send, sent,
              dpab->observed_step, pre_high_wm, pre_wm_valid, dpab->high_wm,
              dpab->wm_valid);
+	     */
       watermark_hist[dpab->high_wm]++;
     }
 
@@ -1474,16 +1495,20 @@ static int tx_worker_main(void *arg) {
   static uint32_t workers_done = 0;
 
   bool announced_done = false;
+  uint64_t next_duty_tx = 0;
+  bool was_in_transient = false;
 
   while (!force_quit &&
          __atomic_load_n(&workers_done, __ATOMIC_ACQUIRE) < sync_n_workers) {
 
     bool store = recorded_samples < target_samples;
     struct sample_record *s = store ? &ctx->samples[recorded_samples] : NULL;
-    bool demand = true;
 
     bool in_transient = recorded_samples >= GATE_START_SAMPLE &&
                         recorded_samples < GATE_START_SAMPLE + GATE_LEN_SAMPLES;
+
+    if (in_transient && !was_in_transient)
+	 next_duty_tx = rte_rdtsc();
 
     uint16_t requested = burst_size;
     uint16_t drain_burst = 32;
@@ -1499,13 +1524,37 @@ static int tx_worker_main(void *arg) {
         break;
 
       case 1:
-        /*
-         * Duty-cycle drain:
-         * transmit one full burst every 64 iterations.
-         * Equivalent to 25% offered duty cycle.
-         */
-        requested =
-            ((recorded_samples - GATE_START_SAMPLE) % 64 == 0) ? burst_size : 0;
+	    uint64_t now = rte_rdtsc();
+    uint64_t hz = rte_get_tsc_hz();
+
+    const uint64_t on_cycles  = hz * duty_cycle  / 1000;
+    const uint64_t off_cycles = hz * duty_cycle  / 1000;
+
+    static uint64_t next_transition = 0;
+    static int tx_enabled = 1;
+
+    if (unlikely(next_transition == 0)) {
+        next_transition = now + on_cycles;
+        tx_enabled = 1;
+    }
+
+    if (unlikely(now >= next_transition)) {
+        if (tx_enabled) {
+            /* ON -> OFF */
+            tx_enabled = 0;
+            next_transition = now + off_cycles;
+        } else {
+            /* OFF -> ON */
+            tx_enabled = 1;
+            next_transition = now + on_cycles;
+        }
+    }
+
+    if (tx_enabled)
+        requested = burst_size;
+    else
+        requested = 0;
+
         break;
 
       case 2:
@@ -1524,7 +1573,8 @@ static int tx_worker_main(void *arg) {
         requested = burst_size;
         break;
       }
-    }
+    }     
+    
     struct rte_mbuf *bufs[MAX_PKT_BURST];
 
     if (requested > 0) {
@@ -1600,6 +1650,7 @@ static int tx_worker_main(void *arg) {
   printf("\n"
          "========== Queue %u benchmark ==========\n"
          "samples             : %" PRIu64 "\n"
+         "duty_cycle          : %d\n"
          "recorded_samples    : %" PRIu64 "\n"
          "tx_pkts             : %" PRIu64 "\n"
          "tx_bytes            : %" PRIu64 "\n"
@@ -1628,7 +1679,7 @@ static int tx_worker_main(void *arg) {
          "avg_cycles_tx       : %.2f\n"
          "avg_cycles_total    : %.2f\n"
          "=========================================\n",
-         queue_id, qs->samples, recorded_samples, qs->tx_pkts, qs->tx_bytes,
+         queue_id, qs->samples, duty_cycle, recorded_samples, qs->tx_pkts, qs->tx_bytes,
          qs->app_discarded, qs->used_polls,
          qs->samples ? (double)qs->used_polls / (double)qs->samples : 0.0,
          qs->occupancy_gated, gating_pct, attempted_pkts, qs->tx_not_accepted,
