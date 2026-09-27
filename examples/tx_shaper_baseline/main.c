@@ -60,8 +60,8 @@
 #define MAX_TX_QUEUES 64
 #define USED_HIST_MAX 8192
 
-#define GATE_START_SAMPLE 20000
-#define GATE_LEN_SAMPLES 400000
+#define GATE_START_SAMPLE 10000
+#define GATE_LEN_SAMPLES 20000
 
 #if defined(COMP) && defined(BQL)
 #error "COMP and BQL cannot both be enabled"
@@ -85,7 +85,7 @@ static uint64_t transient_type = 0; // 0: pause; 1: duty cycle; 2: drain_burst
  */
 static uint64_t target_samples = 1000000;
 static uint64_t warmup_ms = 100;
-static uint64_t measure_ms = 100;
+static uint64_t measure_ms = 800;
 static char outfile_base[256] = "samples";
 static uint32_t work_packets = WORK_PKTS;
 
@@ -519,8 +519,6 @@ static void write_queue_json(uint16_t queue_id, const struct queue_stats *qs,
 fprintf(f, "  \"mechanism\": \"COMP\",\n");
 fprintf(f, "  \"comp_near_steps\": %u,\n",
         comp_near_steps);
-fprintf(f, "  \"comp_reduced_div\": %u,\n",
-        COMP_REDUCED_DIV);
 #endif
 
 #ifdef BQL
@@ -1483,6 +1481,13 @@ static int tx_worker_main(void *arg) {
          !__atomic_load_n(&sync_measure_schedule_ready, __ATOMIC_ACQUIRE))
     rte_pause();
 
+
+uint64_t transient_start =
+    global_start_tsc + ms_to_tsc(50);
+
+uint64_t transient_end =
+    transient_start + ms_to_tsc(100);
+
   spin_until_tsc(global_start_tsc);
 
   uint64_t span = global_end_tsc - global_start_tsc;
@@ -1499,13 +1504,21 @@ static int tx_worker_main(void *arg) {
   bool was_in_transient = false;
 
   while (!force_quit &&
-         __atomic_load_n(&workers_done, __ATOMIC_ACQUIRE) < sync_n_workers) {
+  //       __atomic_load_n(&workers_done, __ATOMIC_ACQUIRE) < sync_n_workers ) {
+         rte_rdtsc() < global_end_tsc) {
 
     bool store = recorded_samples < target_samples;
     struct sample_record *s = store ? &ctx->samples[recorded_samples] : NULL;
 
+    /*
     bool in_transient = recorded_samples >= GATE_START_SAMPLE &&
                         recorded_samples < GATE_START_SAMPLE + GATE_LEN_SAMPLES;
+			*/
+	uint64_t now = rte_rdtsc();
+
+	bool in_transient =
+	    now >= transient_start &&
+	    now < transient_end;
 
     if (in_transient && !was_in_transient)
 	 next_duty_tx = rte_rdtsc();
@@ -1608,11 +1621,11 @@ static int tx_worker_main(void *arg) {
     if (store)
       recorded_samples++;
 
-    if (!announced_done && recorded_samples == target_samples) {
+    // if (!announced_done && recorded_samples == target_samples) {
 
-      __atomic_add_fetch(&workers_done, 1, __ATOMIC_ACQ_REL);
-      announced_done = true;
-    }
+    //   __atomic_add_fetch(&workers_done, 1, __ATOMIC_ACQ_REL);
+    //   announced_done = true;
+    // }
 
     sample_idx++;
   }
@@ -1767,8 +1780,8 @@ int main(int argc, char **argv) {
 
   parse_args(argc, argv);
   #ifdef COMP
-printf("COMP parameters: near_steps=%u reduced_div=%u\n",
-       comp_near_steps, COMP_REDUCED_DIV);
+printf("COMP parameters: near_steps=%u\n",
+       comp_near_steps);
 #endif
 
 #ifdef BQL
