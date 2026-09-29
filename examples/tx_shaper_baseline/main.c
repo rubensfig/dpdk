@@ -910,6 +910,8 @@ static inline void tx_iteration(struct worker_ctx *ctx, struct pq_pending_q *pq,
   memset(s, 0, sizeof(*s));
 
   uint64_t iter_start = rte_rdtsc();
+
+  s->tsc  = iter_start;
   uint64_t tx_cycles = 0;
 
   /* Drain pending first, exactly like the mixed-thread PRIOBP path. */
