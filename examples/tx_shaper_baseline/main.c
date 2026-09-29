@@ -89,7 +89,7 @@ static uint64_t measure_ms = 800;
 static char outfile_base[256] = "samples";
 static uint32_t work_packets = WORK_PKTS;
 
-static uint32_t duty_cycle = 1;
+static uint32_t period_ms = 1;
 
 #ifdef REJ
 static uint32_t rej_add_step = 8u;       /* evaluation parameter */
@@ -161,15 +161,9 @@ static inline uint16_t comp_admit(const struct comp_state *c, uint32_t used,
   if (used >= c->high_wm)
     return 0;
 
-  if (comp_near_high(c, used)) {
-
-    // uint16_t reduced = requested / COMP_REDUCED_DIV;
     uint16_t reduced = (uint16_t)(c->high_wm - used);
-    if (reduced == 0)
-      reduced = 1;
 
     return RTE_MIN(requested, reduced);
-  }
 
   return requested;
 }
@@ -459,7 +453,7 @@ case 'K':
     break;
 
 case 'D':
-    duty_cycle = (uint64_t)atoll(optarg);
+    period_ms = (uint64_t)atoll(optarg);
     break;
 
     default:
@@ -498,7 +492,10 @@ static void write_queue_json(uint16_t queue_id, const struct queue_stats *qs,
                              uint64_t attempted_pkts, double gating_pct,
                              double rejection_pct, double tx_pkts_per_second,
                              const uint64_t used_hist[USED_HIST_MAX],
-                             const uint64_t watermark_hist[USED_HIST_MAX]) {
+                             const uint64_t watermark_hist[USED_HIST_MAX],
+			     uint64_t transient_start,
+			     uint64_t transient_end
+			     ) {
   char fname[300];
   snprintf(fname, sizeof(fname), "%s_q%u.json", outfile_base, queue_id);
 
@@ -514,7 +511,9 @@ static void write_queue_json(uint16_t queue_id, const struct queue_stats *qs,
   fprintf(f, "  \"nb_tx_desc\": %u,\n", nb_tx_desc);
   fprintf(f, "  \"burst_size\": %u,\n", burst_size);
   fprintf(f, "  \"timer_hz\": %" PRIu64 ",\n", rte_get_tsc_hz());
-  fprintf(f, "  \"duty_cycle\": %" PRIu64 ",\n", duty_cycle);
+  fprintf(f, "  \"period_ms\": %" PRIu64 ",\n", period_ms);
+  fprintf(f, "  \"transient_start\": %" PRIu64 ",\n", transient_start);
+  fprintf(f, "  \"transient_end\": %" PRIu64 ",\n", transient_end);
   #ifdef COMP
 fprintf(f, "  \"mechanism\": \"COMP\",\n");
 fprintf(f, "  \"comp_near_steps\": %u,\n",
@@ -1428,6 +1427,8 @@ static int tx_worker_main(void *arg) {
   struct queue_stats *qs = &qstats[queue_id];
   uint64_t used_hist[USED_HIST_MAX] = {0};
   uint64_t watermark_hist[USED_HIST_MAX] = {0};
+  uint64_t transient_start = 0; 
+  uint64_t transient_end = 0; 
 
 #ifdef COMP
   struct comp_state dpab = {0};
@@ -1484,10 +1485,10 @@ static int tx_worker_main(void *arg) {
     rte_pause();
 
 
-uint64_t transient_start =
+transient_start =
     global_start_tsc + ms_to_tsc(50);
 
-uint64_t transient_end =
+transient_end =
     transient_start + ms_to_tsc(100);
 
   spin_until_tsc(global_start_tsc);
@@ -1542,8 +1543,8 @@ uint64_t transient_end =
 	    uint64_t now = rte_rdtsc();
     uint64_t hz = rte_get_tsc_hz();
 
-    const uint64_t on_cycles  = hz * duty_cycle  / 1000;
-    const uint64_t off_cycles = hz * duty_cycle  / 1000;
+    const uint64_t on_cycles  = hz * period_ms  / 1000;
+    const uint64_t off_cycles = hz * period_ms  / 1000;
 
     static uint64_t next_transition = 0;
     static int tx_enabled = 1;
@@ -1665,7 +1666,7 @@ uint64_t transient_end =
   printf("\n"
          "========== Queue %u benchmark ==========\n"
          "samples             : %" PRIu64 "\n"
-         "duty_cycle          : %d\n"
+         "period_ms          : %d\n"
          "recorded_samples    : %" PRIu64 "\n"
          "tx_pkts             : %" PRIu64 "\n"
          "tx_bytes            : %" PRIu64 "\n"
@@ -1694,7 +1695,7 @@ uint64_t transient_end =
          "avg_cycles_tx       : %.2f\n"
          "avg_cycles_total    : %.2f\n"
          "=========================================\n",
-         queue_id, qs->samples, duty_cycle, recorded_samples, qs->tx_pkts, qs->tx_bytes,
+         queue_id, qs->samples, period_ms, recorded_samples, qs->tx_pkts, qs->tx_bytes,
          qs->app_discarded, qs->used_polls,
          qs->samples ? (double)qs->used_polls / (double)qs->samples : 0.0,
          qs->occupancy_gated, gating_pct, attempted_pkts, qs->tx_not_accepted,
@@ -1738,7 +1739,7 @@ uint64_t transient_end =
 
   write_queue_json(queue_id, qs, recorded_samples, offered_pkts, attempted_pkts,
                    gating_pct, rejection_pct, tx_pkts_per_second, used_hist,
-                   watermark_hist);
+                   watermark_hist, transient_start, transient_end);
 
   char fname[300];
   snprintf(fname, sizeof(fname), "%s_q%u.bin", outfile_base, queue_id);
