@@ -823,6 +823,128 @@ static inline void spin_until_tsc(uint64_t deadline) {
     rte_pause();
 }
 
+#ifdef NONE
+/*
+ */
+#ifndef PQ_PENDING_MAX
+#define PQ_PENDING_MAX 512
+#endif
+
+struct pq_pending_q {
+  struct rte_mbuf *pkts[PQ_PENDING_MAX];
+  uint32_t head;
+  uint32_t tail;
+  uint32_t cnt;
+};
+static inline void pq_pending_init(struct pq_pending_q *q) {
+  memset(q, 0, sizeof(*q));
+}
+
+static inline void tx_iteration(struct worker_ctx *ctx, struct pq_pending_q *pq,
+                                struct sample_record *s, struct queue_stats *qs,
+                                uint64_t used_hist[USED_HIST_MAX],
+                                uint64_t watermark_hist[USED_HIST_MAX],
+                                bool collect_stats, uint64_t sample_idx,
+                                uint16_t requested, struct rte_mbuf **bufs) {
+  struct sample_record scratch;
+  if (s == NULL)
+    s = &scratch;
+  memset(s, 0, sizeof(*s));
+
+  uint64_t iter_start = rte_rdtsc();
+
+  s->tsc  = iter_start;
+  uint64_t tx_cycles = 0;
+
+  uint32_t used = 0;
+  uint32_t headroom = 0;
+  uint16_t to_send = requested;
+
+  s->used = used;
+  s->space = headroom;
+  s->limit = nb_tx_desc;
+  s->requested = requested;
+  s->to_send = to_send;
+  s->occupancy_gated = requested - to_send;
+
+  uint16_t fresh_sent = 0;
+  if (to_send > 0) {
+    uint64_t t0 = rte_rdtsc();
+    fresh_sent = rte_eth_tx_burst(port_id, ctx->queue_id, bufs, to_send);
+    uint64_t t1 = rte_rdtsc();
+    tx_cycles += t1 - t0;
+  }
+
+  for (uint16_t i = fresh_sent; i < requested; i++)
+    rte_pktmbuf_free(bufs[i]);
+
+  /*
+   *          */
+  uint16_t fresh_rejected = to_send - fresh_sent;
+
+  s->sent = fresh_sent;
+  s->tx_not_accepted = fresh_rejected;
+  s->cycles_tx = tx_cycles;
+  s->cycles_total = rte_rdtsc() - iter_start;
+
+  if (fresh_rejected > 0) {
+    qs->reject_events++;
+
+    if (qs->first_reject_sample == UINT64_MAX)
+      qs->first_reject_sample = sample_idx;
+
+    qs->last_reject_sample = sample_idx;
+
+    uint32_t occ = RTE_MIN(pq->cnt, (uint32_t)USED_HIST_MAX - 1u);
+
+    watermark_hist[occ]++;
+  }
+
+  if (collect_stats) {
+    if (used < USED_HIST_MAX)
+      used_hist[used]++;
+
+    qs->last_used = (uint16_t)RTE_MIN(used, (uint32_t)UINT16_MAX);
+
+    if (qs->used_polls == 0) {
+      qs->min_used = qs->max_used = qs->last_used;
+    } else {
+      if (qs->last_used < qs->min_used)
+        qs->min_used = qs->last_used;
+
+      if (qs->last_used > qs->max_used)
+        qs->max_used = qs->last_used;
+    }
+
+    qs->sum_used += used;
+    qs->used_polls++;
+
+    /*
+     *      * Successful retries are real TX throughput, even though they are
+     * not
+     *           * part of the fresh-burst sample fields above.
+     *                */
+    qs->tx_pkts += (uint64_t)fresh_sent;
+    qs->tx_bytes += (fresh_sent) * PKT_LEN;
+
+    qs->tx_not_accepted += fresh_rejected;
+    qs->occupancy_gated += s->occupancy_gated;
+
+    /*
+     *      * Only synthetic fresh packets gated due to missing upstream
+     * scheduler
+     *           * are actually discarded by the benchmark.
+     *                */
+    qs->app_discarded += s->occupancy_gated;
+
+    qs->cycles_tx += s->cycles_tx;
+    qs->cycles_total += s->cycles_total;
+    qs->samples++;
+  }
+}
+
+#endif
+
 #ifdef PQ
 /*
  * PQ: software pending-queue backpressure, matching MIXED_THREAD_PRIOBP_STATS.
@@ -873,7 +995,7 @@ static inline void pq_pending_enqueue_burst(struct pq_pending_q *q,
                                             uint16_t nb_mbufs) {
   for (uint16_t i = 0; i < nb_mbufs; i++) {
     /* Fresh work is capped by headroom before TX, so this should not fire. */
-    if (q->cnt == PQ_PENDING_MAX) {
+    if (q->cnt >= PQ_PENDING_MAX) {
       rte_pktmbuf_free(mbufs[i]);
       continue;
     }
@@ -1446,7 +1568,7 @@ static int tx_worker_main(void *arg) {
   struct rej_state rjs;
   rej_init(&rjs, burst_size);
 #endif
-#ifdef PQ
+#if defined(PQ) || defined(NONE)
   struct pq_pending_q pq;
   pq_pending_init(&pq);
 #endif
@@ -1616,7 +1738,7 @@ transient_end =
                  recorded_samples, requested, bufs);
 #endif
 
-#ifdef PQ
+#if defined(PQ) || defined(NONE)
     tx_iteration(ctx, &pq, s, qs, used_hist, watermark_hist, store,
                  recorded_samples, requested, bufs);
 #endif
