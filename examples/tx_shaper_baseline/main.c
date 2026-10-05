@@ -1078,7 +1078,7 @@ static void print_queue_summary(uint16_t queue_id, const struct queue_stats *qs,
   }
 
   printf("\n"
-         "========== Queue %u benchmark (%s) ==========\n"
+         "========== Queue %u benchmark ==========\n"
          "samples             : %" PRIu64 "\n"
          "period_ms           : %u\n"
          "recorded_samples    : %" PRIu64 "\n"
@@ -1109,7 +1109,7 @@ static void print_queue_summary(uint16_t queue_id, const struct queue_stats *qs,
          "avg_cycles_tx       : %.2f\n"
          "avg_cycles_total    : %.2f\n"
          "=========================================\n",
-         queue_id, MECHANISM, qs->samples, period_ms, recorded_samples,
+         queue_id, qs->samples, period_ms, recorded_samples,
          qs->tx_pkts, qs->tx_bytes, qs->app_discarded, qs->used_polls,
          qs->samples ? (double)qs->used_polls / (double)qs->samples : 0.0,
          qs->occupancy_gated, gating_pct, attempted_pkts, qs->tx_not_accepted,
@@ -1128,7 +1128,7 @@ static void print_queue_summary(uint16_t queue_id, const struct queue_stats *qs,
            "the complete time series.\n",
            queue_id, recorded_samples, qs->samples);
 
-  printf("\nused histogram:\n");
+  printf("\nTX queue-count histogram:\n");
   for (uint32_t i = 0; i < USED_HIST_MAX; i++)
     if (used_hist[i] != 0)
       printf("queue %u  used=%3u : %" PRIu64 " (%.4f%%)\n", queue_id, i,
@@ -1137,7 +1137,7 @@ static void print_queue_summary(uint16_t queue_id, const struct queue_stats *qs,
                  ? 100.0 * (double)used_hist[i] / (double)qs->used_polls
                  : 0.0);
 
-  printf("\nwatermark histogram (on rejection):\n");
+  printf("\nhigh_wm histogram:\n");
   for (uint32_t i = 0; i < USED_HIST_MAX; i++)
     if (watermark_hist[i] != 0)
       printf("queue %u  watermark=%3u : %" PRIu64 " (%.4f%%)\n", queue_id, i,

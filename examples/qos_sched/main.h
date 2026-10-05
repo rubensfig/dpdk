@@ -23,8 +23,13 @@ extern "C" {
 #define MIXED_THREAD_PRIOBP 0
 #endif
 
-#ifndef MIXED_THREAD_PAB_COMP
-#define MIXED_THREAD_PAB_COMP 1
+#if defined(MIXED_THREAD_PAB_COMP) || defined(MIXED_THREAD_PAB_BQL)
+#error "MIXED_THREAD_PAB_COMP/PAB_BQL were renamed to MIXED_THREAD_QBC/CBC"
+#endif
+
+/* QBC: Queue Occupancy-Based Capacity (paper Algorithm 2) */
+#ifndef MIXED_THREAD_QBC
+#define MIXED_THREAD_QBC 1
 #endif
 
 #ifndef MIXED_THREAD_PRIOBP_STATS
@@ -43,8 +48,15 @@ extern "C" {
 #define MIXED_THREAD_PRIOPROP 0
 #endif
 
-#ifndef MIXED_THREAD_PAB_BQL
-#define MIXED_THREAD_PAB_BQL 0
+/* CBC: Completion-Based Capacity (paper Algorithm 1); T_poll = CBC_POLL_US */
+#ifndef MIXED_THREAD_CBC
+#define MIXED_THREAD_CBC 0
+#endif
+
+#if MIXED_THREAD_PRIOBP + MIXED_THREAD_QBC + MIXED_THREAD_PRIOBP_STATS + \
+	MIXED_THREAD_AGGBP + MIXED_THREAD_PERTCDEQUEUE + MIXED_THREAD_PRIOPROP + \
+	MIXED_THREAD_CBC != 1
+#error "enable exactly one MIXED_THREAD_* mode (QBC is on by default: add -DMIXED_THREAD_QBC=0 when selecting another)"
 #endif
 
 #define APP_RX_DESC_DEFAULT 1024
