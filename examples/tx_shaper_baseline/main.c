@@ -16,8 +16,8 @@
  *   cbc   CBC (paper Algorithm 1): B_cap = N_desc - (Q - C), with C from
  *         rte_eth_tx_done_cleanup() every T_poll.
  *   qbc   QBC (paper Algorithm 2): queue state U from
- *         rte_eth_tx_queue_count(), learned congestion boundary H and
- *         queue-state granularity Delta.
+ *         rte_eth_tx_queue_count(); every burst is capped at the learned
+ *         congestion boundary, B_cap = H - U.
  *
  * Packets withheld by the controller (gated) and packets rejected by the NIC
  * are freed by the benchmark, except under PAB, which retries rejected ones.
@@ -530,7 +530,20 @@ static inline void ctrl_update(struct ctrl *c, struct sample_record *s,
 
 #endif /* CBC */
 
-/* ---- QBC: Queue Occupancy-Based Capacity (paper Algorithm 2) ---------- */
+/* ---- QBC: Queue Occupancy-Based Capacity (paper Algorithm 2) ----------
+ *
+ *   U = rte_eth_tx_queue_count(); Delta = gcd of the non-zero changes of U
+ *   B_cap = B_req      while H is undefined
+ *         = 0          if U >= H
+ *         = H - U      otherwise (every burst is capped at the boundary)
+ *   partial transmit (once Delta > 0): H = min(H, U)
+ *   full transmit:                     H = max(H, U + B_sent)
+ *
+ * Because every burst is capped at H - U, a full transmit gives
+ * U + B_sent <= H: H rises only before the first rejection and is
+ * non-increasing afterwards. Delta only delays the first update of H until
+ * the queue state has been seen to move.
+ */
 #ifdef QBC
 
 struct ctrl {
@@ -599,9 +612,7 @@ static inline uint32_t ctrl_budget(struct ctrl *c, uint16_t queue,
     return b_req;
   if (u >= c->h)
     return 0;
-  if (c->h - u <= c->delta)
-    return c->h - u;
-  return b_req;
+  return c->h - u;
 }
 
 static inline uint16_t ctrl_keep_rejected(struct ctrl *c,
@@ -622,6 +633,8 @@ static inline void ctrl_update(struct ctrl *c, struct sample_record *s,
     return;
 
   if (b_sent < b_tx) {
+    if (c->delta == 0) /* queue state not yet seen to move */
+      return;
     c->h = c->h_valid ? RTE_MIN(c->h, c->u) : c->u;
     c->h_valid = true;
     hist_inc(wm_hist, c->h);

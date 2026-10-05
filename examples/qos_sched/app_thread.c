@@ -536,10 +536,15 @@ capacity_tx(struct thread_conf *conf, pending_tc_stats_t *s, int tc,
  * QBC: Queue Occupancy-Based Capacity (paper Algorithm 2).
  *
  *   U = rte_eth_tx_queue_count(); Delta = gcd of the non-zero changes of U
- *   B_cap = B_req        if H undefined, or H - U > Delta
- *         = H - U        if 0 < H - U <= Delta
+ *   B_cap = B_req        while H is undefined
  *         = 0            if U >= H
- *   partial transmit: H = min(H, U); full transmit: H = max(H, U + B_sent)
+ *         = H - U        otherwise (every burst is capped at the boundary)
+ *   partial transmit (once Delta > 0): H = min(H, U)
+ *   full transmit:                     H = max(H, U + B_sent)
+ *
+ * Since bursts are capped at H - U, H rises only before the first rejection
+ * and is non-increasing afterwards. Delta only delays the first update of H
+ * until the queue state has been seen to move.
  *
  * B_req is the per-TC dequeue limit qos_dequeue. If the PMD has no queue
  * count (e.g. iavf), the TC runs without backpressure and a warning is
@@ -597,9 +602,7 @@ qbc_budget(struct qbc_state *q, uint16_t port, int tc, uint32_t b_req,
 		return b_req;
 	if (u >= q->h)
 		return 0;
-	if (q->h - u <= q->delta)
-		return q->h - u;
-	return b_req;
+	return RTE_MIN(q->h - u, b_req);
 }
 
 /* iv) Update the congestion boundary. */
@@ -610,6 +613,8 @@ qbc_update(struct qbc_state *q, uint32_t b_tx, uint32_t b_sent)
 		return;
 
 	if (b_sent < b_tx) {
+		if (q->delta == 0)	/* queue state not yet seen to move */
+			return;
 		q->h = q->h_valid ? RTE_MIN(q->h, q->u) : q->u;
 	} else {
 		uint32_t v = q->u + b_sent;
