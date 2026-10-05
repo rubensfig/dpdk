@@ -6,19 +6,26 @@
 # To build this example as a standalone application with an already-installed
 # DPDK instance, use 'make'
 
-tx_controller = 'pq'
+# Transmit controller (see the header of main.c):
+#   none  Uncoordinated
+#   pab   Priority-Aware Backpressure (retry buffer)
+#   rej   REJ, outcome-based window (paper appendix)
+#   cbc   Completion-Based Capacity (paper Algorithm 1)
+#   qbc   Queue Occupancy-Based Capacity (paper Algorithm 2)
+tx_controller = 'pab'
 
-if tx_controller == 'comp'
-  cflags += ['-DCOMP=1']
-elif tx_controller == 'bql'
-  cflags += ['-DBQL=1']
-elif tx_controller == 'rej'
-  cflags += ['-DREJ=1']
-elif tx_controller == 'pq'
-  cflags += ['-DPQ=1']
-else
-  error('tx_controller must be either comp or bql')
+controllers = {
+  'none': 'NONE',
+  'pab': 'PAB',
+  'rej': 'REJ',
+  'cbc': 'CBC',
+  'qbc': 'QBC',
+}
+
+if not controllers.has_key(tx_controller)
+  error('tx_controller must be one of: none, pab, rej, cbc, qbc')
 endif
+cflags += ['-D' + controllers[tx_controller] + '=1']
 
 allow_experimental_apis = true
 sources = files(
