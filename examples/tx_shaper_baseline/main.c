@@ -197,6 +197,9 @@ static struct queue_stats qstats[MAX_TX_QUEUES];
  *   space          PAB: retry-buffer space; CBC: B_cap
  *   limit          NONE, CBC: N_desc; PAB: retry-buffer capacity
  *   freed          CBC: completions returned by this iteration's poll
+ *   retry_sent     PAB: retried packets accepted by the NIC this iteration
+ *                  (sent counts fresh packets only; accepted = sent +
+ *                  retry_sent)
  *   high_wm        REJ: window W; QBC: H (before the update)
  *   observed_step  REJ: A; QBC: Delta
  *   wm_valid       REJ: W > 0; QBC: H defined
@@ -219,7 +222,7 @@ struct sample_record {
 
   uint16_t occupancy_gated;
   uint16_t tx_not_accepted;
-  uint16_t reserved0;
+  uint16_t retry_sent; /* PAB only, 0 otherwise (was reserved0) */
 
   uint64_t cycles_count;
   uint64_t cycles_tx;
@@ -683,6 +686,7 @@ static inline void tx_iteration(struct worker_ctx *ctx, struct ctrl *c,
     rte_pktmbuf_free(bufs[i]);
 
   s->sent = sent;
+  s->retry_sent = o.extra_sent;
   s->tx_not_accepted = to_send - sent;
 
   ctrl_update(c, s, to_send, sent, wm_hist);
