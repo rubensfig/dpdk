@@ -2537,16 +2537,19 @@ grinder_schedule(struct rte_sched_port *port,
 	uint32_t tc = grinder->tc_index;
 	uint32_t be_tc_active;
 
+	/* Per-TC transmit budget (rte_sched_port_dequeue_tc). Checked before the
+	 * credits: the credit checks deduct credits on success, so a TC with no
+	 * budget left would otherwise burn subport/pipe/TC credits without
+	 * sending anything, on every grinder pass. */
+	if (capacity_pct && capacity_pct[tc] == 0)
+		return 0;
+
 	if (subport->tc_ov_enabled) {
 		if (!grinder_credits_check_with_tc_ov(port, subport, pos))
 			return 0;
 	} else {
 		if (!grinder_credits_check(port, subport, pos))
 			return 0;
-	}
-
-	if (capacity_pct && capacity_pct[tc]  == 0) {
-		return 0;
 	}
 
 	/* Advance port time */

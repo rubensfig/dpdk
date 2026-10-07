@@ -3,6 +3,8 @@
  */
 
 #include <stdint.h>
+#include <stdbool.h>
+#include <strings.h>
 
 #include <rte_log.h>
 #include <rte_mbuf.h>
@@ -353,9 +355,9 @@ app_worker_thread(struct thread_conf **confs)
 	}
 }
 
-#if MIXED_THREAD_PERTCDEQUEUE
-void
-app_mixed_thread(struct thread_conf **confs)
+/* ---- mode: pertcdequeue ---- */
+static void
+app_mixed_thread_pertcdequeue(struct thread_conf **confs)
 {
     struct rte_mbuf *mbufs[burst_conf.ring_burst];
     struct thread_conf *conf;
@@ -412,10 +414,9 @@ app_mixed_thread(struct thread_conf **confs)
 	conf_idx = 0;
      }
 }
-#endif
-#if MIXED_THREAD_PRIOBP
-void
-app_mixed_thread(struct thread_conf **confs)
+/* ---- mode: priobp ---- */
+static void
+app_mixed_thread_priobp(struct thread_conf **confs)
 {
     struct rte_mbuf *mbufs[burst_conf.ring_burst];
     struct thread_conf *conf;
@@ -487,9 +488,7 @@ app_mixed_thread(struct thread_conf **confs)
 	conf_idx = 0;
      }
 }
-#endif
 
-#if MIXED_THREAD_QBC || MIXED_THREAD_CBC
 /*
  * Capacity controllers from the paper, one instance per TxQ (= traffic
  * class). Each loop iteration: compute the per-TC budget B_cap, let the
@@ -529,9 +528,8 @@ capacity_tx(struct thread_conf *conf, pending_tc_stats_t *s, int tc,
 	APP_STATS_ADD(conf->stat.nb_tx, sent);
 	return sent;
 }
-#endif
 
-#if MIXED_THREAD_QBC
+/* ---- mode: qbc ---- */
 /*
  * QBC: Queue Occupancy-Based Capacity (paper Algorithm 2).
  *
@@ -623,7 +621,8 @@ qbc_update(struct qbc_state *q, uint32_t b_tx, uint32_t b_sent)
 	q->h_valid = true;
 }
 
-void app_mixed_thread(struct thread_conf **confs)
+static void
+app_mixed_thread_qbc(struct thread_conf **confs)
 {
 	struct rte_mbuf *mbufs[burst_conf.ring_burst];
 	struct thread_conf *conf;
@@ -670,9 +669,9 @@ void app_mixed_thread(struct thread_conf **confs)
 			conf_idx = 0;
 	}
 }
-#endif /* MIXED_THREAD_QBC */
+/* end QBC */
 
-#if MIXED_THREAD_CBC
+/* ---- mode: cbc ---- */
 /*
  * CBC: Completion-Based Capacity (paper Algorithm 1).
  *
@@ -680,11 +679,8 @@ void app_mixed_thread(struct thread_conf **confs)
  *   B_cap = max(0, N_desc - (Q - C)),  Q += B_sent
  *
  * N_desc is the configured TxQ depth (ring_conf.tx_size). T_poll is
- * CBC_POLL_US (compile time). A TxQ with nothing outstanding is not polled.
+ * cbc_poll_us (--cbc-poll, default CBC_POLL_US). A TxQ with nothing outstanding is not polled.
  */
-#ifndef CBC_POLL_US
-#define CBC_POLL_US 10u
-#endif
 
 struct cbc_state {
 	uint64_t q;		/* Q: packets accepted by the NIC */
@@ -692,7 +688,8 @@ struct cbc_state {
 	uint64_t last_poll_tsc;
 };
 
-void app_mixed_thread(struct thread_conf **confs)
+static void
+app_mixed_thread_cbc(struct thread_conf **confs)
 {
 	struct rte_mbuf *mbufs[burst_conf.ring_burst];
 	struct thread_conf *conf;
@@ -702,7 +699,7 @@ void app_mixed_thread(struct thread_conf **confs)
 	pending_tc_stats_t *stats = flow->tc_stats;
 
 	struct cbc_state cbc[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
-	const uint64_t poll_tsc = (rte_get_tsc_hz() * CBC_POLL_US) / 1000000ULL;
+	const uint64_t poll_tsc = (rte_get_tsc_hz() * cbc_poll_us) / 1000000ULL;
 	const uint64_t n_desc = ring_conf.tx_size;
 	bool warned = false;
 
@@ -717,7 +714,7 @@ void app_mixed_thread(struct thread_conf **confs)
 		pkts[tc] = tc_mbufs[tc];
 	}
 
-	printf("CBC: N_desc=%" PRIu64 " T_poll=%u us\n", n_desc, CBC_POLL_US);
+	printf("CBC: N_desc=%" PRIu64 " T_poll=%u us\n", n_desc, cbc_poll_us);
 
 	while ((conf = confs[conf_idx])) {
 		capacity_rx_to_sched(conf, mbufs);
@@ -764,11 +761,11 @@ void app_mixed_thread(struct thread_conf **confs)
 			conf_idx = 0;
 	}
 }
-#endif /* MIXED_THREAD_CBC */
+/* end CBC */
 
-#if MIXED_THREAD_PRIOBP_STATS
-void
-app_mixed_thread(struct thread_conf **confs)
+/* ---- mode: priobp_stats ---- */
+static void
+app_mixed_thread_priobp_stats(struct thread_conf **confs)
 {
     struct rte_mbuf *mbufs[burst_conf.ring_burst];
     struct thread_conf *conf;
@@ -861,11 +858,10 @@ app_mixed_thread(struct thread_conf **confs)
 	conf_idx = 0;
      }
 }
-#endif
 
-#if MIXED_THREAD_AGGBP
-void
-app_mixed_thread(struct thread_conf **confs)
+/* ---- mode: aggbp ---- */
+static void
+app_mixed_thread_aggbp(struct thread_conf **confs)
 {
     struct rte_mbuf *mbufs[burst_conf.ring_burst];
     struct rte_mbuf *pending_mbufs[burst_conf.ring_burst];
@@ -945,10 +941,9 @@ app_mixed_thread(struct thread_conf **confs)
             conf_idx = 0;
     }
 }
-#endif
-#if MIXED_THREAD_PRIOPROP
-void
-app_mixed_thread(struct thread_conf **confs)
+/* ---- mode: prioprop ---- */
+static void
+app_mixed_thread_prioprop(struct thread_conf **confs)
 {
     struct rte_mbuf *mbufs[burst_conf.ring_burst];
     struct rte_mbuf *pending_mbufs[burst_conf.ring_burst];
@@ -989,12 +984,15 @@ app_mixed_thread(struct thread_conf **confs)
 		conf_idx = 0;
     }
 }
-#endif
+/* ---- mode: none (upstream qos_sched, no backpressure) ---- */
 /*
-void
-app_mixed_thread(struct thread_conf **confs)
+ * Dequeue up to qos_dequeue packets and transmit them on the TxQ of their
+ * traffic class. Packets the NIC rejects are dropped.
+ */
+static void
+app_mixed_thread_none(struct thread_conf **confs)
 {
-	struct rte_mbuf *mbufs[burst_conf.ring_burst];
+	struct rte_mbuf *mbufs[RTE_MAX(burst_conf.ring_burst, burst_conf.qos_dequeue)];
 	struct thread_conf *conf;
 	int conf_idx = 0;
 
@@ -1011,17 +1009,76 @@ app_mixed_thread(struct thread_conf **confs)
 			APP_STATS_ADD(conf->stat.nb_rx, nb_pkt);
 		}
 
-
 		nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs,
 					burst_conf.qos_dequeue);
 		if (likely(nb_pkt > 0)) {
 			uint16_t nb_tx = rte_eth_tx_burst(conf->tx_port, 0, mbufs, nb_pkt);
-			if (nb_tx != nb_pkt)
+
+			if (nb_tx != nb_pkt) {
 				rte_pktmbuf_free_bulk(&mbufs[nb_tx], nb_pkt - nb_tx);
+				APP_STATS_ADD(conf->stat.nb_drop, nb_pkt - nb_tx);
+			}
+			APP_STATS_ADD(conf->stat.nb_tx, nb_tx);
 		}
 
 		conf_idx++;
 		if (confs[conf_idx] == NULL)
 			conf_idx = 0;
 	}
-} */
+}
+
+/* ---- mode selection (--mode) ---- */
+enum mixed_mode mixed_mode = MIXED_MODE_DEFAULT;
+uint32_t cbc_poll_us = CBC_POLL_US;
+
+static const struct {
+	const char *name;
+	void (*fn)(struct thread_conf **confs);
+	bool tc_stats;	/* fills flow->tc_stats (pending-queue table) */
+} mixed_modes[MIXED_MODE_MAX] = {
+	[MIXED_MODE_NONE]         = { "none",         app_mixed_thread_none,         false },
+	[MIXED_MODE_QBC]          = { "qbc",          app_mixed_thread_qbc,          true  },
+	[MIXED_MODE_CBC]          = { "cbc",          app_mixed_thread_cbc,          true  },
+	[MIXED_MODE_PRIOBP]       = { "priobp",       app_mixed_thread_priobp,       false },
+	[MIXED_MODE_PRIOBP_STATS] = { "priobp_stats", app_mixed_thread_priobp_stats, true  },
+	[MIXED_MODE_AGGBP]        = { "aggbp",        app_mixed_thread_aggbp,        false },
+	[MIXED_MODE_PERTCDEQUEUE] = { "pertcdequeue", app_mixed_thread_pertcdequeue, false },
+	[MIXED_MODE_PRIOPROP]     = { "prioprop",     app_mixed_thread_prioprop,     false },
+};
+
+int
+mixed_mode_parse(const char *name)
+{
+	for (int i = 0; i < MIXED_MODE_MAX; i++)
+		if (strcasecmp(name, mixed_modes[i].name) == 0) {
+			mixed_mode = (enum mixed_mode)i;
+			return 0;
+		}
+	return -1;
+}
+
+const char *
+mixed_mode_name(void)
+{
+	return mixed_modes[mixed_mode].name;
+}
+
+const char *
+mixed_mode_list(void)
+{
+	return "none|qbc|cbc|priobp|priobp_stats|aggbp|pertcdequeue|prioprop";
+}
+
+bool
+mixed_mode_has_tc_stats(void)
+{
+	return mixed_modes[mixed_mode].tc_stats;
+}
+
+void
+app_mixed_thread(struct thread_conf **confs)
+{
+	RTE_LOG(INFO, APP, "lcore %u: mixed thread mode '%s'\n",
+		rte_lcore_id(), mixed_modes[mixed_mode].name);
+	mixed_modes[mixed_mode].fn(confs);
+}

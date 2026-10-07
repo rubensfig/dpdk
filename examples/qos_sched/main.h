@@ -5,6 +5,7 @@
 #ifndef _MAIN_H_
 #define _MAIN_H_
 
+#include <stdbool.h>
 #include <rte_sched.h>
 #include "pending_stats.h"
 
@@ -19,45 +20,57 @@ extern "C" {
  */
 #define APP_INTERACTIVE_DEFAULT 0
 
-#ifndef MIXED_THREAD_PRIOBP
-#define MIXED_THREAD_PRIOBP 0
-#endif
-
+/*
+ * Mixed-thread variant (backpressure scheme), selected at run time with
+ * --mode <name>; see mixed_mode_list(). The default can still be chosen at
+ * build time with the old flags, e.g. -DMIXED_THREAD_CBC=1, or directly with
+ * -DMIXED_MODE_DEFAULT=MIXED_MODE_CBC.
+ */
 #if defined(MIXED_THREAD_PAB_COMP) || defined(MIXED_THREAD_PAB_BQL)
 #error "MIXED_THREAD_PAB_COMP/PAB_BQL were renamed to MIXED_THREAD_QBC/CBC"
 #endif
 
-/* QBC: Queue Occupancy-Based Capacity (paper Algorithm 2) */
-#ifndef MIXED_THREAD_QBC
-#define MIXED_THREAD_QBC 1
+enum mixed_mode {
+	MIXED_MODE_NONE = 0,		/* upstream qos_sched, no backpressure */
+	MIXED_MODE_QBC,			/* Queue Occupancy-Based Capacity (Alg. 2) */
+	MIXED_MODE_CBC,			/* Completion-Based Capacity (Alg. 1) */
+	MIXED_MODE_PRIOBP,
+	MIXED_MODE_PRIOBP_STATS,
+	MIXED_MODE_AGGBP,
+	MIXED_MODE_PERTCDEQUEUE,
+	MIXED_MODE_PRIOPROP,
+	MIXED_MODE_MAX
+};
+
+#ifndef MIXED_MODE_DEFAULT
+#if defined(MIXED_THREAD_CBC) && MIXED_THREAD_CBC
+#define MIXED_MODE_DEFAULT MIXED_MODE_CBC
+#elif defined(MIXED_THREAD_PRIOBP) && MIXED_THREAD_PRIOBP
+#define MIXED_MODE_DEFAULT MIXED_MODE_PRIOBP
+#elif defined(MIXED_THREAD_PRIOBP_STATS) && MIXED_THREAD_PRIOBP_STATS
+#define MIXED_MODE_DEFAULT MIXED_MODE_PRIOBP_STATS
+#elif defined(MIXED_THREAD_AGGBP) && MIXED_THREAD_AGGBP
+#define MIXED_MODE_DEFAULT MIXED_MODE_AGGBP
+#elif defined(MIXED_THREAD_PERTCDEQUEUE) && MIXED_THREAD_PERTCDEQUEUE
+#define MIXED_MODE_DEFAULT MIXED_MODE_PERTCDEQUEUE
+#elif defined(MIXED_THREAD_PRIOPROP) && MIXED_THREAD_PRIOPROP
+#define MIXED_MODE_DEFAULT MIXED_MODE_PRIOPROP
+#else
+#define MIXED_MODE_DEFAULT MIXED_MODE_QBC
+#endif
 #endif
 
-#ifndef MIXED_THREAD_PRIOBP_STATS
-#define MIXED_THREAD_PRIOBP_STATS 0
+/* CBC completion poll period T_poll in us (--cbc-poll overrides) */
+#ifndef CBC_POLL_US
+#define CBC_POLL_US 10u
 #endif
 
-#ifndef MIXED_THREAD_AGGBP
-#define MIXED_THREAD_AGGBP 0
-#endif
-
-#ifndef MIXED_THREAD_PERTCDEQUEUE
-#define MIXED_THREAD_PERTCDEQUEUE 0
-#endif
-
-#ifndef MIXED_THREAD_PRIOPROP
-#define MIXED_THREAD_PRIOPROP 0
-#endif
-
-/* CBC: Completion-Based Capacity (paper Algorithm 1); T_poll = CBC_POLL_US */
-#ifndef MIXED_THREAD_CBC
-#define MIXED_THREAD_CBC 0
-#endif
-
-#if MIXED_THREAD_PRIOBP + MIXED_THREAD_QBC + MIXED_THREAD_PRIOBP_STATS + \
-	MIXED_THREAD_AGGBP + MIXED_THREAD_PERTCDEQUEUE + MIXED_THREAD_PRIOPROP + \
-	MIXED_THREAD_CBC != 1
-#error "enable exactly one MIXED_THREAD_* mode (QBC is on by default: add -DMIXED_THREAD_QBC=0 when selecting another)"
-#endif
+extern enum mixed_mode mixed_mode;
+extern uint32_t cbc_poll_us;
+int mixed_mode_parse(const char *name);
+const char *mixed_mode_name(void);
+const char *mixed_mode_list(void);
+bool mixed_mode_has_tc_stats(void);
 
 #define APP_RX_DESC_DEFAULT 1024
 #define APP_TX_DESC_DEFAULT 1024

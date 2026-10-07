@@ -65,6 +65,9 @@ static const char usage[] =
 	"           B = TX host threshold (default value is %u)                         \n"
 	"           C = TX write-back threshold (default value is %u)                   \n"
 	"    --cfg FILE : profile configuration to load                                 \n"
+	"    --mode NAME : mixed-thread backpressure mode (default qbc, or set at build) \n"
+	"           none|qbc|cbc|priobp|priobp_stats|aggbp|pertcdequeue|prioprop        \n"
+	"    --cbc-poll US : CBC completion poll period T_poll in us (default %u)       \n"
 ;
 
 /* display usage */
@@ -76,7 +79,8 @@ app_usage(const char *prgname)
 		MAX_PKT_RX_BURST, PKT_ENQUEUE, PKT_DEQUEUE,
 		MAX_PKT_TX_BURST, NB_MBUF,
 		RX_PTHRESH, RX_HTHRESH, RX_WTHRESH,
-		TX_PTHRESH, TX_HTHRESH, TX_WTHRESH
+		TX_PTHRESH, TX_HTHRESH, TX_WTHRESH,
+		CBC_POLL_US
 		);
 }
 
@@ -265,6 +269,10 @@ enum {
 	OPT_TTH_NUM,
 #define OPT_CFG "cfg"
 	OPT_CFG_NUM,
+#define OPT_MODE "mode"
+	OPT_MODE_NUM,
+#define OPT_CBC_POLL "cbc-poll"
+	OPT_CBC_POLL_NUM,
 };
 
 /*
@@ -288,6 +296,8 @@ app_parse_args(int argc, char **argv)
 		{OPT_RTH, 1, NULL, OPT_RTH_NUM},
 		{OPT_TTH, 1, NULL, OPT_TTH_NUM},
 		{OPT_CFG, 1, NULL, OPT_CFG_NUM},
+		{OPT_MODE, 1, NULL, OPT_MODE_NUM},
+		{OPT_CBC_POLL, 1, NULL, OPT_CBC_POLL_NUM},
 		{NULL,    0, 0,    0          }
 	};
 
@@ -372,6 +382,22 @@ app_parse_args(int argc, char **argv)
 
 			case OPT_CFG_NUM:
 				cfg_profile = optarg;
+				break;
+
+			case OPT_MODE_NUM:
+				if (mixed_mode_parse(optarg)) {
+					RTE_LOG(ERR, APP, "Invalid --mode %s (expected %s)\n",
+							optarg, mixed_mode_list());
+					return -1;
+				}
+				break;
+
+			case OPT_CBC_POLL_NUM:
+				if (atoi(optarg) <= 0) {
+					RTE_LOG(ERR, APP, "Invalid --cbc-poll %s\n", optarg);
+					return -1;
+				}
+				cbc_poll_us = (uint32_t)atoi(optarg);
 				break;
 
 			default:

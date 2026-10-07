@@ -186,7 +186,7 @@ app_stat(void)
 			flow->wt_thread.stat.nb_rx - flow->wt_thread.stat.nb_drop);
 		printf("-------+------------+------------+\n");
 
-#if MIXED_THREAD_PRIOBP_STATS || MIXED_THREAD_CBC || MIXED_THREAD_QBC
+	if (mixed_mode_has_tc_stats()) {
 	uint64_t hz = rte_get_tsc_hz();
 	printf("-------+------------ Pending Queue Stats -------------+\n");
 	printf("  TC   | avg_occ | max_occ | avg_lat_ns | max_lat_ns | loss | cyc/tx | cyc/retry |\n");
@@ -256,7 +256,7 @@ app_stat(void)
 	pstats_reset(s);
 	}
 	printf("-------+---------+---------+------------+------------+------+--------+-----------+\n");
-#endif
+	}
 
 		memset(&flow->rx_thread.stat, 0, sizeof(struct thread_stat));
 		memset(&flow->wt_thread.stat, 0, sizeof(struct thread_stat));
