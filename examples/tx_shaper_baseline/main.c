@@ -554,9 +554,11 @@ static inline void ctrl_update(struct ctrl *c, struct sample_record *s,
  * one SQB (= Delta) above its true value. If H is learned at or below such a
  * stale U, B_cap = 0, nothing is sent, U never changes, and the queue
  * stalls. Hence:
- *   U0 = minimum U observed (the empty-queue reading), U' = U - U0
- *   all of the above runs on U', and once Delta > 0:
- *   H >= QBC_H_FLOOR_STEPS * Delta
+ *   U0 = minimum U observed after the first accepted packet (the
+ *        empty-queue reading; earlier readings can be placeholders, e.g.
+ *        the cnxk counter word is zeroed until the HW first writes it)
+ *   U' = U - U0; all of the above runs on U', and once Delta > 0:
+ *   H >= QBC_H_FLOOR_STEPS * Delta (enforced in budget and update)
  * With the default of 2 steps, a counter stuck one Delta above empty still
  * leaves a budget of at least Delta.
  *
@@ -576,8 +578,9 @@ struct ctrl {
   uint32_t delta; /* Delta: gcd of observed non-zero changes of U */
   uint32_t u;     /* U' = U - U0 of the current iteration */
   bool have_u;
-  uint32_t u0;    /* U0: empty-queue reading (minimum U seen) */
+  uint32_t u0;    /* U0: empty-queue reading (min U after first send) */
   bool have_u0;
+  bool sent_any;  /* a packet was accepted: counter word is now live */
   bool warned;
 };
 
@@ -619,20 +622,26 @@ static inline uint32_t ctrl_budget(struct ctrl *c, uint16_t queue,
   }
 
   uint32_t u_raw = (uint32_t)q;
-  if (unlikely(!c->have_u0 || u_raw < c->u0)) {
-    /* A lower empty reading shifts U' up; keep H and U_prev with it. */
-    if (c->have_u0) {
-      uint32_t shift = c->u0 - u_raw;
+  /* U0 is learned only after the first accepted packet: before that the
+   * PMD may report a placeholder (cnxk: zeroed fc word, 0). When U0 moves,
+   * H and U_prev move with it so that they stay relative to the same U. */
+  if (unlikely(c->sent_any && (!c->have_u0 || u_raw < c->u0))) {
+    int64_t shift = (int64_t)c->u0 - (int64_t)u_raw; /* u0 = 0 if unset */
 
-      if (c->h_valid)
-        c->h += shift;
-      if (c->have_prev)
-        c->u_prev += shift;
+    if (c->h_valid) {
+      int64_t h = (int64_t)c->h + shift;
+
+      /* H at or below the new empty level carries no information:
+       * forget it and relearn (B_cap = B_req until then). */
+      c->h_valid = h > 0;
+      c->h = c->h_valid ? (uint32_t)h : 0;
     }
+    if (c->have_prev)
+      c->u_prev = (uint32_t)RTE_MAX((int64_t)c->u_prev + shift, (int64_t)0);
     c->u0 = u_raw;
     c->have_u0 = true;
   }
-  uint32_t u = u_raw - c->u0; /* U' */
+  uint32_t u = u_raw > c->u0 ? u_raw - c->u0 : 0; /* U' */
 
   if (c->have_prev && u != c->u_prev)
     c->delta = gcd_u32(c->delta, u > c->u_prev ? u - c->u_prev : c->u_prev - u);
@@ -646,9 +655,12 @@ static inline uint32_t ctrl_budget(struct ctrl *c, uint16_t queue,
   o->used = u_raw;
   o->have_used = true;
 
-  /* ii) Compute transmission budget */
+  /* ii) Compute transmission budget (H floor also applies here, so a
+   * counter stuck since start-up cannot hold B_cap at 0) */
   if (!c->h_valid)
     return b_req;
+  if (c->delta > 0)
+    c->h = RTE_MAX(c->h, QBC_H_FLOOR_STEPS * c->delta);
   if (u >= c->h)
     return 0;
   return c->h - u;
@@ -667,6 +679,9 @@ static inline void ctrl_update(struct ctrl *c, struct sample_record *s,
                                uint16_t b_tx, uint16_t b_sent,
                                uint64_t wm_hist[USED_HIST_MAX]) {
   RTE_SET_USED(s);
+
+  if (b_sent > 0)
+    c->sent_any = true;
 
   if (!c->have_u || b_tx == 0)
     return;

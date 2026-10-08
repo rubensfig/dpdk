@@ -598,9 +598,11 @@ fresh_tx(struct thread_conf *conf, pending_tc_stats_t *s, struct pending_q *pq,
  * one SQB (= Delta) above its true value. If H is learned at or below such a
  * stale U, B_cap = 0, nothing is sent, U never changes, and the TC stalls.
  * Hence:
- *   U0 = minimum U observed (the empty-queue reading), U' = U - U0
- *   all of the above runs on U', and once Delta > 0:
- *   H >= QBC_H_FLOOR_STEPS * Delta
+ *   U0 = minimum U observed after the first accepted packet (the
+ *        empty-queue reading; earlier readings can be placeholders, e.g.
+ *        the cnxk counter word is zeroed until the HW first writes it)
+ *   U' = U - U0; all of the above runs on U', and once Delta > 0:
+ *   H >= QBC_H_FLOOR_STEPS * Delta (enforced in budget and update)
  * With the default of 2 steps, a counter stuck one Delta above empty still
  * leaves a budget of at least Delta.
  */
@@ -613,8 +615,9 @@ struct qbc_state {
 	uint32_t u_prev;	/* U_prev */
 	uint32_t delta;		/* Delta: queue-state granularity */
 	uint32_t u;		/* U' = U - U0 of the current iteration */
-	uint32_t u0;		/* U0: empty-queue reading (min U seen) */
+	uint32_t u0;		/* U0: empty-queue reading (min U after first send) */
 	bool have_u0;
+	bool sent_any;		/* a packet was accepted: counter word is live */
 	bool h_valid;		/* H defined */
 	bool have_prev;
 	bool have_u;
@@ -650,20 +653,29 @@ qbc_budget(struct qbc_state *q, uint16_t port, int tc, uint32_t b_req,
 	}
 
 	uint32_t u_raw = (uint32_t)count;
-	if (unlikely(!q->have_u0 || u_raw < q->u0)) {
-		/* a lower empty reading shifts U' up; keep H and U_prev with it */
-		if (q->have_u0) {
-			uint32_t shift = q->u0 - u_raw;
+	/*
+	 * U0 is learned only after the first accepted packet: before that the
+	 * PMD may report a placeholder (cnxk: zeroed fc word, 0). When U0
+	 * moves, H and U_prev move with it so they stay relative to the same U.
+	 */
+	if (unlikely(q->sent_any && (!q->have_u0 || u_raw < q->u0))) {
+		int64_t shift = (int64_t)q->u0 - (int64_t)u_raw; /* u0 = 0 if unset */
 
-			if (q->h_valid)
-				q->h += shift;
-			if (q->have_prev)
-				q->u_prev += shift;
+		if (q->h_valid) {
+			int64_t h = (int64_t)q->h + shift;
+
+			/* H at or below the new empty level carries no
+			 * information: forget it and relearn (B_cap = B_req). */
+			q->h_valid = h > 0;
+			q->h = q->h_valid ? (uint32_t)h : 0;
 		}
+		if (q->have_prev)
+			q->u_prev = (uint32_t)RTE_MAX((int64_t)q->u_prev + shift,
+					(int64_t)0);
 		q->u0 = u_raw;
 		q->have_u0 = true;
 	}
-	uint32_t u = u_raw - q->u0;	/* U' */
+	uint32_t u = u_raw > q->u0 ? u_raw - q->u0 : 0;	/* U' */
 
 	if (q->have_prev && u != q->u_prev)
 		q->delta = qbc_gcd(q->delta,
@@ -673,8 +685,12 @@ qbc_budget(struct qbc_state *q, uint16_t port, int tc, uint32_t b_req,
 	q->u = u;
 	q->have_u = true;
 
+	/* H floor also applies here: a counter stuck since start-up must not
+	 * hold B_cap at 0 */
 	if (!q->h_valid)
 		return b_req;
+	if (q->delta > 0)
+		q->h = RTE_MAX(q->h, QBC_H_FLOOR_STEPS * q->delta);
 	if (u >= q->h)
 		return 0;
 	return RTE_MIN(q->h - u, b_req);
@@ -684,6 +700,9 @@ qbc_budget(struct qbc_state *q, uint16_t port, int tc, uint32_t b_req,
 static inline void
 qbc_update(struct qbc_state *q, uint32_t b_tx, uint32_t b_sent)
 {
+	if (b_sent > 0)
+		q->sent_any = true;
+
 	if (!q->have_u || b_tx == 0)
 		return;
 
