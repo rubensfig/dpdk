@@ -546,8 +546,27 @@ static inline void ctrl_update(struct ctrl *c, struct sample_record *s,
  * U + B_sent <= H: H rises only before the first rejection and is
  * non-increasing afterwards. Delta only delays the first update of H until
  * the queue state has been seen to move.
+ *
+ * Queue-count offset and H floor. Some PMDs report a non-zero U for an empty
+ * TxQ and update U lazily. On cnxk, U = SQBs_in_use * (SQEs_per_SQB - 1):
+ * an idle SQ reads 3 SQBs (189 pkts), and with fc_hyst_bits = 1 the HW only
+ * rewrites the counter after a change of 2 SQBs, so a drained queue can stay
+ * one SQB (= Delta) above its true value. If H is learned at or below such a
+ * stale U, B_cap = 0, nothing is sent, U never changes, and the queue
+ * stalls. Hence:
+ *   U0 = minimum U observed (the empty-queue reading), U' = U - U0
+ *   all of the above runs on U', and once Delta > 0:
+ *   H >= QBC_H_FLOOR_STEPS * Delta
+ * With the default of 2 steps, a counter stuck one Delta above empty still
+ * leaves a budget of at least Delta.
+ *
+ * Samples stay in raw PMD units: used = U, high_wm = H + U0.
  */
 #ifdef QBC
+
+#ifndef QBC_H_FLOOR_STEPS
+#define QBC_H_FLOOR_STEPS 2u
+#endif
 
 struct ctrl {
   uint32_t h;      /* H: congestion boundary */
@@ -555,8 +574,10 @@ struct ctrl {
   uint32_t u_prev; /* U_prev */
   bool have_prev;
   uint32_t delta; /* Delta: gcd of observed non-zero changes of U */
-  uint32_t u;     /* U_QBC of the current iteration */
+  uint32_t u;     /* U' = U - U0 of the current iteration */
   bool have_u;
+  uint32_t u0;    /* U0: empty-queue reading (minimum U seen) */
+  bool have_u0;
   bool warned;
 };
 
@@ -579,7 +600,7 @@ static inline uint32_t ctrl_budget(struct ctrl *c, uint16_t queue,
   int q = rte_eth_tx_queue_count(port_id, queue);
   s->cycles_count = rte_rdtsc() - t0;
 
-  s->high_wm = c->h;
+  s->high_wm = c->h + c->u0; /* raw units */
   s->wm_valid = c->h_valid;
 
   if (q < 0) {
@@ -597,7 +618,22 @@ static inline uint32_t ctrl_budget(struct ctrl *c, uint16_t queue,
     return b_req;
   }
 
-  uint32_t u = (uint32_t)q;
+  uint32_t u_raw = (uint32_t)q;
+  if (unlikely(!c->have_u0 || u_raw < c->u0)) {
+    /* A lower empty reading shifts U' up; keep H and U_prev with it. */
+    if (c->have_u0) {
+      uint32_t shift = c->u0 - u_raw;
+
+      if (c->h_valid)
+        c->h += shift;
+      if (c->have_prev)
+        c->u_prev += shift;
+    }
+    c->u0 = u_raw;
+    c->have_u0 = true;
+  }
+  uint32_t u = u_raw - c->u0; /* U' */
+
   if (c->have_prev && u != c->u_prev)
     c->delta = gcd_u32(c->delta, u > c->u_prev ? u - c->u_prev : c->u_prev - u);
   c->u_prev = u;
@@ -605,9 +641,9 @@ static inline uint32_t ctrl_budget(struct ctrl *c, uint16_t queue,
   c->u = u;
   c->have_u = true;
 
-  s->used = u;
+  s->used = u_raw;
   s->observed_step = c->delta;
-  o->used = u;
+  o->used = u_raw;
   o->have_used = true;
 
   /* ii) Compute transmission budget */
@@ -639,11 +675,14 @@ static inline void ctrl_update(struct ctrl *c, struct sample_record *s,
     if (c->delta == 0) /* queue state not yet seen to move */
       return;
     c->h = c->h_valid ? RTE_MIN(c->h, c->u) : c->u;
+    c->h = RTE_MAX(c->h, QBC_H_FLOOR_STEPS * c->delta); /* Delta > 0 here */
     c->h_valid = true;
-    hist_inc(wm_hist, c->h);
+    hist_inc(wm_hist, c->h + c->u0); /* raw units */
   } else {
     uint32_t v = c->u + b_sent;
     c->h = c->h_valid ? RTE_MAX(c->h, v) : v;
+    if (c->delta > 0)
+      c->h = RTE_MAX(c->h, QBC_H_FLOOR_STEPS * c->delta);
     c->h_valid = true;
   }
 }
@@ -826,6 +865,9 @@ static void print_params(FILE *f, const char *indent, const char *sep) {
 #endif
 #ifdef PAB
   fprintf(f, "%s\"pab_retry_max\": %u%s", indent, PAB_RETRY_MAX, sep);
+#endif
+#ifdef QBC
+  fprintf(f, "%s\"qbc_h_floor_steps\": %u%s", indent, QBC_H_FLOOR_STEPS, sep);
 #endif
 }
 

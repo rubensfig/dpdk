@@ -510,10 +510,49 @@ capacity_rx_to_sched(struct thread_conf *conf, struct rte_mbuf **mbufs)
 	}
 }
 
-/* Transmit one TC's dequeued burst; returns B_sent. */
+/*
+ * Retry path: send at most max packets from the head of the TC's pending
+ * queue (FIFO). Returns the number accepted; *n_tried is the number offered.
+ * Packets that are offered again but rejected get their retry count bumped.
+ */
 static inline uint16_t
-capacity_tx(struct thread_conf *conf, pending_tc_stats_t *s, int tc,
-		struct rte_mbuf **pkts, uint32_t b_tx)
+pending_retry_tx(struct thread_conf *conf, pending_tc_stats_t *s,
+		struct pending_q *pq, int tc, uint32_t max, uint16_t *n_tried)
+{
+	struct rte_mbuf *out[PENDING_MAX];
+	uint16_t n = pending_peek(pq, out, (uint16_t)RTE_MIN(max, (uint32_t)PENDING_MAX));
+
+	*n_tried = n;
+	if (n == 0)
+		return 0;
+
+	uint64_t t0 = rte_rdtsc();
+	uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, out, n);
+	s->cycles_retry += rte_rdtsc() - t0;
+
+	if (sent) {
+		pending_consume_tracked(pq, s, sent);
+		s->pkts_tx_total += sent;
+		APP_STATS_ADD(conf->stat.nb_tx, sent);
+	}
+	for (uint16_t i = 0; i < n - sent; i++) {
+		uint16_t idx = (pq->head + i) & (PENDING_MAX - 1);
+
+		if (pq->retry_cnt[idx] < UINT8_MAX)
+			pq->retry_cnt[idx]++;
+	}
+	return sent;
+}
+
+/*
+ * Fresh path: transmit one TC's dequeued burst; returns B_sent. Rejected
+ * packets go to the pending queue (retry) or are dropped (no retry). With
+ * retry the caller caps the burst at the free pending space, so nothing is
+ * dropped here.
+ */
+static inline uint16_t
+fresh_tx(struct thread_conf *conf, pending_tc_stats_t *s, struct pending_q *pq,
+		int tc, struct rte_mbuf **pkts, uint32_t b_tx, bool retry)
 {
 	uint64_t t0 = rte_rdtsc();
 	uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, pkts, b_tx);
@@ -521,9 +560,13 @@ capacity_tx(struct thread_conf *conf, pending_tc_stats_t *s, int tc,
 	s->pkts_tx_total += sent;
 
 	if (unlikely(sent < b_tx)) {
-		rte_pktmbuf_free_bulk(&pkts[sent], b_tx - sent);
-		s->retry_loss += b_tx - sent;
-		APP_STATS_ADD(conf->stat.nb_drop, b_tx - sent);
+		if (retry) {
+			pending_enqueue_burst_tracked(pq, s, &pkts[sent], b_tx - sent);
+		} else {
+			rte_pktmbuf_free_bulk(&pkts[sent], b_tx - sent);
+			s->retry_loss += b_tx - sent;
+			APP_STATS_ADD(conf->stat.nb_drop, b_tx - sent);
+		}
 	}
 	APP_STATS_ADD(conf->stat.nb_tx, sent);
 	return sent;
@@ -547,12 +590,31 @@ capacity_tx(struct thread_conf *conf, pending_tc_stats_t *s, int tc,
  * B_req is the per-TC dequeue limit qos_dequeue. If the PMD has no queue
  * count (e.g. iavf), the TC runs without backpressure and a warning is
  * printed once.
+ *
+ * Queue-count offset and H floor. Some PMDs report a non-zero U for an empty
+ * TxQ and update U lazily. On cnxk, U = SQBs_in_use * (SQEs_per_SQB - 1):
+ * an idle SQ reads 3 SQBs (189 pkts), and with fc_hyst_bits = 1 the HW only
+ * rewrites the counter after a change of 2 SQBs, so a drained queue can stay
+ * one SQB (= Delta) above its true value. If H is learned at or below such a
+ * stale U, B_cap = 0, nothing is sent, U never changes, and the TC stalls.
+ * Hence:
+ *   U0 = minimum U observed (the empty-queue reading), U' = U - U0
+ *   all of the above runs on U', and once Delta > 0:
+ *   H >= QBC_H_FLOOR_STEPS * Delta
+ * With the default of 2 steps, a counter stuck one Delta above empty still
+ * leaves a budget of at least Delta.
  */
+#ifndef QBC_H_FLOOR_STEPS
+#define QBC_H_FLOOR_STEPS 2u
+#endif
+
 struct qbc_state {
 	uint32_t h;		/* H: congestion boundary */
 	uint32_t u_prev;	/* U_prev */
 	uint32_t delta;		/* Delta: queue-state granularity */
-	uint32_t u;		/* U of the current iteration */
+	uint32_t u;		/* U' = U - U0 of the current iteration */
+	uint32_t u0;		/* U0: empty-queue reading (min U seen) */
+	bool have_u0;
 	bool h_valid;		/* H defined */
 	bool have_prev;
 	bool have_u;
@@ -587,7 +649,22 @@ qbc_budget(struct qbc_state *q, uint16_t port, int tc, uint32_t b_req,
 		return b_req;
 	}
 
-	uint32_t u = (uint32_t)count;
+	uint32_t u_raw = (uint32_t)count;
+	if (unlikely(!q->have_u0 || u_raw < q->u0)) {
+		/* a lower empty reading shifts U' up; keep H and U_prev with it */
+		if (q->have_u0) {
+			uint32_t shift = q->u0 - u_raw;
+
+			if (q->h_valid)
+				q->h += shift;
+			if (q->have_prev)
+				q->u_prev += shift;
+		}
+		q->u0 = u_raw;
+		q->have_u0 = true;
+	}
+	uint32_t u = u_raw - q->u0;	/* U' */
+
 	if (q->have_prev && u != q->u_prev)
 		q->delta = qbc_gcd(q->delta,
 				u > q->u_prev ? u - q->u_prev : q->u_prev - u);
@@ -618,57 +695,11 @@ qbc_update(struct qbc_state *q, uint32_t b_tx, uint32_t b_sent)
 		uint32_t v = q->u + b_sent;
 		q->h = q->h_valid ? RTE_MAX(q->h, v) : v;
 	}
+	if (q->delta > 0)
+		q->h = RTE_MAX(q->h, QBC_H_FLOOR_STEPS * q->delta);
 	q->h_valid = true;
 }
 
-static void
-app_mixed_thread_qbc(struct thread_conf **confs)
-{
-	struct rte_mbuf *mbufs[burst_conf.ring_burst];
-	struct thread_conf *conf;
-	int conf_idx = 0;
-
-	struct flow_conf *flow = container_of(confs[0], struct flow_conf, wt_thread);
-	pending_tc_stats_t *stats = flow->tc_stats;
-
-	struct qbc_state qbc[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
-	bool warned = false;
-
-	struct rte_mbuf *tc_mbufs[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE][burst_conf.qos_dequeue];
-	struct rte_mbuf **pkts[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
-	uint32_t tc_counts[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
-	uint32_t tc_ov[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
-
-	memset(qbc, 0, sizeof(qbc));
-	for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
-		pstats_reset(&stats[tc]);
-		pkts[tc] = tc_mbufs[tc];
-	}
-
-	while ((conf = confs[conf_idx])) {
-		capacity_rx_to_sched(conf, mbufs);
-
-		for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++)
-			tc_ov[tc] = qbc_budget(&qbc[tc], conf->tx_port, tc,
-					burst_conf.qos_dequeue, &warned);
-
-		memset(tc_counts, 0, sizeof(tc_counts));
-		rte_sched_port_dequeue_tc(conf->sched_port, pkts,
-				burst_conf.qos_dequeue, tc_ov, tc_counts);
-
-		for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
-			if (tc_counts[tc] == 0)
-				continue;
-			uint16_t sent = capacity_tx(conf, &stats[tc], tc, pkts[tc],
-					tc_counts[tc]);
-			qbc_update(&qbc[tc], tc_counts[tc], sent);
-		}
-
-		conf_idx++;
-		if (confs[conf_idx] == NULL)
-			conf_idx = 0;
-	}
-}
 /* end QBC */
 
 /* ---- mode: cbc ---- */
@@ -680,6 +711,7 @@ app_mixed_thread_qbc(struct thread_conf **confs)
  *
  * N_desc is the configured TxQ depth (ring_conf.tx_size). T_poll is
  * cbc_poll_us (--cbc-poll, default CBC_POLL_US). A TxQ with nothing outstanding is not polled.
+ * The loop itself is app_mixed_thread_ctrl() below.
  */
 
 struct cbc_state {
@@ -688,79 +720,6 @@ struct cbc_state {
 	uint64_t last_poll_tsc;
 };
 
-static void
-app_mixed_thread_cbc(struct thread_conf **confs)
-{
-	struct rte_mbuf *mbufs[burst_conf.ring_burst];
-	struct thread_conf *conf;
-	int conf_idx = 0;
-
-	struct flow_conf *flow = container_of(confs[0], struct flow_conf, wt_thread);
-	pending_tc_stats_t *stats = flow->tc_stats;
-
-	struct cbc_state cbc[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
-	const uint64_t poll_tsc = (rte_get_tsc_hz() * cbc_poll_us) / 1000000ULL;
-	const uint64_t n_desc = ring_conf.tx_size;
-	bool warned = false;
-
-	struct rte_mbuf *tc_mbufs[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE][burst_conf.qos_dequeue];
-	struct rte_mbuf **pkts[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
-	uint32_t tc_counts[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
-	uint32_t tc_ov[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
-
-	memset(cbc, 0, sizeof(cbc));
-	for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
-		pstats_reset(&stats[tc]);
-		pkts[tc] = tc_mbufs[tc];
-	}
-
-	printf("CBC: N_desc=%" PRIu64 " T_poll=%u us\n", n_desc, cbc_poll_us);
-
-	while ((conf = confs[conf_idx])) {
-		capacity_rx_to_sched(conf, mbufs);
-
-		uint64_t now = rte_rdtsc();
-		for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
-			struct cbc_state *c = &cbc[tc];
-
-			/* i) Process transmission completions every T_poll */
-			if (c->q != c->c && now - c->last_poll_tsc >= poll_tsc) {
-				int freed = rte_eth_tx_done_cleanup(conf->tx_port, tc, 0);
-
-				if (freed > 0) {
-					c->c = RTE_MIN(c->c + (uint64_t)freed, c->q);
-				} else if (unlikely(freed < 0 && !warned)) {
-					printf("CBC: rte_eth_tx_done_cleanup(port %u, txq %d) "
-					       "failed (%d): no completions, CBC will stall\n",
-					       conf->tx_port, tc, freed);
-					warned = true;
-				}
-				c->last_poll_tsc = now;
-			}
-
-			/* ii) Compute transmission budget */
-			uint64_t u = c->q - c->c;
-			uint64_t b_cap = u < n_desc ? n_desc - u : 0;
-			tc_ov[tc] = (uint32_t)RTE_MIN(b_cap, (uint64_t)burst_conf.qos_dequeue);
-		}
-
-		memset(tc_counts, 0, sizeof(tc_counts));
-		rte_sched_port_dequeue_tc(conf->sched_port, pkts,
-				burst_conf.qos_dequeue, tc_ov, tc_counts);
-
-		/* iii) Transmit, iv) update accepted work */
-		for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
-			if (tc_counts[tc] == 0)
-				continue;
-			cbc[tc].q += capacity_tx(conf, &stats[tc], tc, pkts[tc],
-					tc_counts[tc]);
-		}
-
-		conf_idx++;
-		if (confs[conf_idx] == NULL)
-			conf_idx = 0;
-	}
-}
 /* end CBC */
 
 /* ---- mode: priobp_stats ---- */
@@ -984,47 +943,227 @@ app_mixed_thread_prioprop(struct thread_conf **confs)
 		conf_idx = 0;
     }
 }
-/* ---- mode: none (upstream qos_sched, no backpressure) ---- */
+/* ---- mode: rej (REJ, paper appendix) ---- */
 /*
- * Dequeue up to qos_dequeue packets and transmit them on the TxQ of their
- * traffic class. Packets the NIC rejects are dropped.
+ * Outcome-based window W per TxQ, from transmission results only:
+ *   B_cap = W (initially B_req = qos_dequeue)
+ *   idle iteration (B_tx = 0):  W = B_req, s = 0
+ *   partial transmit:           W = max(B_sent, REJ_MIN), s = 0
+ *   full transmit:              after K (--rej-grow-streak) in a row,
+ *                               W = min(W + A (--rej-add-step), B_req)
  */
-static void
-app_mixed_thread_none(struct thread_conf **confs)
+uint32_t rej_add_step = REJ_ADD_STEP;
+uint32_t rej_grow_streak = REJ_GROW_STREAK;
+
+struct rej_state {
+	uint32_t window;	/* W */
+	uint32_t streak;	/* s: consecutive full transmits */
+};
+
+static inline void
+rej_update(struct rej_state *r, uint32_t b_tx, uint32_t b_sent, uint32_t b_req)
 {
-	struct rte_mbuf *mbufs[RTE_MAX(burst_conf.ring_burst, burst_conf.qos_dequeue)];
+	if (b_tx == 0) {
+		r->window = b_req;
+		r->streak = 0;
+		return;
+	}
+	if (b_sent < b_tx) {
+		r->window = RTE_MAX(b_sent, (uint32_t)REJ_MIN);
+		r->streak = 0;
+		return;
+	}
+	if (++r->streak >= rej_grow_streak) {
+		r->window = RTE_MIN(r->window + rej_add_step, b_req);
+		r->streak = 0;
+	}
+}
+
+/* ---- shared per-TC loop for none, qbc, cbc, rej ---- */
+/*
+ * Per iteration and TC:
+ *   1) B_cap from the controller
+ *   2) retry: up to B_cap packets from the TC's pending queue
+ *   3) fresh: only if every retried packet was accepted (keeps FIFO order),
+ *      up to B_cap - retried, the free pending space and qos_dequeue
+ *   4) rejected fresh packets go to the pending queue (or are dropped
+ *      when retry is off)
+ *   5) controller update with B_tx = retried + fresh, B_sent = accepted
+ * With retry, no packet is dropped after leaving the scheduler.
+ */
+enum ctrl_kind { CTRL_NONE, CTRL_QBC, CTRL_CBC, CTRL_REJ };
+
+#define N_SCHED_TC RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE
+
+static void
+app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
+		bool retry)
+{
+	struct rte_mbuf *mbufs[burst_conf.ring_burst];
 	struct thread_conf *conf;
 	int conf_idx = 0;
+	const uint32_t b_req = burst_conf.qos_dequeue;
+
+	struct flow_conf *flow = container_of(confs[0], struct flow_conf, wt_thread);
+	pending_tc_stats_t *stats = flow->tc_stats;
+
+	struct pending_q pending[N_SCHED_TC];
+	struct qbc_state qbc[N_SCHED_TC];
+	struct cbc_state cbc[N_SCHED_TC];
+	struct rej_state rej[N_SCHED_TC];
+	bool warned = false;
+
+	const uint64_t poll_tsc = (rte_get_tsc_hz() * cbc_poll_us) / 1000000ULL;
+	const uint64_t n_desc = ring_conf.tx_size;
+
+	struct rte_mbuf *tc_mbufs[N_SCHED_TC][burst_conf.qos_dequeue];
+	struct rte_mbuf **pkts[N_SCHED_TC];
+	uint32_t tc_counts[N_SCHED_TC];
+	uint32_t tc_ov[N_SCHED_TC];
+	uint16_t r_tried[N_SCHED_TC];
+	uint16_t r_sent[N_SCHED_TC];
+
+	memset(qbc, 0, sizeof(qbc));
+	memset(cbc, 0, sizeof(cbc));
+	for (int tc = 0; tc < N_SCHED_TC; tc++) {
+		pending_init(&pending[tc]);
+		pstats_reset(&stats[tc]);
+		pkts[tc] = tc_mbufs[tc];
+		rej[tc].window = b_req;
+		rej[tc].streak = 0;
+	}
+
+	if (kind == CTRL_CBC)
+		printf("CBC: N_desc=%" PRIu64 " T_poll=%u us\n", n_desc, cbc_poll_us);
+	if (kind == CTRL_REJ)
+		printf("REJ: A=%u K=%u W_min=%u\n", rej_add_step, rej_grow_streak,
+				(uint32_t)REJ_MIN);
+	printf("retry of rejected packets: %s\n", retry ? "on" : "off (drop)");
 
 	while ((conf = confs[conf_idx])) {
-		uint32_t nb_pkt;
+		capacity_rx_to_sched(conf, mbufs);
 
-		nb_pkt = rte_ring_sc_dequeue_burst(conf->rx_ring, (void **)mbufs,
-					burst_conf.ring_burst, NULL);
-		if (likely(nb_pkt)) {
-			int nb_sent = rte_sched_port_enqueue(conf->sched_port, mbufs,
-					nb_pkt);
+		uint64_t now = rte_rdtsc();
+		for (int tc = 0; tc < N_SCHED_TC; tc++) {
+			uint32_t cap;
 
-			APP_STATS_ADD(conf->stat.nb_drop, nb_pkt - nb_sent);
-			APP_STATS_ADD(conf->stat.nb_rx, nb_pkt);
+			/* 1) budget */
+			switch (kind) {
+			case CTRL_QBC:
+				cap = qbc_budget(&qbc[tc], conf->tx_port, tc, b_req,
+						&warned);
+				break;
+			case CTRL_CBC: {
+				struct cbc_state *c = &cbc[tc];
+
+				if (c->q != c->c && now - c->last_poll_tsc >= poll_tsc) {
+					int freed = rte_eth_tx_done_cleanup(conf->tx_port, tc, 0);
+
+					if (freed > 0) {
+						c->c = RTE_MIN(c->c + (uint64_t)freed, c->q);
+					} else if (unlikely(freed < 0 && !warned)) {
+						printf("CBC: rte_eth_tx_done_cleanup(port %u, txq %d) "
+						       "failed (%d): no completions, CBC will stall\n",
+						       conf->tx_port, tc, freed);
+						warned = true;
+					}
+					c->last_poll_tsc = now;
+				}
+				uint64_t u = c->q - c->c;
+				uint64_t b_cap = u < n_desc ? n_desc - u : 0;
+
+				cap = (uint32_t)RTE_MIN(b_cap, (uint64_t)b_req);
+				break;
+			}
+			case CTRL_REJ:
+				cap = rej[tc].window;
+				break;
+			default:
+				cap = b_req;
+				break;
+			}
+
+			/* 2) retry pending first */
+			r_tried[tc] = 0;
+			r_sent[tc] = 0;
+			if (retry && pending[tc].cnt)
+				r_sent[tc] = pending_retry_tx(conf, &stats[tc], &pending[tc],
+						tc, cap, &r_tried[tc]);
+
+			/* 3) fresh budget */
+			if (r_sent[tc] < r_tried[tc]) {
+				tc_ov[tc] = 0;
+			} else {
+				uint32_t left = cap - r_tried[tc];
+
+				if (retry)
+					left = RTE_MIN(left,
+						(uint32_t)(PENDING_MAX - pending[tc].cnt));
+				tc_ov[tc] = RTE_MIN(left, b_req);
+			}
 		}
 
-		nb_pkt = rte_sched_port_dequeue(conf->sched_port, mbufs,
-					burst_conf.qos_dequeue);
-		if (likely(nb_pkt > 0)) {
-			uint16_t nb_tx = rte_eth_tx_burst(conf->tx_port, 0, mbufs, nb_pkt);
+		memset(tc_counts, 0, sizeof(tc_counts));
+		rte_sched_port_dequeue_tc(conf->sched_port, pkts, b_req, tc_ov,
+				tc_counts);
 
-			if (nb_tx != nb_pkt) {
-				rte_pktmbuf_free_bulk(&mbufs[nb_tx], nb_pkt - nb_tx);
-				APP_STATS_ADD(conf->stat.nb_drop, nb_pkt - nb_tx);
+		for (int tc = 0; tc < N_SCHED_TC; tc++) {
+			/* 4) fresh transmit */
+			uint32_t b_tx = r_tried[tc] + tc_counts[tc];
+			uint32_t sent = r_sent[tc];
+
+			if (tc_counts[tc])
+				sent += fresh_tx(conf, &stats[tc], &pending[tc], tc,
+						pkts[tc], tc_counts[tc], retry);
+
+			/* 5) controller update */
+			switch (kind) {
+			case CTRL_QBC:
+				qbc_update(&qbc[tc], b_tx, sent);
+				break;
+			case CTRL_CBC:
+				cbc[tc].q += sent;
+				break;
+			case CTRL_REJ:
+				rej_update(&rej[tc], b_tx, sent, b_req);
+				break;
+			default:
+				break;
 			}
-			APP_STATS_ADD(conf->stat.nb_tx, nb_tx);
+
+			if (retry)
+				pstats_record_occupancy(&stats[tc], pending[tc].cnt);
 		}
 
 		conf_idx++;
 		if (confs[conf_idx] == NULL)
 			conf_idx = 0;
 	}
+}
+
+/* none: uncoordinated, rejected packets are dropped (no retry) */
+static void
+app_mixed_thread_none(struct thread_conf **confs)
+{
+	app_mixed_thread_ctrl(confs, CTRL_NONE, false);
+}
+
+static void
+app_mixed_thread_qbc(struct thread_conf **confs)
+{
+	app_mixed_thread_ctrl(confs, CTRL_QBC, true);
+}
+
+static void
+app_mixed_thread_cbc(struct thread_conf **confs)
+{
+	app_mixed_thread_ctrl(confs, CTRL_CBC, true);
+}
+
+static void
+app_mixed_thread_rej(struct thread_conf **confs)
+{
+	app_mixed_thread_ctrl(confs, CTRL_REJ, true);
 }
 
 /* ---- mode selection (--mode) ---- */
@@ -1036,7 +1175,7 @@ static const struct {
 	void (*fn)(struct thread_conf **confs);
 	bool tc_stats;	/* fills flow->tc_stats (pending-queue table) */
 } mixed_modes[MIXED_MODE_MAX] = {
-	[MIXED_MODE_NONE]         = { "none",         app_mixed_thread_none,         false },
+	[MIXED_MODE_NONE]         = { "none",         app_mixed_thread_none,         true  },
 	[MIXED_MODE_QBC]          = { "qbc",          app_mixed_thread_qbc,          true  },
 	[MIXED_MODE_CBC]          = { "cbc",          app_mixed_thread_cbc,          true  },
 	[MIXED_MODE_PRIOBP]       = { "priobp",       app_mixed_thread_priobp,       false },
@@ -1044,6 +1183,7 @@ static const struct {
 	[MIXED_MODE_AGGBP]        = { "aggbp",        app_mixed_thread_aggbp,        false },
 	[MIXED_MODE_PERTCDEQUEUE] = { "pertcdequeue", app_mixed_thread_pertcdequeue, false },
 	[MIXED_MODE_PRIOPROP]     = { "prioprop",     app_mixed_thread_prioprop,     false },
+	[MIXED_MODE_REJ]          = { "rej",          app_mixed_thread_rej,          true  },
 };
 
 int
@@ -1066,7 +1206,7 @@ mixed_mode_name(void)
 const char *
 mixed_mode_list(void)
 {
-	return "none|qbc|cbc|priobp|priobp_stats|aggbp|pertcdequeue|prioprop";
+	return "none|qbc|cbc|rej|priobp|priobp_stats|aggbp|pertcdequeue|prioprop";
 }
 
 bool

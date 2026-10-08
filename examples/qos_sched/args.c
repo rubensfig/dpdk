@@ -66,8 +66,10 @@ static const char usage[] =
 	"           C = TX write-back threshold (default value is %u)                   \n"
 	"    --cfg FILE : profile configuration to load                                 \n"
 	"    --mode NAME : mixed-thread backpressure mode (default qbc, or set at build) \n"
-	"           none|qbc|cbc|priobp|priobp_stats|aggbp|pertcdequeue|prioprop        \n"
+	"           none|qbc|cbc|rej|priobp|priobp_stats|aggbp|pertcdequeue|prioprop    \n"
 	"    --cbc-poll US : CBC completion poll period T_poll in us (default %u)       \n"
+	"    --rej-add-step A : REJ additive window step (default %u)                   \n"
+	"    --rej-grow-streak K : REJ full transmits before growing W (default %u)     \n"
 ;
 
 /* display usage */
@@ -80,7 +82,7 @@ app_usage(const char *prgname)
 		MAX_PKT_TX_BURST, NB_MBUF,
 		RX_PTHRESH, RX_HTHRESH, RX_WTHRESH,
 		TX_PTHRESH, TX_HTHRESH, TX_WTHRESH,
-		CBC_POLL_US
+		CBC_POLL_US, REJ_ADD_STEP, REJ_GROW_STREAK
 		);
 }
 
@@ -273,6 +275,10 @@ enum {
 	OPT_MODE_NUM,
 #define OPT_CBC_POLL "cbc-poll"
 	OPT_CBC_POLL_NUM,
+#define OPT_REJ_ADD "rej-add-step"
+	OPT_REJ_ADD_NUM,
+#define OPT_REJ_GROW "rej-grow-streak"
+	OPT_REJ_GROW_NUM,
 };
 
 /*
@@ -298,6 +304,8 @@ app_parse_args(int argc, char **argv)
 		{OPT_CFG, 1, NULL, OPT_CFG_NUM},
 		{OPT_MODE, 1, NULL, OPT_MODE_NUM},
 		{OPT_CBC_POLL, 1, NULL, OPT_CBC_POLL_NUM},
+		{OPT_REJ_ADD, 1, NULL, OPT_REJ_ADD_NUM},
+		{OPT_REJ_GROW, 1, NULL, OPT_REJ_GROW_NUM},
 		{NULL,    0, 0,    0          }
 	};
 
@@ -398,6 +406,22 @@ app_parse_args(int argc, char **argv)
 					return -1;
 				}
 				cbc_poll_us = (uint32_t)atoi(optarg);
+				break;
+
+			case OPT_REJ_ADD_NUM:
+				if (atoi(optarg) <= 0) {
+					RTE_LOG(ERR, APP, "Invalid --rej-add-step %s\n", optarg);
+					return -1;
+				}
+				rej_add_step = (uint32_t)atoi(optarg);
+				break;
+
+			case OPT_REJ_GROW_NUM:
+				if (atoi(optarg) <= 0) {
+					RTE_LOG(ERR, APP, "Invalid --rej-grow-streak %s\n", optarg);
+					return -1;
+				}
+				rej_grow_streak = (uint32_t)atoi(optarg);
 				break;
 
 			default:

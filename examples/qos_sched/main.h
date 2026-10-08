@@ -39,6 +39,7 @@ enum mixed_mode {
 	MIXED_MODE_AGGBP,
 	MIXED_MODE_PERTCDEQUEUE,
 	MIXED_MODE_PRIOPROP,
+	MIXED_MODE_REJ,			/* REJ, outcome-based window (appendix) */
 	MIXED_MODE_MAX
 };
 
@@ -55,6 +56,8 @@ enum mixed_mode {
 #define MIXED_MODE_DEFAULT MIXED_MODE_PERTCDEQUEUE
 #elif defined(MIXED_THREAD_PRIOPROP) && MIXED_THREAD_PRIOPROP
 #define MIXED_MODE_DEFAULT MIXED_MODE_PRIOPROP
+#elif defined(MIXED_THREAD_REJ) && MIXED_THREAD_REJ
+#define MIXED_MODE_DEFAULT MIXED_MODE_REJ
 #else
 #define MIXED_MODE_DEFAULT MIXED_MODE_QBC
 #endif
@@ -65,8 +68,21 @@ enum mixed_mode {
 #define CBC_POLL_US 10u
 #endif
 
+/* REJ: additive step A, grow streak K, minimum window (CLI overrides A, K) */
+#ifndef REJ_ADD_STEP
+#define REJ_ADD_STEP 8u
+#endif
+#ifndef REJ_GROW_STREAK
+#define REJ_GROW_STREAK 32u
+#endif
+#ifndef REJ_MIN
+#define REJ_MIN 1u
+#endif
+
 extern enum mixed_mode mixed_mode;
 extern uint32_t cbc_poll_us;
+extern uint32_t rej_add_step;
+extern uint32_t rej_grow_streak;
 int mixed_mode_parse(const char *name);
 const char *mixed_mode_name(void);
 const char *mixed_mode_list(void);
