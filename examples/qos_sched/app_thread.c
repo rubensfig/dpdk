@@ -581,10 +581,14 @@ fresh_tx(struct thread_conf *conf, pending_tc_stats_t *s, struct pending_q *pq,
  *         = 0            if U >= H
  *         = H - U        otherwise (every burst is capped at the boundary)
  *   partial transmit (once Delta > 0): H = min(H, U)
- *   full transmit:                     H = max(H, U + B_sent)
+ *   full transmit at B_tx = B_cap:     H = max(H, U + B_sent)
  *
- * Since bursts are capped at H - U, H rises only before the first rejection
- * and is non-increasing afterwards. Delta only delays the first update of H
+ * A full transmit below B_cap is demand-limited and says nothing about the
+ * boundary, so it does not touch H. Otherwise the first small burst after
+ * an idle start (traffic begins after the app) would set H to that burst
+ * size, and since bursts are capped at H - U, H could never rise again.
+ * H is therefore learned from the first full B_req burst, and is
+ * non-increasing afterwards. Delta only delays the first decrease of H
  * until the queue state has been seen to move.
  *
  * B_req is the per-TC dequeue limit qos_dequeue. If the PMD has no queue
@@ -698,7 +702,8 @@ qbc_budget(struct qbc_state *q, uint16_t port, int tc, uint32_t b_req,
 
 /* iv) Update the congestion boundary. */
 static inline void
-qbc_update(struct qbc_state *q, uint32_t b_tx, uint32_t b_sent)
+qbc_update(struct qbc_state *q, uint32_t b_tx, uint32_t b_sent,
+		uint32_t b_cap)
 {
 	if (b_sent > 0)
 		q->sent_any = true;
@@ -711,6 +716,9 @@ qbc_update(struct qbc_state *q, uint32_t b_tx, uint32_t b_sent)
 			return;
 		q->h = q->h_valid ? RTE_MIN(q->h, q->u) : q->u;
 	} else {
+		/* demand-limited: no information about the boundary */
+		if (b_tx < b_cap)
+			return;
 		uint32_t v = q->u + b_sent;
 		q->h = q->h_valid ? RTE_MAX(q->h, v) : v;
 	}
@@ -1041,6 +1049,7 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 	uint32_t tc_ov[N_SCHED_TC];
 	uint16_t r_tried[N_SCHED_TC];
 	uint16_t r_sent[N_SCHED_TC];
+	uint32_t tc_cap[N_SCHED_TC];
 
 	memset(qbc, 0, sizeof(qbc));
 	memset(cbc, 0, sizeof(cbc));
@@ -1102,6 +1111,8 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 				break;
 			}
 
+			tc_cap[tc] = cap;
+
 			/* 2) retry pending first */
 			r_tried[tc] = 0;
 			r_sent[tc] = 0;
@@ -1138,7 +1149,7 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 			/* 5) controller update */
 			switch (kind) {
 			case CTRL_QBC:
-				qbc_update(&qbc[tc], b_tx, sent);
+				qbc_update(&qbc[tc], b_tx, sent, tc_cap[tc]);
 				break;
 			case CTRL_CBC:
 				cbc[tc].q += sent;
