@@ -8,10 +8,13 @@
 #include <stdbool.h>
 #include <rte_sched.h>
 #include "pending_stats.h"
+#include "ctrl_stats.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+struct rte_tel_data;	/* telemetry handler prototypes below */
 
 #define RTE_LOGTYPE_APP RTE_LOGTYPE_USER1
 
@@ -173,6 +176,9 @@ struct flow_conf
 	struct thread_conf tx_thread;
 
 	pending_tc_stats_t tc_stats[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
+
+	/* run telemetry, never reset (see ctrl_stats.h) */
+	struct ctrl_stats cs;
 };
 
 
@@ -242,6 +248,12 @@ int qavg_tcsubport(uint16_t port_id, uint32_t subport_id, uint8_t tc);
 int qavg_subport(uint16_t port_id, uint32_t subport_id);
 int
 telemetry_pending_stats(const char *cmd __rte_unused, 
+		const char *params, struct rte_tel_data *d);
+int
+telemetry_ctrl_stats(const char *cmd __rte_unused,
+		const char *params, struct rte_tel_data *d);
+int
+telemetry_scenario(const char *cmd __rte_unused,
 		const char *params, struct rte_tel_data *d);
 
 

@@ -17,6 +17,7 @@
 #include <rte_cfgfile.h>
 #include <rte_malloc.h>
 #include <rte_tm.h>
+#include <rte_telemetry.h>
 
 #include "main.h"
 #include "cfg_file.h"
@@ -695,6 +696,10 @@ int app_init(void)
 
 	rte_telemetry_register_cmd( "/qos/pending_stats", telemetry_pending_stats,
 				    "Pending queue stats. Params: flow_id[,tc]");
+	rte_telemetry_register_cmd("/qos/ctrl_stats", telemetry_ctrl_stats,
+				   "Controller run telemetry (monotonic). Params: flow_id");
+	rte_telemetry_register_cmd("/qos/scenario", telemetry_scenario,
+				   "Static run configuration. No params");
 
 	RTE_LOG(INFO, APP, "time stamp clock running at %" PRIu64 " Hz\n",
 			 rte_get_timer_hz());

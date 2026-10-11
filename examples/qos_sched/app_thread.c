@@ -266,6 +266,8 @@ app_rx_thread(struct thread_conf **confs)
 
 			if (unlikely(rte_ring_sp_enqueue_bulk(conf->rx_ring,
 					(void **)rx_mbufs, nb_rx, NULL) == 0)) {
+				container_of(conf, struct flow_conf,
+					rx_thread)->cs.rx_ring_drop += nb_rx;
 				for(i = 0; i < nb_rx; i++) {
 					rte_pktmbuf_free(rx_mbufs[i]);
 
@@ -497,16 +499,20 @@ app_mixed_thread_priobp(struct thread_conf **confs)
  * (counted in nb_drop and in the per-TC "loss" column).
  */
 static inline void
-capacity_rx_to_sched(struct thread_conf *conf, struct rte_mbuf **mbufs)
+capacity_rx_to_sched(struct thread_conf *conf, struct rte_mbuf **mbufs,
+		struct ctrl_inst_stats *ci)
 {
 	uint32_t nb_pkt_rec = rte_ring_sc_dequeue_burst(conf->rx_ring,
 			(void **)mbufs, burst_conf.ring_burst, NULL);
 
+	ci->loops++;
 	if (likely(nb_pkt_rec)) {
 		uint32_t nb_sent = rte_sched_port_enqueue(conf->sched_port, mbufs,
 				nb_pkt_rec);
 		APP_STATS_ADD(conf->stat.nb_drop, nb_pkt_rec - nb_sent);
 		APP_STATS_ADD(conf->stat.nb_rx, nb_pkt_rec);
+		ci->sched_enq += nb_pkt_rec;
+		ci->sched_drop += nb_pkt_rec - nb_sent;
 	}
 }
 
@@ -769,6 +775,14 @@ app_mixed_thread_priobp_stats(struct thread_conf **confs)
     for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++)
 	        pstats_reset(&stats[tc]);
 
+    for (int i = 0; confs[i] != NULL; i++)
+	ctrl_stats_init_gauges(&container_of(confs[i], struct flow_conf,
+			wt_thread)->cs);
+
+    /* per-TC retry burst of this iteration, for ctrl_stats */
+    uint16_t r_tried[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
+    uint16_t r_sent[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
+
     struct rte_mbuf *tc_mbufs[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE][burst_conf.qos_dequeue];
     struct rte_mbuf **pkts[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
     uint32_t tc_counts[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
@@ -785,10 +799,16 @@ app_mixed_thread_priobp_stats(struct thread_conf **confs)
 	/* RX → Scheduler enqueue */
 	nb_pkt_rec = rte_ring_sc_dequeue_burst(conf->rx_ring, (void **)mbufs, burst_conf.ring_burst, NULL);
 
+	struct ctrl_stats *cs = &container_of(conf, struct flow_conf,
+			wt_thread)->cs;
+
+	cs->inst.loops++;
 	if (likely(nb_pkt_rec)) {
 		uint32_t nb_sent = rte_sched_port_enqueue(conf->sched_port, mbufs, nb_pkt_rec);
 		APP_STATS_ADD(conf->stat.nb_drop, nb_pkt_rec - nb_sent);
 		APP_STATS_ADD(conf->stat.nb_rx,  nb_pkt_rec);
+		cs->inst.sched_enq += nb_pkt_rec;
+		cs->inst.sched_drop += nb_pkt_rec - nb_sent;
 	}
 
 	/* ── TX path: drain pending ──────────────────────────── */
@@ -796,10 +816,13 @@ app_mixed_thread_priobp_stats(struct thread_conf **confs)
 		tc_counts[tc] = 0;
 		uint16_t n = pending_peek(&pending[tc], mbufs, burst_conf.qos_dequeue);
 
+		r_tried[tc] = n;
+		r_sent[tc] = 0;
 		if (n > 0) {
 			uint64_t t0 = rte_rdtsc();
 			uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, mbufs, n);
 			uint64_t t1 = rte_rdtsc();
+			r_sent[tc] = sent;
 			if (sent) {
 				pending_consume_tracked(&pending[tc], &stats[tc], sent);
 				//pending_consume(&pending[tc], sent);
@@ -823,20 +846,34 @@ app_mixed_thread_priobp_stats(struct thread_conf **confs)
 	rte_sched_port_dequeue_tc(conf->sched_port, pkts, burst_conf.qos_dequeue, tc_ov, tc_counts);
 
 	for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
-		if (tc_counts[tc] == 0) continue;
+		uint32_t f_sent = 0, dropped = 0;
 
-		uint64_t t0   = rte_rdtsc();
-		uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, pkts[tc], tc_counts[tc]);
-		uint64_t t1   = rte_rdtsc();
+		if (tc_counts[tc]) {
+			uint64_t t0   = rte_rdtsc();
+			uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, pkts[tc], tc_counts[tc]);
+			uint64_t t1   = rte_rdtsc();
 
-		stats[tc].cycles_tx     += (t1 - t0);
-		stats[tc].pkts_tx_total += sent;
+			stats[tc].cycles_tx     += (t1 - t0);
+			stats[tc].pkts_tx_total += sent;
+			f_sent = sent;
 
-		if (unlikely(sent < tc_counts[tc])) {
-			pending_enqueue_burst_tracked(&pending[tc], &stats[tc], &pkts[tc][sent], tc_counts[tc] - sent);
-			// pending_enqueue_burst(&pending[tc], &pkts[tc][sent], tc_counts[tc] - sent);
+			if (unlikely(sent < tc_counts[tc])) {
+				uint16_t pq_before = pending[tc].cnt;
+
+				pending_enqueue_burst_tracked(&pending[tc], &stats[tc], &pkts[tc][sent], tc_counts[tc] - sent);
+				// pending_enqueue_burst(&pending[tc], &pkts[tc][sent], tc_counts[tc] - sent);
+				dropped = (tc_counts[tc] - sent) -
+					(uint32_t)(pending[tc].cnt - pq_before);
+			}
+			APP_STATS_ADD(conf->stat.nb_tx, sent);
 		}
-		APP_STATS_ADD(conf->stat.nb_tx, sent);
+
+		/* PAB: B_cap is the free PQ space handed to the scheduler */
+		ctrl_stats_decision(&cs->tc[tc], burst_conf.qos_dequeue,
+				tc_ov[tc], tc_ov[tc], tc_counts[tc], r_tried[tc],
+				r_sent[tc], r_sent[tc] + f_sent, dropped,
+				pending[tc].cnt);
+		cs->inst.sched_deq += tc_counts[tc];
 	}
 
 	conf_idx++;
@@ -1061,6 +1098,10 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 		rej[tc].streak = 0;
 	}
 
+	for (int i = 0; confs[i] != NULL; i++)
+		ctrl_stats_init_gauges(&container_of(confs[i], struct flow_conf,
+				wt_thread)->cs);
+
 	if (kind == CTRL_CBC)
 		printf("CBC: N_desc=%" PRIu64 " T_poll=%u us\n", n_desc, cbc_poll_us);
 	if (kind == CTRL_REJ)
@@ -1069,7 +1110,10 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 	printf("retry of rejected packets: %s\n", retry ? "on" : "off (drop)");
 
 	while ((conf = confs[conf_idx])) {
-		capacity_rx_to_sched(conf, mbufs);
+		struct ctrl_stats *cs = &container_of(conf, struct flow_conf,
+				wt_thread)->cs;
+
+		capacity_rx_to_sched(conf, mbufs, &cs->inst);
 
 		uint64_t now = rte_rdtsc();
 		for (int tc = 0; tc < N_SCHED_TC; tc++) {
@@ -1085,7 +1129,13 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 				struct cbc_state *c = &cbc[tc];
 
 				if (c->q != c->c && now - c->last_poll_tsc >= poll_tsc) {
+					uint64_t t_fb = rte_rdtsc();
 					int freed = rte_eth_tx_done_cleanup(conf->tx_port, tc, 0);
+
+					cs->tc[tc].fb_cyc += rte_rdtsc() - t_fb;
+					cs->tc[tc].polls++;
+					if (freed > 0)
+						cs->tc[tc].freed += (uint64_t)freed;
 
 					if (freed > 0) {
 						c->c = RTE_MIN(c->c + (uint64_t)freed, c->q);
@@ -1099,6 +1149,8 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 				}
 				uint64_t u = c->q - c->c;
 				uint64_t b_cap = u < n_desc ? n_desc - u : 0;
+
+				cs->tc[tc].q_minus_c = (int64_t)u;
 
 				cap = (uint32_t)RTE_MIN(b_cap, (uint64_t)b_req);
 				break;
@@ -1141,25 +1193,52 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 			/* 4) fresh transmit */
 			uint32_t b_tx = r_tried[tc] + tc_counts[tc];
 			uint32_t sent = r_sent[tc];
+			uint32_t dropped = 0;
 
-			if (tc_counts[tc])
-				sent += fresh_tx(conf, &stats[tc], &pending[tc], tc,
-						pkts[tc], tc_counts[tc], retry);
+			if (tc_counts[tc]) {
+				uint16_t pq_before = pending[tc].cnt;
+				uint32_t f_sent = fresh_tx(conf, &stats[tc], &pending[tc],
+						tc, pkts[tc], tc_counts[tc], retry);
+				uint32_t f_rej = tc_counts[tc] - f_sent;
+
+				sent += f_sent;
+				/* rejected fresh packets that did not enter the PQ */
+				dropped = retry ? f_rej - (uint32_t)(pending[tc].cnt -
+						pq_before) : f_rej;
+			}
 
 			/* 5) controller update */
+			struct ctrl_tc_stats *ts = &cs->tc[tc];
+
 			switch (kind) {
-			case CTRL_QBC:
+			case CTRL_QBC: {
+				bool h_was = qbc[tc].h_valid;
+				uint32_t h_old = qbc[tc].h;
+
 				qbc_update(&qbc[tc], b_tx, sent, tc_cap[tc]);
+				ts->h_lowered += h_was && qbc[tc].h < h_old;
+				ts->u = qbc[tc].have_u ? (int64_t)qbc[tc].u : CS_UNSET;
+				ts->u0 = qbc[tc].have_u0 ? (int64_t)qbc[tc].u0 : CS_UNSET;
+				ts->h = qbc[tc].h_valid ? (int64_t)qbc[tc].h : CS_UNSET;
+				ts->delta = qbc[tc].delta;
 				break;
+			}
 			case CTRL_CBC:
 				cbc[tc].q += sent;
 				break;
 			case CTRL_REJ:
+				ts->cuts += b_tx > 0 && sent < b_tx;
 				rej_update(&rej[tc], b_tx, sent, b_req);
+				ts->w = rej[tc].window;
 				break;
 			default:
 				break;
 			}
+
+			ctrl_stats_decision(ts, b_req, tc_cap[tc], tc_ov[tc],
+					tc_counts[tc], r_tried[tc], r_sent[tc], sent,
+					dropped, pending[tc].cnt);
+			cs->inst.sched_deq += tc_counts[tc];
 
 			if (retry)
 				pstats_record_occupancy(&stats[tc], pending[tc].cnt);
