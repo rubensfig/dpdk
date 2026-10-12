@@ -212,10 +212,10 @@ static inline int get_pkt_sched(struct rte_mbuf *m, uint32_t *subport, uint32_t 
  	/* Color */
  	*color = 0;
 
-	// rte_ether_addr_copy(&eth_hdr->dst_addr, &addr);
-	// rte_ether_addr_copy(&eth_hdr->src_addr, &eth_hdr->dst_addr);
-	// rte_ether_addr_copy(&addr, &eth_hdr->src_addr);
-	//        uint16_t ether_type = rte_be_to_cpu_16(eth_hdr->ether_type);
+	rte_ether_addr_copy(&eth_hdr->dst_addr, &addr);
+	rte_ether_addr_copy(&eth_hdr->src_addr, &eth_hdr->dst_addr);
+	rte_ether_addr_copy(&addr, &eth_hdr->src_addr);
+	       uint16_t ether_type = rte_be_to_cpu_16(eth_hdr->ether_type);
 	//
 	/*
 	uint16_t ether_type = rte_be_to_cpu_16(eth_hdr->ether_type);
