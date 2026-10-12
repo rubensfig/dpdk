@@ -610,6 +610,7 @@ telemetry_scenario(const char *cmd __rte_unused,
 	snprintf(buf, sizeof(buf), "%s", cfg_profile ? cfg_profile : "");
 	rte_tel_data_add_dict_string(d, "cfg_profile", buf);
 	rte_tel_data_add_dict_string(d, "build", __DATE__ " " __TIME__);
+	rte_tel_data_add_dict_uint(d, "ctrl_stats_version", CTRL_STATS_VERSION);
 	rte_tel_data_add_dict_uint(d, "tsc_hz", rte_get_tsc_hz());
 	rte_tel_data_add_dict_uint(d, "tsc", rte_rdtsc());
 	rte_tel_data_add_dict_uint(d, "nb_pfc", nb_pfc);

@@ -23,6 +23,18 @@
 #include <rte_sched.h>
 
 #define CS_N_TC RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE
+
+/*
+ * Version of the counter semantics, reported in /qos/scenario.
+ *  1 (field absent): ov was read back after rte_sched_port_dequeue_tc(),
+ *    which decrements the budget array, so ov held the budget LEFT OVER
+ *    (offered - dequeued), and `bound` was computed from it. In the PAB
+ *    loop the same left-over value was also passed as B_cap, so PAB's
+ *    cap and stalls were wrong too.
+ *  2: ov, bound (and PAB's cap, stalls) use the budget as offered,
+ *    copied before the dequeue call.
+ */
+#define CTRL_STATS_VERSION 2
 #define CS_UNSET (-1)
 
 struct ctrl_tc_stats {

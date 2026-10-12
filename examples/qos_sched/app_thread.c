@@ -764,6 +764,8 @@ app_mixed_thread_priobp_stats(struct thread_conf **confs)
     int conf_idx = 0;
 
     uint32_t tc_ov[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
+    /* tc_ov as offered: rte_sched_port_dequeue_tc() decrements tc_ov */
+    uint32_t tc_offer[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
 
     struct pending_q pending[N_TC];
     for (int i = 0; i < N_TC; i++)
@@ -843,6 +845,7 @@ app_mixed_thread_priobp_stats(struct thread_conf **confs)
 
 
 	/* ── Scheduler dequeue + fresh TX ───────────────────── */
+	memcpy(tc_offer, tc_ov, sizeof(tc_offer));
 	rte_sched_port_dequeue_tc(conf->sched_port, pkts, burst_conf.qos_dequeue, tc_ov, tc_counts);
 
 	for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
@@ -870,7 +873,7 @@ app_mixed_thread_priobp_stats(struct thread_conf **confs)
 
 		/* PAB: B_cap is the free PQ space handed to the scheduler */
 		ctrl_stats_decision(&cs->tc[tc], burst_conf.qos_dequeue,
-				tc_ov[tc], tc_ov[tc], tc_counts[tc], r_tried[tc],
+				tc_offer[tc], tc_offer[tc], tc_counts[tc], r_tried[tc],
 				r_sent[tc], r_sent[tc] + f_sent, dropped,
 				pending[tc].cnt);
 		cs->inst.sched_deq += tc_counts[tc];
@@ -1084,6 +1087,8 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 	struct rte_mbuf **pkts[N_SCHED_TC];
 	uint32_t tc_counts[N_SCHED_TC];
 	uint32_t tc_ov[N_SCHED_TC];
+	/* tc_ov as offered: rte_sched_port_dequeue_tc() decrements tc_ov */
+	uint32_t tc_offer[N_SCHED_TC];
 	uint16_t r_tried[N_SCHED_TC];
 	uint16_t r_sent[N_SCHED_TC];
 	uint32_t tc_cap[N_SCHED_TC];
@@ -1186,6 +1191,7 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 		}
 
 		memset(tc_counts, 0, sizeof(tc_counts));
+		memcpy(tc_offer, tc_ov, sizeof(tc_offer));
 		rte_sched_port_dequeue_tc(conf->sched_port, pkts, b_req, tc_ov,
 				tc_counts);
 
@@ -1235,7 +1241,7 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 				break;
 			}
 
-			ctrl_stats_decision(ts, b_req, tc_cap[tc], tc_ov[tc],
+			ctrl_stats_decision(ts, b_req, tc_cap[tc], tc_offer[tc],
 					tc_counts[tc], r_tried[tc], r_sent[tc], sent,
 					dropped, pending[tc].cnt);
 			cs->inst.sched_deq += tc_counts[tc];
