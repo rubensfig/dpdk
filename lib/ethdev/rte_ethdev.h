@@ -7104,6 +7104,19 @@ out:
 	return rc;
 }
 
+struct vf_msg_command;
+
+/**
+ * PMDLink: send a raw virtchnl message from a VF port to its PF.
+ *
+ * @return 0 on success, -ENOTSUP if the driver has no PMDLink support,
+ *   negative errno otherwise. On success *cmd->output_buffer holds a copy of
+ *   the PF's reply (allocated with rte_zmalloc, the caller frees it).
+ */
+__rte_experimental
+int
+rte_eth_dev_send_vf_msg(uint16_t port_id, struct vf_msg_command *vf_command);
+
 #ifdef __cplusplus
 }
 #endif

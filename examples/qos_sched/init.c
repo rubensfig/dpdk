@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <memory.h>
+#include <string.h>
 
 #include <rte_log.h>
 #include <rte_mbuf.h>
@@ -22,6 +23,7 @@
 #include "main.h"
 #include "cfg_file.h"
 #include "pending_stats.h"
+#include "pmdlink.h"
 
 uint32_t app_numa_mask = 0;
 static uint32_t app_inited_port_mask = 0;
@@ -70,10 +72,10 @@ static struct rte_eth_conf port_conf = {
 typedef uint16_t port_t;
 typedef uint16_t teid_t;
 
-/*
 qos_node_t *pmdlink_read_topology(port_t port) {
     struct vf_msg_command *cmd;
     uint8_t *response = NULL;
+    int ret;
 
     cmd = rte_zmalloc("vf_msg_command", sizeof(struct vf_msg_command), 0);
 
@@ -83,38 +85,60 @@ qos_node_t *pmdlink_read_topology(port_t port) {
     cmd->output_size = 0;
     cmd->output_buffer = &response;
     rte_log(RTE_LOG_DEBUG, RTE_LOGTYPE_USER1, "Sending VIRTCHNL_OP_HQOS_TREE_READ, port=%d\n", port);
-    // rte_eth_dev_send_vf_msg(port, cmd);
+    ret = rte_eth_dev_send_vf_msg(port, cmd);
+    rte_free(cmd);
+
+    if (ret != 0 || response == NULL)
+        rte_exit(EXIT_FAILURE, "HQOS_TREE_READ failed on port %d: ret=%d\n", port, ret);
 
     struct virtchnl_hqos_cfg_list *sched_cfg = (struct virtchnl_hqos_cfg_list *)response;
 
-    qos_node_t *rsp = rte_zmalloc("vf_msg_command", sizeof(qos_node_t) * (1 + sched_cfg->num_elem), 0);
+    /* the reply is copied from a buffer of IAVF_AQ_BUF_SZ bytes */
+    const int max_elem = 1 + (IAVF_AQ_BUF_SZ - (int)sizeof(struct virtchnl_hqos_cfg_list)) /
+                              (int)sizeof(struct virtchnl_hqos_cfg);
+    if (sched_cfg->num_elem == 0 || sched_cfg->num_elem > max_elem)
+        rte_exit(EXIT_FAILURE, "HQOS_TREE_READ: bad num_elem=%u (max %d)\n",
+                 sched_cfg->num_elem, max_elem);
 
+    qos_node_t *rsp = rte_zmalloc("qos_nodes", sizeof(qos_node_t) * (1 + sched_cfg->num_elem), 0);
+    uint16_t next_queue = 0;
+
+    printf("HQOS tree, port %d (%u elements):\n", port, sched_cfg->num_elem);
     for (int i = 0; i < sched_cfg->num_elem; i++) {
-        if (sched_cfg->cfg[i].teid == 0)
-            rte_exit(EXIT_FAILURE, "read_vf_qos_nodes() - zero teid assertion failed\n");
+        struct virtchnl_hqos_cfg *c = &sched_cfg->cfg[i];
+
+        if (c->teid == 0)
+            rte_exit(EXIT_FAILURE, "HQOS_TREE_READ: element %d has teid 0 (layout mismatch?)\n", i);
 
         rsp[i] = (qos_node_t){
-            .teid = sched_cfg->cfg[i].teid,
-            .parent_teid = sched_cfg->cfg[i].parent_teid,
-            .tx_queue_id = sched_cfg->cfg[i].tx_queue_id,
+            .teid = c->teid,
+            .parent_teid = c->parent_teid,
+            .node_type = c->node_type,
+            /* The driver sends no queue id. The tree is sent depth-first and
+             * queues are added in order, so the k-th leaf is TX queue k.
+             * Check this against the printout below. */
+            .tx_queue_id = (c->node_type == VIRTCHNL_HQOS_ELEM_TYPE_LEAF) ? next_queue++ : 0,
         };
+        printf("  [%d] %s teid=%u parent=%u prio=%u weight=%u%s\n", i,
+               c->node_type == VIRTCHNL_HQOS_ELEM_TYPE_LEAF ? "leaf" : "node",
+               c->teid, c->parent_teid, c->tx_priority, c->tx_weight,
+               c->node_type == VIRTCHNL_HQOS_ELEM_TYPE_LEAF ? "  <- queue" : "");
     }
-    // set an end marker, teid==0 is not legal/used (protected by previous assertion)
-    rsp[sched_cfg->num_elem] = (qos_node_t){
-        .teid = 0,
-    };
-    rte_free(cmd);
+    // set an end marker, teid==0 is not legal/used (checked above)
+    rsp[sched_cfg->num_elem] = (qos_node_t){ .teid = 0 };
+
+    rte_free(response);
     return rsp;
 }
 
-void pmdlink_set_shaper(uint16_t port, uint16_t source_teid) {
+static void pmdlink_set_shaper(uint16_t port, uint32_t source_teid) {
     struct vf_msg_command *cmd;
     cmd = rte_zmalloc("vf_msg_command", sizeof(struct vf_msg_command), 0);
 
     uint8_t *response = NULL;
 
     struct virtchnl_hqos_cfg_list *msg = NULL;
-    int len = sizeof(struct virtchnl_hqos_cfg_list *) + (6) * sizeof(struct virtchnl_hqos_cfg *);
+    int len = sizeof(struct virtchnl_hqos_cfg_list); /* one element */
 
     cmd->opcode = VIRTCHNL_OP_HQOS_ELEMS_CONF;
     cmd->input_size = len;
@@ -131,21 +155,26 @@ void pmdlink_set_shaper(uint16_t port, uint16_t source_teid) {
     cmd->input_buffer = (uint8_t *)msg;
 
     rte_log(RTE_LOG_INFO, RTE_LOGTYPE_USER1, "Sending VIRTCHNL_OP_HQOS_ELEMS_CONF, port=%d, source_node=%d, shaper=%d\n", port, source_teid, 10000000);
-    rte_eth_dev_send_vf_msg(port, cmd);
+    int ret = rte_eth_dev_send_vf_msg(port, cmd);
+    if (ret != 0)
+        rte_log(RTE_LOG_ERR, RTE_LOGTYPE_USER1, "opcode %u on teid %u failed: %d (see dmesg on the host)\n",
+                cmd->opcode, source_teid, ret);
+    if (response)
+        rte_free(response);
 
     rte_free(msg);
     rte_free(cmd);
 }
 
 
-void pmdlink_node_priority(uint16_t port, uint16_t source_teid, uint16_t tx_priority) {
+static void pmdlink_node_priority(uint16_t port, uint32_t source_teid, uint16_t tx_priority) {
     struct vf_msg_command *cmd;
     cmd = rte_zmalloc("vf_msg_command", sizeof(struct vf_msg_command), 0);
 
     uint8_t *response = NULL;
 
     struct virtchnl_hqos_cfg_list *msg = NULL;
-    int len = sizeof(struct virtchnl_hqos_cfg_list *) + (6) * sizeof(struct virtchnl_hqos_cfg *);
+    int len = sizeof(struct virtchnl_hqos_cfg_list); /* one element */
 
     cmd->opcode = VIRTCHNL_OP_HQOS_ELEMS_CONF;
     cmd->input_size = len;
@@ -163,20 +192,25 @@ void pmdlink_node_priority(uint16_t port, uint16_t source_teid, uint16_t tx_prio
     cmd->input_buffer = (uint8_t *)msg;
 
     rte_log(RTE_LOG_INFO, RTE_LOGTYPE_USER1, "Sending VIRTCHNL_OP_HQOS_ELEMS_CONF, port=%d, source_node=%d, prio=%d\n", port, source_teid, tx_priority);
-    rte_eth_dev_send_vf_msg(port, cmd);
+    int ret = rte_eth_dev_send_vf_msg(port, cmd);
+    if (ret != 0)
+        rte_log(RTE_LOG_ERR, RTE_LOGTYPE_USER1, "opcode %u on teid %u failed: %d (see dmesg on the host)\n",
+                cmd->opcode, source_teid, ret);
+    if (response)
+        rte_free(response);
 
     rte_free(msg);
     rte_free(cmd);
 }
 
-void pmdlink_add_node(uint16_t port, uint16_t source_teid, uint16_t tx_priority) {
+static __rte_unused void pmdlink_add_node(uint16_t port, uint32_t source_teid, uint16_t tx_priority) {
     struct vf_msg_command *cmd;
     cmd = rte_zmalloc("vf_msg_command", sizeof(struct vf_msg_command), 0);
 
     uint8_t *response = NULL;
 
     struct virtchnl_hqos_cfg_list *msg = NULL;
-    int len = sizeof(struct virtchnl_hqos_cfg_list *) + (6) * sizeof(struct virtchnl_hqos_cfg *);
+    int len = sizeof(struct virtchnl_hqos_cfg_list); /* one element */
 
     cmd->opcode = VIRTCHNL_OP_HQOS_ELEMS_ADD;
     cmd->input_size = len;
@@ -193,7 +227,12 @@ void pmdlink_add_node(uint16_t port, uint16_t source_teid, uint16_t tx_priority)
     cmd->input_buffer = (uint8_t *)msg;
 
     rte_log(RTE_LOG_INFO, RTE_LOGTYPE_USER1, "Sending VIRTCHNL_OP_HQOS_ELEMS_ADD, port=%d, source_node=%d, prio=%d\n", port, source_teid, tx_priority);
-    rte_eth_dev_send_vf_msg(port, cmd);
+    int ret = rte_eth_dev_send_vf_msg(port, cmd);
+    if (ret != 0)
+        rte_log(RTE_LOG_ERR, RTE_LOGTYPE_USER1, "opcode %u on teid %u failed: %d (see dmesg on the host)\n",
+                cmd->opcode, source_teid, ret);
+    if (response)
+        rte_free(response);
 
     rte_free(msg);
     rte_free(cmd);
@@ -201,8 +240,82 @@ void pmdlink_add_node(uint16_t port, uint16_t source_teid, uint16_t tx_priority)
 
 struct port_hqos_state *port_hqos_table[MAXPORTS];
 
-*/
+/*
+ * PMDLink (iavf VFs only): strict priority between the TX queues of this VF.
+ * TX queue q carries traffic class q (see app_thread.c), so queue 0 = TC0 gets
+ * the highest priority. E810: priority 7 is served first; the ice driver
+ * ignores tx_priority 0, so 7 levels are usable (7..1) and queues >= 6 share 1.
+ *
+ * Priority only arbitrates between siblings. Each queue group gets the highest
+ * priority of its queues, and queues that share a group get their own
+ * priority inside it. With one queue per group (the default tree) only the
+ * groups are set.
+ *
+ * This works within one VF only: the PF accepts HQoS messages for nodes
+ * inside the calling VF's subtree, so priority across instances (VFs) cannot
+ * be configured this way.
+ */
 static void port_hqos_init(uint16_t port) {
+    struct rte_eth_dev_info dev_info;
+
+    if (rte_eth_dev_info_get(port, &dev_info) != 0 ||
+        strcmp(dev_info.driver_name, "net_iavf") != 0)
+        return;
+
+    struct port_hqos_state *pht = rte_zmalloc("user qos llapi", sizeof(struct port_hqos_state), 0);
+    port_hqos_table[port] = pht;
+
+    qos_node_t *qos_nodes = pmdlink_read_topology(port);
+    pht->root = qos_nodes[0].teid;
+    pht->binding_count = 0;
+    pht->bindings[0] = (struct binding){0, 0};
+
+    /* Optional cap on the VF's root node, in kbps. 0 keeps the default
+     * (unlimited) tree; the old code set 10000000 = 10 Gb/s here. */
+#define PMDLINK_VF_TX_MAX_KBPS 0
+    if (PMDLINK_VF_TX_MAX_KBPS)
+        pmdlink_set_shaper(port, qos_nodes[0].teid);
+
+    int n = 0;
+    while (qos_nodes[n].teid != 0)
+        n++;
+    uint16_t *group_prio = rte_zmalloc("group_prio", sizeof(uint16_t) * (n + 1), 0);
+
+    for (int i = 0; i < n; i++) {
+        if (qos_nodes[i].node_type != VIRTCHNL_HQOS_ELEM_TYPE_LEAF)
+            continue;
+
+        int q = qos_nodes[i].tx_queue_id;
+        uint16_t prio = (q < 6) ? (uint16_t)(7 - q) : 1;
+
+        int siblings = 0, g = -1;
+        for (int j = 0; j < n; j++) {
+            if (qos_nodes[j].parent_teid == qos_nodes[i].parent_teid)
+                siblings++;
+            if (qos_nodes[j].teid == qos_nodes[i].parent_teid)
+                g = j;
+        }
+        if (siblings > 1) {
+            printf("port=%d: queue %d (leaf %u) -> priority %u inside group %u\n",
+                   port, q, qos_nodes[i].teid, prio, qos_nodes[i].parent_teid);
+            pmdlink_node_priority(port, qos_nodes[i].teid, prio);
+        }
+        if (g >= 0 && prio > group_prio[g])
+            group_prio[g] = prio;
+    }
+
+    for (int g = 0; g < n; g++) {
+        if (group_prio[g] == 0)
+            continue;
+        printf("port=%d: queue group %u -> priority %u\n", port, qos_nodes[g].teid, group_prio[g]);
+        pmdlink_node_priority(port, qos_nodes[g].teid, group_prio[g]);
+    }
+
+    /* read back, to see what the NIC now has */
+    rte_free(group_prio);
+    rte_free(qos_nodes);
+    qos_nodes = pmdlink_read_topology(port);
+    rte_free(qos_nodes);
 }
 static int
 app_init_port_tm(uint16_t port_id)
@@ -371,7 +484,9 @@ app_init_port(uint16_t portid, struct rte_mempool *mp, bool hqos_init)
 		       	rte_exit(EXIT_FAILURE, "rte_eth_tx_queue_setup: err=%d, port=%u queue=%d\n", ret, portid, i);
 	}
 
-	app_init_port_tm(portid);
+	/* cnxk (Octeon) rte_tm tree; on iavf, PMDLink sets priorities after start */
+	if (strcmp(dev_info.driver_name, "net_iavf") != 0)
+		app_init_port_tm(portid);
 
 	/* Start device */
 	ret = rte_eth_dev_start(portid);
@@ -668,8 +783,8 @@ int app_init(void)
 		if (qos_conf[i].mbuf_pool == NULL)
 			rte_exit(EXIT_FAILURE, "Cannot init mbuf pool for socket %u\n", i);
 
-		app_init_port(qos_conf[i].rx_port, qos_conf[i].mbuf_pool, false);
-		app_init_port(qos_conf[i].tx_port, qos_conf[i].mbuf_pool, false);
+		app_init_port(qos_conf[i].rx_port, qos_conf[i].mbuf_pool, true);
+		app_init_port(qos_conf[i].tx_port, qos_conf[i].mbuf_pool, true);
 
 		memset(&link, 0, sizeof(link));
 		ret = rte_eth_link_get(qos_conf[i].tx_port, &link);

@@ -33,7 +33,8 @@ void pmdlink_delete_node(port_t port, teid_t node_teid);
 typedef struct {
     uint32_t teid;
     uint32_t parent_teid;
-    uint16_t tx_queue_id;
+    uint8_t node_type;      /* VIRTCHNL_HQOS_ELEM_TYPE_NODE / _LEAF */
+    uint16_t tx_queue_id;   /* leaves only: derived from tree order, see pmdlink_read_topology() */
 } qos_node_t;
 
 qos_node_t *pmdlink_read_topology(port_t port);

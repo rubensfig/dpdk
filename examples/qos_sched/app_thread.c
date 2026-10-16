@@ -299,7 +299,7 @@ app_tx_thread(struct thread_conf **confs)
 				int tx_queue = mbufs[i]->hash.sched.traffic_class;
 				int tx_port = conf->tx_port;
 
-				if (tx_queue > N_TX_QUEUES) {
+				if (tx_queue >= N_TX_QUEUES) {
 					tx_queue = 1;
 				}
 
@@ -995,7 +995,7 @@ app_mixed_thread_prioprop(struct thread_conf **confs)
 			int tx_queue = mbufs[i]->hash.sched.traffic_class;
 			int tx_port = conf->tx_port;
 	
-			if (tx_queue > N_TX_QUEUES) {
+			if (tx_queue >= N_TX_QUEUES) {
 				tx_queue = 1;	
 			}
 	

@@ -1370,6 +1370,10 @@ typedef uint64_t (*eth_get_restore_flags_t)(struct rte_eth_dev *dev,
 /**
  * @internal A structure containing the functions exported by an Ethernet driver.
  */
+/** PMDLink: forward a raw virtchnl message from a VF to its PF (iavf only). */
+struct vf_msg_command;
+typedef int (*eth_dev_send_vf_msg_t)(struct rte_eth_dev *dev, struct vf_msg_command *cmd);
+
 struct eth_dev_ops {
 	eth_dev_configure_t        dev_configure; /**< Configure device */
 	eth_dev_start_t            dev_start;     /**< Start device */
@@ -1615,6 +1619,9 @@ struct eth_dev_ops {
 
 	/** Get configuration which ethdev should restore */
 	eth_get_restore_flags_t get_restore_flags;
+
+	/** PMDLink: send a raw virtchnl message to the PF (iavf only) */
+	eth_dev_send_vf_msg_t send_vf_msg;
 };
 
 /**

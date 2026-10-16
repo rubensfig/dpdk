@@ -258,16 +258,17 @@ struct virtchnl_hqos_cfg {
     uint64_t tx_share;
     uint32_t tx_priority;
     uint32_t tx_weight;
-    uint16_t vsi_handle;
-    uint16_t tx_queue_id;
-    uint32_t id;
+    /* The loaded ice driver sends 40-byte elements. The 1.17.2 extension
+     * (vsi_handle, tx_queue_id, id -> 48 bytes) is not used here. */
 };
+_Static_assert(sizeof(struct virtchnl_hqos_cfg) == 40, "virtchnl_hqos_cfg must be 40 bytes");
 
 struct virtchnl_hqos_cfg_list {
     uint16_t num_elem;
     uint8_t pad[6];
     struct virtchnl_hqos_cfg cfg[1];
 };
+_Static_assert(sizeof(struct virtchnl_hqos_cfg_list) == 48, "virtchnl_hqos_cfg_list must be 48 bytes");
 
 struct vf_msg_command {
     uint32_t opcode;         // Operation code

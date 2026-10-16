@@ -326,6 +326,7 @@ EXPERIMENTAL {
 	rte_flow_template_table_resize_complete;
 
 	# added in 24.11
+	rte_eth_dev_send_vf_msg;
 	__rte_ethdev_trace_rx_burst_empty;
 	__rte_ethdev_trace_rx_burst_nonempty;
 	__rte_eth_trace_call_rx_callbacks_empty;
