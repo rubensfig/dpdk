@@ -101,7 +101,6 @@ qos_node_t *pmdlink_read_topology(port_t port) {
                  sched_cfg->num_elem, max_elem);
 
     qos_node_t *rsp = rte_zmalloc("qos_nodes", sizeof(qos_node_t) * (1 + sched_cfg->num_elem), 0);
-    uint16_t next_queue = 0;
 
     printf("HQOS tree, port %d (%u elements):\n", port, sched_cfg->num_elem);
     for (int i = 0; i < sched_cfg->num_elem; i++) {
@@ -114,18 +113,48 @@ qos_node_t *pmdlink_read_topology(port_t port) {
             .teid = c->teid,
             .parent_teid = c->parent_teid,
             .node_type = c->node_type,
-            /* The driver sends no queue id. The tree is sent depth-first and
-             * queues are added in order, so the k-th leaf is TX queue k.
-             * Check this against the printout below. */
-            .tx_queue_id = (c->node_type == VIRTCHNL_HQOS_ELEM_TYPE_LEAF) ? next_queue++ : 0,
+            .tx_queue_id = 0, /* leaves: set below */
         };
         printf("  [%d] %s teid=%u parent=%u prio=%u weight=%u%s\n", i,
                c->node_type == VIRTCHNL_HQOS_ELEM_TYPE_LEAF ? "leaf" : "node",
                c->teid, c->parent_teid, c->tx_priority, c->tx_weight,
-               c->node_type == VIRTCHNL_HQOS_ELEM_TYPE_LEAF ? "  <- queue" : "");
+               c->node_type == VIRTCHNL_HQOS_ELEM_TYPE_LEAF ? "  <- leaf" : "");
     }
     // set an end marker, teid==0 is not legal/used (checked above)
     rsp[sched_cfg->num_elem] = (qos_node_t){ .teid = 0 };
+
+    /* The driver sends no queue id. ice gives each new queue to the
+     * least-loaded queue group, scanning the groups in tree order
+     * (ice_sched_get_free_qgrp), so queues are spread round-robin over the
+     * groups: with G groups, the k-th leaf of the g-th group is TX queue
+     * k*G + g. Leaves are listed in the order they were attached. */
+    {
+        uint32_t groups[MAXQUEUES];
+        uint16_t filled[MAXQUEUES] = {0};
+        int n_groups = 0;
+
+        for (int i = 0; i < sched_cfg->num_elem; i++) {
+            if (rsp[i].node_type != VIRTCHNL_HQOS_ELEM_TYPE_LEAF)
+                continue;
+            int g = 0;
+            while (g < n_groups && groups[g] != rsp[i].parent_teid)
+                g++;
+            if (g == n_groups && n_groups < MAXQUEUES)
+                groups[n_groups++] = rsp[i].parent_teid;
+        }
+        for (int i = 0; i < sched_cfg->num_elem; i++) {
+            if (rsp[i].node_type != VIRTCHNL_HQOS_ELEM_TYPE_LEAF)
+                continue;
+            int g = 0;
+            while (groups[g] != rsp[i].parent_teid)
+                g++;
+            rsp[i].tx_queue_id = filled[g]++ * n_groups + g;
+        }
+        for (int i = 0; i < sched_cfg->num_elem; i++)
+            if (rsp[i].node_type == VIRTCHNL_HQOS_ELEM_TYPE_LEAF)
+                printf("  leaf %u (group %u) = TX queue %u\n",
+                       rsp[i].teid, rsp[i].parent_teid, rsp[i].tx_queue_id);
+    }
 
     rte_free(response);
     return rsp;
@@ -167,7 +196,7 @@ static void pmdlink_set_shaper(uint16_t port, uint32_t source_teid) {
 }
 
 
-static void pmdlink_node_priority(uint16_t port, uint32_t source_teid, uint16_t tx_priority) {
+static __rte_unused void pmdlink_node_priority(uint16_t port, uint32_t source_teid, uint16_t tx_priority) {
     struct vf_msg_command *cmd;
     cmd = rte_zmalloc("vf_msg_command", sizeof(struct vf_msg_command), 0);
 
@@ -240,21 +269,83 @@ static __rte_unused void pmdlink_add_node(uint16_t port, uint32_t source_teid, u
 
 struct port_hqos_state *port_hqos_table[MAXPORTS];
 
-/*
+/* ------------------------------------------------------------------------
  * PMDLink (iavf VFs only): strict priority between the TX queues of this VF.
- * TX queue q carries traffic class q (see app_thread.c), so queue 0 = TC0 gets
- * the highest priority. E810: priority 7 is served first; the ice driver
- * ignores tx_priority 0, so 7 levels are usable (7..1) and queues >= 6 share 1.
  *
- * Priority only arbitrates between siblings. Each queue group gets the highest
- * priority of its queues, and queues that share a group get their own
- * priority inside it. With one queue per group (the default tree) only the
- * groups are set.
+ * TX queue q carries traffic class q (app_thread.c), so queue 0 = TC0 is the
+ * most important. On E810, priority only arbitrates between siblings, 7 is
+ * served first, and the ice driver ignores priority 0, so a sibling set has
+ * 7 usable levels (7..1).
  *
- * This works within one VF only: the PF accepts HQoS messages for nodes
- * inside the calling VF's subtree, so priority across instances (VFs) cannot
- * be configured this way.
- */
+ * ice spreads a VF's queues round-robin over its queue groups, so by default
+ * every group mixes classes. To get one strict order over all queues, the
+ * leaves are moved so that group j holds queues 7j .. 7j+6:
+ *   group j gets priority 7 - j, queue q gets 7 - (q % 7) inside its group.
+ * Missing groups are created with ELEMS_ADD. Moves stay inside this VF's
+ * subtree, which is all the PF allows; priority across VFs is not possible.
+ *
+ * The kernel ORs a new priority into the old bits, so run the same
+ * configuration every time (or reload ice) to keep the values exact.
+ * ------------------------------------------------------------------------ */
+#define PMDLINK_LEVELS          7   /* usable priorities per sibling set */
+#define PMDLINK_QGRP_MAX_CHILD  8   /* E810 queue-group fan-out */
+
+static int pmdlink_send_one(uint16_t port, uint32_t opcode, const struct virtchnl_hqos_cfg *cfg)
+{
+    struct vf_msg_command *cmd = rte_zmalloc("vf_msg_command", sizeof(*cmd), 0);
+    struct virtchnl_hqos_cfg_list *msg = rte_zmalloc("hqos", sizeof(*msg), 0);
+    uint8_t *response = NULL;
+    int ret;
+
+    msg->num_elem = 1;
+    msg->cfg[0] = *cfg;
+    cmd->opcode = opcode;
+    cmd->input_buffer = (uint8_t *)msg;
+    cmd->input_size = sizeof(*msg);
+    cmd->output_buffer = &response;
+    cmd->output_size = IAVF_AQ_BUF_SZ;
+
+    ret = rte_eth_dev_send_vf_msg(port, cmd);
+    if (ret != 0)
+        rte_log(RTE_LOG_ERR, RTE_LOGTYPE_USER1,
+                "port %u: opcode %u (teid %u, parent %u) failed: %d (see dmesg on the host)\n",
+                port, opcode, cfg->teid, cfg->parent_teid, ret);
+    if (response)
+        rte_free(response);
+    rte_free(msg);
+    rte_free(cmd);
+    return ret;
+}
+
+static int pmdlink_move(uint16_t port, uint32_t teid, uint32_t new_parent)
+{
+    struct virtchnl_hqos_cfg c = { .node_type = VIRTCHNL_HQOS_ELEM_TYPE_LEAF,
+                                   .teid = teid, .parent_teid = new_parent };
+    return pmdlink_send_one(port, VIRTCHNL_OP_HQOS_ELEMS_MOVE, &c);
+}
+
+static int pmdlink_add_group(uint16_t port, uint32_t parent)
+{
+    struct virtchnl_hqos_cfg c = { .node_type = VIRTCHNL_HQOS_ELEM_TYPE_NODE,
+                                   .parent_teid = parent };
+    return pmdlink_send_one(port, VIRTCHNL_OP_HQOS_ELEMS_ADD, &c);
+}
+
+static int pmdlink_prio(uint16_t port, uint32_t teid, uint32_t prio)
+{
+    struct virtchnl_hqos_cfg c = { .node_type = VIRTCHNL_HQOS_ELEM_TYPE_NODE,
+                                   .teid = teid, .tx_priority = prio };
+    return pmdlink_send_one(port, VIRTCHNL_OP_HQOS_ELEMS_CONF, &c);
+}
+
+static int find_teid(const uint32_t *v, int n, uint32_t teid)
+{
+    for (int i = 0; i < n; i++)
+        if (v[i] == teid)
+            return i;
+    return -1;
+}
+
 static void port_hqos_init(uint16_t port) {
     struct rte_eth_dev_info dev_info;
 
@@ -265,8 +356,8 @@ static void port_hqos_init(uint16_t port) {
     struct port_hqos_state *pht = rte_zmalloc("user qos llapi", sizeof(struct port_hqos_state), 0);
     port_hqos_table[port] = pht;
 
-    qos_node_t *qos_nodes = pmdlink_read_topology(port);
-    pht->root = qos_nodes[0].teid;
+    qos_node_t *t = pmdlink_read_topology(port);
+    pht->root = t[0].teid;
     pht->binding_count = 0;
     pht->bindings[0] = (struct binding){0, 0};
 
@@ -274,49 +365,136 @@ static void port_hqos_init(uint16_t port) {
      * (unlimited) tree; the old code set 10000000 = 10 Gb/s here. */
 #define PMDLINK_VF_TX_MAX_KBPS 0
     if (PMDLINK_VF_TX_MAX_KBPS)
-        pmdlink_set_shaper(port, qos_nodes[0].teid);
+        pmdlink_set_shaper(port, t[0].teid);
 
-    int n = 0;
-    while (qos_nodes[n].teid != 0)
-        n++;
-    uint16_t *group_prio = rte_zmalloc("group_prio", sizeof(uint16_t) * (n + 1), 0);
+    /* leaves (with their queue ids, from the first read) and queue groups */
+    static uint32_t leaf_teid[MAXQUEUES], cur[MAXQUEUES], target[MAXQUEUES];
+    static uint16_t leaf_q[MAXQUEUES];
+    static uint32_t grp[MAXQUEUES];
+    int nl = 0, ng = 0;
+    uint32_t grp_parent = 0;
 
-    for (int i = 0; i < n; i++) {
-        if (qos_nodes[i].node_type != VIRTCHNL_HQOS_ELEM_TYPE_LEAF)
+    for (int i = 0; t[i].teid != 0; i++) {
+        if (t[i].node_type != VIRTCHNL_HQOS_ELEM_TYPE_LEAF || nl >= MAXQUEUES)
             continue;
+        leaf_teid[nl] = t[i].teid;
+        leaf_q[nl] = t[i].tx_queue_id;
+        cur[nl] = t[i].parent_teid;
+        nl++;
+        if (find_teid(grp, ng, t[i].parent_teid) < 0)
+            grp[ng++] = t[i].parent_teid;
+    }
+    for (int i = 0; t[i].teid != 0; i++)
+        if (ng && t[i].teid == grp[0])
+            grp_parent = t[i].parent_teid;
+    rte_free(t);
 
-        int q = qos_nodes[i].tx_queue_id;
-        uint16_t prio = (q < 6) ? (uint16_t)(7 - q) : 1;
-
-        int siblings = 0, g = -1;
-        for (int j = 0; j < n; j++) {
-            if (qos_nodes[j].parent_teid == qos_nodes[i].parent_teid)
-                siblings++;
-            if (qos_nodes[j].teid == qos_nodes[i].parent_teid)
-                g = j;
-        }
-        if (siblings > 1) {
-            printf("port=%d: queue %d (leaf %u) -> priority %u inside group %u\n",
-                   port, q, qos_nodes[i].teid, prio, qos_nodes[i].parent_teid);
-            pmdlink_node_priority(port, qos_nodes[i].teid, prio);
-        }
-        if (g >= 0 && prio > group_prio[g])
-            group_prio[g] = prio;
+    if (nl == 0 || grp_parent == 0) {
+        printf("port=%d: PMDLink: no TX queues found in the tree\n", port);
+        return;
     }
 
-    for (int g = 0; g < n; g++) {
-        if (group_prio[g] == 0)
-            continue;
-        printf("port=%d: queue group %u -> priority %u\n", port, qos_nodes[g].teid, group_prio[g]);
-        pmdlink_node_priority(port, qos_nodes[g].teid, group_prio[g]);
+    /* 1) enough groups: one per PMDLINK_LEVELS queues */
+    int needed = (nl + PMDLINK_LEVELS - 1) / PMDLINK_LEVELS;
+    if (needed > 7) {
+        printf("port=%d: PMDLink: %d queues need %d groups, at most 7 can be ordered\n",
+               port, nl, needed);
+        needed = 7;
+    }
+    while (ng < needed) {
+        if (pmdlink_add_group(port, grp_parent) != 0)
+            break;
+        qos_node_t *t2 = pmdlink_read_topology(port);
+        int added = 0;
+        for (int i = 0; t2[i].teid != 0 && ng < needed; i++)
+            if (t2[i].parent_teid == grp_parent &&
+                t2[i].node_type != VIRTCHNL_HQOS_ELEM_TYPE_LEAF &&
+                find_teid(grp, ng, t2[i].teid) < 0) {
+                grp[ng++] = t2[i].teid;
+                added = 1;
+            }
+        rte_free(t2);
+        if (!added)
+            break;
+    }
+    if (ng < needed) {
+        printf("port=%d: PMDLink: could only get %d of %d queue groups; "
+               "priorities below are approximate\n", port, ng, needed);
+        needed = ng;
     }
 
-    /* read back, to see what the NIC now has */
-    rte_free(group_prio);
-    rte_free(qos_nodes);
-    qos_nodes = pmdlink_read_topology(port);
-    rte_free(qos_nodes);
+    /* 2) move each leaf to group q / 7 (overflow queues go to the last group) */
+    int cnt[MAXQUEUES] = {0};
+    for (int k = 0; k < nl; k++) {
+        int g = leaf_q[k] / PMDLINK_LEVELS;
+        target[k] = grp[g < needed ? g : needed - 1];
+        int cg = find_teid(grp, ng, cur[k]);
+        if (cg >= 0)
+            cnt[cg]++;
+    }
+
+    int moves = 0, failed = 0;
+    for (int iter = 0; iter < 4 * nl && !failed; iter++) {
+        int misplaced = 0, progress = 0;
+
+        for (int k = 0; k < nl && !failed; k++) {
+            if (cur[k] == target[k])
+                continue;
+            misplaced++;
+            int tg = find_teid(grp, ng, target[k]), cg = find_teid(grp, ng, cur[k]);
+            if (cnt[tg] >= PMDLINK_QGRP_MAX_CHILD)
+                continue;
+            if (pmdlink_move(port, leaf_teid[k], target[k]) != 0) {
+                failed = 1;
+                break;
+            }
+            cnt[tg]++; cnt[cg]--; cur[k] = target[k];
+            moves++; progress = 1; misplaced--;
+        }
+        if (!misplaced || failed)
+            break;
+        if (!progress) {
+            /* every target is full: park one misplaced leaf in a group with room */
+            for (int k = 0; k < nl; k++) {
+                if (cur[k] == target[k])
+                    continue;
+                int cg = find_teid(grp, ng, cur[k]), g;
+                for (g = 0; g < ng; g++)
+                    if (grp[g] != cur[k] && cnt[g] < PMDLINK_QGRP_MAX_CHILD)
+                        break;
+                if (g == ng || pmdlink_move(port, leaf_teid[k], grp[g]) != 0) {
+                    failed = 1;
+                    break;
+                }
+                cnt[g]++; cnt[cg]--; cur[k] = grp[g]; moves++;
+                break;
+            }
+        }
+    }
+    printf("port=%d: PMDLink: %d queues, %d groups, %d moves%s\n", port, nl, needed, moves,
+           failed ? " (FAILED: queues keep their default groups)" : "");
+
+    /* 3) priorities: groups 7, 6, ...; queues 7..1 inside their group */
+    for (int k = 0; k < nl; k++) {
+        uint32_t lp = PMDLINK_LEVELS - (leaf_q[k] % PMDLINK_LEVELS);
+        int g = find_teid(grp, ng, cur[k]);
+        if (!failed && leaf_q[k] >= needed * PMDLINK_LEVELS)
+            lp = 1;  /* overflow queues share the lowest level */
+        printf("port=%d: queue %u (leaf %u) -> priority %u in group %u (group priority %d)\n",
+               port, leaf_q[k], leaf_teid[k], lp, cur[k], 7 - g);
+        pmdlink_prio(port, leaf_teid[k], lp);
+    }
+    for (int g = 0; g < needed; g++)
+        pmdlink_prio(port, grp[g], 7 - g);
+    if (failed)
+        printf("port=%d: WARNING: queues were not regrouped, so strict priority holds for "
+               "queue 0 against the rest only\n", port);
+
+    /* 4) read back */
+    t = pmdlink_read_topology(port);
+    rte_free(t);
 }
+
 static int
 app_init_port_tm(uint16_t port_id)
 {
