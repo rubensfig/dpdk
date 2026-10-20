@@ -7,6 +7,7 @@
 
 #include <stdbool.h>
 #include <rte_sched.h>
+#include <rte_ether.h>
 #include "pending_stats.h"
 #include "ctrl_stats.h"
 
@@ -133,6 +134,41 @@ bool mixed_mode_has_tc_stats(void);
 #define N_TX_QUEUES 16
 #define N_TC 16
 
+/*
+ * PF mode (--pf-tree): all instances share one PF port. Instance i (= pfc i)
+ * receives on RX queue i (rte_flow on its Ixia gateway MAC) and transmits on
+ * TX queues txq_base .. txq_base + PF_NQ - 1, txq_base = i * PF_NQ. The NIC
+ * Tx tree (class- or instance-major) is built in pf_tree.c. app_tc2q maps the
+ * rte_sched traffic class to the queue inside the instance (identity outside
+ * PF mode, so TXQ() == tc there and the VF/cnxk path is unchanged).
+ */
+#define PF_NQ 8                    /* NIC classes = TX queues per instance */
+#define MAX_TXQ_PER_PORT 128
+extern uint8_t app_tc2q[N_TC];
+#define TXQ(conf, tc) ((uint16_t)((conf)->txq_base + app_tc2q[(tc)]))
+
+enum pf_tree_shape {
+	PF_TREE_OFF = 0,	/* VF / cnxk behaviour, one instance per port */
+	PF_TREE_CLASS,		/* classes above instances: global priority */
+	PF_TREE_INSTANCE,	/* instances above classes: per-VF behaviour */
+	PF_TREE_DEFAULT,	/* PF mode, driver's default tree */
+};
+
+struct pf_conf {
+	enum pf_tree_shape shape;
+	double rate_gbps;		/* port shaper, 0 = none */
+	struct rte_ether_addr inst_mac;	/* instance i: last byte + i */
+	int levels;			/* TM depth, -1 = detect */
+	bool set_dst;			/* --pf-dst-mac given */
+	struct rte_ether_addr dst_mac;	/* instance i: byte 1 + i (Ixia upstream) */
+};
+extern struct pf_conf pf_conf;
+int pf_parse_tree(const char *s);
+int pf_parse_tc_map(const char *s);
+const char *pf_tree_name(void);
+void pf_init_ports(void);
+void pf_cleanup(void);
+
 struct thread_stat
 {
 	uint64_t nb_rx;
@@ -147,6 +183,12 @@ struct __rte_cache_aligned thread_conf
 	uint16_t tx_port;
 	uint16_t rx_queue;
 	uint16_t tx_queue;
+	uint16_t txq_base;		/* PF mode: first TX queue of the instance */
+	/* PF mode, set in pf_tree.c: MACs written by the RX thread after the
+	 * swap (0 = keep, 1 = source only, 2 = source and destination) */
+	uint8_t mac_rewrite;
+	struct rte_ether_addr src_mac;
+	struct rte_ether_addr dst_mac;
 	struct rte_ring *rx_ring;
 	struct rte_ring *tx_ring;
 	struct rte_sched_port *sched_port;
@@ -166,6 +208,7 @@ struct flow_conf
 	uint16_t tx_port;
 	uint16_t rx_queue;
 	uint16_t tx_queue;
+	uint16_t txq_base;		/* PF mode: first TX queue of the instance */
 	struct rte_ring *rx_ring;
 	struct rte_ring *tx_ring;
 	struct rte_sched_port *sched_port;
@@ -225,7 +268,7 @@ extern struct rte_sched_port_params port_params;
 extern struct rte_sched_cman_params cman_params;
 extern struct rte_sched_subport_params subport_params[MAX_SCHED_SUBPORTS];
 
-extern struct rte_eth_dev_tx_buffer *tx_buffer[RTE_MAX_ETHPORTS][N_TX_QUEUES];
+extern struct rte_eth_dev_tx_buffer *tx_buffer[RTE_MAX_ETHPORTS][MAX_TXQ_PER_PORT];
 
 int app_parse_args(int argc, char **argv);
 int app_init(void);

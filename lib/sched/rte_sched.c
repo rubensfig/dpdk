@@ -32,6 +32,28 @@
 #define RTE_SCHED_PORT_N_GRINDERS 8
 #endif
 
+/*
+ * Per-visit quantum for the lower-priority TCs (TC > 0): a grinder serves at
+ * most this many packets of one LP TC of a pipe before it moves on; the queue
+ * stays active in the bitmap and is served again on the next pass. TC 0 (HP)
+ * still drains fully on every visit. 0 = no quantum (stock behaviour).
+ *
+ * Why: under backpressure rte_sched_port_dequeue_tc() gets a small LP budget,
+ * often 0. A visit used to drain the whole queue, so one budget reached only a
+ * few pipes, while calls with budget 0 skip LP pipes and HP pipes keep the
+ * scan going. Which LP pipes were served then depended on their position
+ * after the HP pipes in scan order: a fixed, address-dependent unfairness
+ * between LP users (25 users, LP qsize 64: max/min 1.5-2.0 per user). With a
+ * quantum one budget is spread over budget/Q pipes.
+ */
+#ifndef RTE_SCHED_LP_QUANTUM
+#define RTE_SCHED_LP_QUANTUM 1
+#endif
+/* LP packets per pipe and round (dequeue_tc); 0 in RTE_SCHED_LP_QUANTUM
+ * (no visit quantum) still allows one per round */
+#define RTE_SCHED_LP_QUANTUM_ROUND \
+	(RTE_SCHED_LP_QUANTUM ? RTE_SCHED_LP_QUANTUM : 1)
+
 #define RTE_SCHED_TB_RATE_CONFIG_ERR          (1e-7)
 #define RTE_SCHED_WRR_SHIFT                   3
 #define RTE_SCHED_MAX_QUEUES_PER_TC           RTE_SCHED_BE_QUEUES_PER_PIPE
@@ -78,6 +100,13 @@ struct __rte_cache_aligned rte_sched_pipe {
 	/* TC oversubscription */
 	uint64_t tc_ov_credits;
 	uint8_t tc_ov_period_id;
+
+	/* LP round (rte_sched_port_dequeue_tc): round in which this pipe last
+	 * sent an LP packet, and how many in that round (at most
+	 * RTE_SCHED_LP_QUANTUM per round) */
+	uint32_t lp_round;
+	uint8_t lp_cnt;
+	uint8_t lp_nq;		/* non-empty LP queues of this pipe */
 };
 
 struct rte_sched_queue {
@@ -120,6 +149,7 @@ struct rte_sched_grinder {
 	/* Current pipe */
 	enum grinder_state state;
 	uint32_t productive;
+	uint32_t n_visit;	/* packets of the current TC in this visit */
 	uint32_t pindex;
 	struct rte_sched_subport *subport;
 	struct rte_sched_subport_profile *subport_params;
@@ -201,6 +231,21 @@ struct __rte_cache_aligned rte_sched_subport {
 	/* Grinders */
 	struct rte_sched_grinder grinder[RTE_SCHED_PORT_N_GRINDERS];
 	uint32_t busy_grinders;
+
+	/* LP rounds (rte_sched_port_dequeue_tc). Under a per-TC budget a call
+	 * often serves only part of the LP pipes, and the shared bitmap scan
+	 * position between calls is set by HP, so the scan order alone does not
+	 * give the LP pipes equal turns. Instead each pipe gets at most one LP
+	 * turn per round (pipe->lp_round); a new round starts when the scan
+	 * wraps after refusing an already served pipe while LP budget was left.
+	 * Order of service within a round does not matter. */
+	uint32_t lp_round;
+	uint32_t lp_active;	/* pipes with a non-empty LP queue */
+	uint32_t lp_served;	/* of those, served in this round */
+	uint32_t lp_sent;	/* this pass: LP packets sent (fallback) */
+	uint32_t lp_refused;	/* this pass: refused a served pipe, budget left */
+	uint32_t lp_skipped;	/* this pass: skipped an unserved pipe, no budget */
+	uint32_t lp_last_pos;	/* last bitmap position read (wrap detection) */
 
 	/* Queue base calculation */
 	uint32_t qsize_add[RTE_SCHED_QUEUES_PER_PIPE];
@@ -2087,6 +2132,19 @@ rte_sched_port_enqueue_qwa(struct rte_sched_port *port,
 		return 0;
 	}
 
+	/* LP round: count pipes with a backlogged LP queue */
+	if (qlen == 0 && (qindex & (RTE_SCHED_QUEUES_PER_PIPE - 1)) != 0) {
+		struct rte_sched_pipe *pipe = subport->pipe +
+			(qindex / RTE_SCHED_QUEUES_PER_PIPE);
+
+		if (pipe->lp_nq++ == 0) {
+			subport->lp_active++;
+			/* back within the round it was served in: still served */
+			if (pipe->lp_round == subport->lp_round && pipe->lp_cnt)
+				subport->lp_served++;
+		}
+	}
+
 	/* Enqueue packet */
 	qbase[q->qw & (qsize - 1)] = pkt;
 	q->qw++;
@@ -2541,6 +2599,19 @@ grinder_schedule(struct rte_sched_port *port,
 	 * credits: the credit checks deduct credits on success, so a TC with no
 	 * budget left would otherwise burn subport/pipe/TC credits without
 	 * sending anything, on every grinder pass. */
+	/* LP round: at most RTE_SCHED_LP_QUANTUM LP packets per pipe and round */
+	if (capacity_pct && tc != 0) {
+		if (grinder->pipe->lp_round == subport->lp_round &&
+		    grinder->pipe->lp_cnt >= RTE_SCHED_LP_QUANTUM_ROUND) {
+			if (capacity_pct[tc] != 0)
+				subport->lp_refused = 1;
+			return 0;
+		}
+		if (capacity_pct[tc] == 0) {
+			subport->lp_skipped = 1;	/* still owed a turn */
+			return 0;
+		}
+	}
 	if (capacity_pct && capacity_pct[tc] == 0)
 		return 0;
 
@@ -2559,18 +2630,46 @@ grinder_schedule(struct rte_sched_port *port,
 	// port->pkts_out[port->n_pkts_out++] = pkt;
 	port->pkts_out_tc[tc][port->tc_pkts_out[tc]++] = pkt;
 	queue->qr++;
+	if (capacity_pct && tc != 0) {
+		struct rte_sched_pipe *pipe = grinder->pipe;
+
+		if (pipe->lp_round != subport->lp_round || pipe->lp_cnt == 0) {
+			pipe->lp_round = subport->lp_round;
+			pipe->lp_cnt = 0;
+			subport->lp_served++;
+		}
+		pipe->lp_cnt++;
+		subport->lp_sent++;
+	}
 
 	be_tc_active = (grinder->tc_index == RTE_SCHED_TRAFFIC_CLASS_BE) ? ~0x0 : 0x0;
 	grinder->wrr_tokens[grinder->qpos] +=
 		(pkt_len * grinder->wrr_cost[grinder->qpos]) & be_tc_active;
 
 	if (queue->qr == queue->qw) {
+		/* LP round: a pipe leaving keeps the count of served pipes exact */
+		if (tc != 0) {
+			struct rte_sched_pipe *pipe = grinder->pipe;
+
+			if (pipe->lp_nq && --pipe->lp_nq == 0) {
+				subport->lp_active--;
+				if (pipe->lp_round == subport->lp_round &&
+				    pipe->lp_cnt && subport->lp_served)
+					subport->lp_served--;
+			}
+		}
 		rte_bitmap_clear(subport->bmp, qindex);
 		grinder->qmask &= ~(1 << grinder->qpos);
 		if (be_tc_active)
 			grinder->wrr_mask[grinder->qpos] = 0;
 
 		rte_sched_port_red_set_queue_empty_timestamp(port, subport, qindex);
+	}
+
+	/* LP round: every backlogged pipe has had its turn, start the next */
+	if (capacity_pct && tc != 0 && subport->lp_served >= subport->lp_active) {
+		subport->lp_round++;
+		subport->lp_served = 0;
 	}
 
 	rte_sched_port_pie_dequeue(subport, qindex, pkt_len, port->time_cpu_cycles);
@@ -2674,6 +2773,7 @@ grinder_next_tc(struct rte_sched_port *port,
 
 	grinder->tc_index = rte_sched_port_pipe_tc(port, qindex);
 	grinder->qmask = grinder->tccache_qmask[grinder->tccache_r];
+	grinder->n_visit = 0;
 	grinder->qsize = qsize;
 
 	if (grinder->tc_index < RTE_SCHED_TRAFFIC_CLASS_BE) {
@@ -2727,6 +2827,26 @@ grinder_next_pipe(struct rte_sched_port *port,
 #ifdef RTE_SCHED_DEBUG
 		debug_check_queue_slab(subport, bmp_pos, bmp_slab);
 #endif
+
+		/* LP round: the scan runs in ascending position and wraps (a read
+		 * at or below the last position, also when all active pipes share
+		 * one slab). A pass that refused served pipes with budget left and
+		 * skipped no unserved pipe for lack of budget: every backlogged
+		 * pipe has had its turn, start the next round. */
+		if (bmp_pos <= subport->lp_last_pos) {
+			/* fallback only: a whole pass refused served pipes, sent no
+			 * LP and skipped nothing for lack of budget, so the pipes
+			 * still owed a turn cannot use it (e.g. out of TC credits) */
+			if (subport->lp_refused && !subport->lp_skipped &&
+			    !subport->lp_sent) {
+				subport->lp_round++;
+				subport->lp_served = 0;
+			}
+			subport->lp_refused = 0;
+			subport->lp_skipped = 0;
+			subport->lp_sent = 0;
+		}
+		subport->lp_last_pos = bmp_pos;
 
 		/* Return if pipe group already in one of the other grinders */
 		subport->grinder_base_bmp_pos[pos] = RTE_SCHED_BMP_POS_INVALID;
@@ -2948,8 +3068,11 @@ grinder_handle(struct rte_sched_port *port,
 
 		wrr_active = (grinder->tc_index == RTE_SCHED_TRAFFIC_CLASS_BE);
 
-		/* Look for next packet within the same TC */
-		if (result && grinder->qmask) {
+		/* Look for next packet within the same TC; LP TCs (TC > 0) at
+		 * most RTE_SCHED_LP_QUANTUM packets per visit */
+		if (result && grinder->qmask &&
+		    (RTE_SCHED_LP_QUANTUM == 0 || grinder->tc_index == 0 ||
+		     ++grinder->n_visit < RTE_SCHED_LP_QUANTUM)) {
 			if (wrr_active)
 				grinder_wrr(subport, pos);
 

@@ -582,8 +582,9 @@ telemetry_ctrl_stats(const char *cmd __rte_unused, const char *params,
 	if (qc != NULL) {
 		rte_tel_data_start_array(qc, RTE_TEL_INT_VAL);
 		for (int t = 0; t < CS_N_TC; t++) {
-			int c = t < N_TX_QUEUES ?
-				rte_eth_tx_queue_count(flow->tx_port, t) : -1;
+			int c = t < N_TC ?
+				rte_eth_tx_queue_count(flow->tx_port,
+					flow->txq_base + app_tc2q[t]) : -1;
 
 			rte_tel_data_add_array_int(qc, c < 0 ? -1 : c);
 		}
@@ -614,6 +615,19 @@ telemetry_scenario(const char *cmd __rte_unused,
 	rte_tel_data_add_dict_uint(d, "tsc_hz", rte_get_tsc_hz());
 	rte_tel_data_add_dict_uint(d, "tsc", rte_rdtsc());
 	rte_tel_data_add_dict_uint(d, "nb_pfc", nb_pfc);
+	rte_tel_data_add_dict_string(d, "pf_tree", pf_tree_name());
+	if (pf_conf.shape != PF_TREE_OFF) {
+		struct rte_tel_data *m = rte_tel_data_alloc();
+
+		rte_tel_data_add_dict_uint(d, "pf_rate_mbps",
+				(uint64_t)(pf_conf.rate_gbps * 1000));
+		if (m != NULL) {
+			rte_tel_data_start_array(m, RTE_TEL_UINT_VAL);
+			for (int t = 0; t < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; t++)
+				rte_tel_data_add_array_uint(m, app_tc2q[t]);
+			rte_tel_data_add_dict_container(d, "pf_tc2q", m, 0);
+		}
+	}
 	rte_tel_data_add_dict_uint(d, "n_tc", CS_N_TC);
 
 	rte_tel_data_add_dict_uint(d, "rx_desc", ring_conf.rx_size);
@@ -664,10 +678,12 @@ telemetry_scenario(const char *cmd __rte_unused,
 		rte_tel_data_add_dict_uint(fd, "rx_core", f->rx_core);
 		rte_tel_data_add_dict_uint(fd, "wt_core", f->wt_core);
 		rte_tel_data_add_dict_uint(fd, "tx_core", f->tx_core);
+		rte_tel_data_add_dict_uint(fd, "rx_queue", f->rx_queue);
+		rte_tel_data_add_dict_uint(fd, "txq_base", f->txq_base);
 		if (rte_eth_dev_info_get(f->tx_port, &info) == 0 &&
 				info.driver_name != NULL)
 			rte_tel_data_add_dict_string(fd, "pmd", info.driver_name);
-		if (rte_eth_tx_queue_info_get(f->tx_port, 0, &qi) == 0) {
+		if (rte_eth_tx_queue_info_get(f->tx_port, f->txq_base, &qi) == 0) {
 			rte_tel_data_add_dict_int(fd, "txq_nb_desc", qi.nb_desc);
 			rte_tel_data_add_dict_int(fd, "tx_rs_thresh",
 					qi.conf.tx_rs_thresh);

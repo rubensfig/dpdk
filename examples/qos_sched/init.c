@@ -72,6 +72,10 @@ static struct rte_eth_conf port_conf = {
 typedef uint16_t port_t;
 typedef uint16_t teid_t;
 
+/* Queue ids are derived from ice's default round-robin layout, which only
+ * holds before the leaves are regrouped; the read-back sets this to 0. */
+static int pmdlink_derive_queues = 1;
+
 qos_node_t *pmdlink_read_topology(port_t port) {
     struct vf_msg_command *cmd;
     uint8_t *response = NULL;
@@ -123,6 +127,7 @@ qos_node_t *pmdlink_read_topology(port_t port) {
     // set an end marker, teid==0 is not legal/used (checked above)
     rsp[sched_cfg->num_elem] = (qos_node_t){ .teid = 0 };
 
+    if (pmdlink_derive_queues)
     /* The driver sends no queue id. ice gives each new queue to the
      * least-loaded queue group, scanning the groups in tree order
      * (ice_sched_get_free_qgrp), so queues are spread round-robin over the
@@ -490,8 +495,10 @@ static void port_hqos_init(uint16_t port) {
         printf("port=%d: WARNING: queues were not regrouped, so strict priority holds for "
                "queue 0 against the rest only\n", port);
 
-    /* 4) read back */
+    /* 4) read back (queue ids are not re-derived: the layout changed) */
+    pmdlink_derive_queues = 0;
     t = pmdlink_read_topology(port);
+    pmdlink_derive_queues = 1;
     rte_free(t);
 }
 
@@ -817,24 +824,47 @@ struct rte_sched_port_params port_params = {
 };
 
 static struct rte_sched_port *
-app_init_sched_port(uint32_t portid, uint32_t socketid)
+app_init_sched_port(uint32_t portid, uint32_t socketid, uint32_t flow)
 {
-	static char port_name[32]; /* static as referenced from global port_params*/
+	/* static as referenced from global port_params; one per flow, since in
+	 * PF mode several instances share a tx port */
+	static char port_names[MAX_DATA_STREAMS][32];
+	char *port_name = port_names[flow];
 	struct rte_eth_link link;
 	struct rte_sched_port *port = NULL;
 	uint32_t pipe, subport;
 	uint32_t pipe_count;
 	int err;
 
-	err = rte_eth_link_get(portid, &link);
-	if (err < 0)
-		rte_exit(EXIT_FAILURE,
-			 "rte_eth_link_get: err=%d, port=%u: %s\n",
-			 err, portid, rte_strerror(-err));
+	/* rte_sched port rate = link speed. The link can read as down / speed 0
+	 * for a moment (seen on ice right after the first instance's scheduler
+	 * was set up), so retry and fall back to the last speed seen. */
+	static uint32_t last_speed[RTE_MAX_ETHPORTS];
+	uint32_t speed = 0;
+
+	for (int t = 0; t < 50; t++) {
+		err = rte_eth_link_get_nowait(portid, &link);
+		if (err < 0)
+			rte_exit(EXIT_FAILURE,
+				 "rte_eth_link_get: err=%d, port=%u: %s\n",
+				 err, portid, rte_strerror(-err));
+		if (link.link_speed && link.link_speed != RTE_ETH_SPEED_NUM_UNKNOWN) {
+			speed = link.link_speed;
+			break;
+		}
+		rte_delay_ms(100);
+	}
+	if (speed == 0)
+		speed = last_speed[portid];
+	if (speed == 0)
+		rte_exit(EXIT_FAILURE, "port %u: no link speed for the scheduler rate\n",
+			 portid);
+	last_speed[portid] = speed;
 
 	port_params.socket = socketid;
-	port_params.rate = (uint64_t) link.link_speed * 1000 * 1000 / 8;
-	snprintf(port_name, sizeof(port_name), "port_%d", portid);
+	port_params.rate = (uint64_t)speed * 1000 * 1000 / 8;
+	printf("sched port %u/%u: rate %u Mb/s (link)\n", portid, flow, speed);
+	snprintf(port_name, sizeof(port_names[0]), "port_%u_%u", portid, flow);
 	port_params.name = port_name;
 
 	port = rte_sched_port_config(&port_params);
@@ -961,6 +991,10 @@ int app_init(void)
 		if (qos_conf[i].mbuf_pool == NULL)
 			rte_exit(EXIT_FAILURE, "Cannot init mbuf pool for socket %u\n", i);
 
+		/* PF mode: ports are set up once all pools exist (pf_tree.c) */
+		if (pf_conf.shape != PF_TREE_OFF)
+			continue;
+
 		app_init_port(qos_conf[i].rx_port, qos_conf[i].mbuf_pool, true);
 		app_init_port(qos_conf[i].tx_port, qos_conf[i].mbuf_pool, true);
 
@@ -981,10 +1015,22 @@ int app_init(void)
 				 ret, qos_conf[i].tx_port, rte_strerror(-ret));
 		}
 
-		qos_conf[i].sched_port = app_init_sched_port(qos_conf[i].tx_port, socket);
+		qos_conf[i].sched_port = app_init_sched_port(qos_conf[i].tx_port, socket, i);
 
 		for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++)
 			pstats_reset(&qos_conf[i].tc_stats[tc]);
+	}
+
+	if (pf_conf.shape != PF_TREE_OFF) {
+		pf_init_ports();
+		for (i = 0; i < nb_pfc; i++) {
+			uint32_t socket = rte_lcore_to_socket_id(qos_conf[i].rx_core);
+
+			qos_conf[i].sched_port =
+				app_init_sched_port(qos_conf[i].tx_port, socket, i);
+			for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++)
+				pstats_reset(&qos_conf[i].tc_stats[tc]);
+		}
 	}
 
 	rte_telemetry_register_cmd( "/qos/pending_stats", telemetry_pending_stats,

@@ -15,5 +15,6 @@ sources = files(
         'cmdline.c',
         'init.c',
         'main.c',
+        'pf_tree.c',
         'stats.c',
 )

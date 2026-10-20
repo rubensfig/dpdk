@@ -27,6 +27,8 @@ static uint32_t app_numa_mask;
 static uint64_t app_used_port_mask = 0;
 static uint64_t app_used_rx_port_mask = 0;
 static uint64_t app_used_tx_port_mask = 0;
+/* a port used by more than one pfc: only allowed in PF mode (--pf-tree) */
+static bool app_port_shared = false;
 
 
 static const char usage[] =
@@ -70,6 +72,18 @@ static const char usage[] =
 	"    --cbc-poll US : CBC completion poll period T_poll in us (default %u)       \n"
 	"    --rej-add-step A : REJ additive window step (default %u)                   \n"
 	"    --rej-grow-streak K : REJ full transmits before growing W (default %u)     \n"
+	"    --pf-tree class|instance|default : PF mode, all pfc share the PF port(s);   \n"
+	"           pfc i = instance i: RX queue i (rte_flow on its MAC), TX queues     \n"
+	"           8i..8i+7; NIC tree with classes above instances (class), instances \n"
+	"           above classes (instance) or the driver's default tree (default)     \n"
+	"    --pf-rate-gbps R : PF mode port shaper in Gb/s, 0 = none (default 25)      \n"
+	"    --pf-tc-map \"q0,..,q12\" : traffic class -> one of the 8 TX queues of     \n"
+	"           the instance (default scheduler order: 0,1,2,3,4,5,6,7,7,7,7,7,7)   \n"
+	"    --pf-inst-mac MAC : MAC of instance 0, instance i adds i to the last byte  \n"
+	"           (default 00:11:22:33:44:00, the Ixia gateway MACs)                  \n"
+	"    --pf-levels L : TM tree depth (default: detected)                          \n"
+	"    --pf-dst-mac MAC : static MACs: source = tx port MAC, destination = MAC   \n"
+	"           with byte 1 + instance (Ixia upstream 00:<i>:01:00:00:01)           \n"
 ;
 
 /* display usage */
@@ -213,21 +227,16 @@ app_parse_flow_conf(const char *conf_str)
 		return -1;
 	}
 
+	/* ports shared between pfc are checked after parsing: PF mode allows it */
 	mask = 1lu << pconf->rx_port;
-	if (app_used_rx_port_mask & mask) {
-		RTE_LOG(ERR, APP, "pfc %u: rx port %"PRIu16" is used already\n",
-				nb_pfc, pconf->rx_port);
-		return -1;
-	}
+	if (app_used_rx_port_mask & mask)
+		app_port_shared = true;
 	app_used_rx_port_mask |= mask;
 	app_used_port_mask |= mask;
 
 	mask = 1lu << pconf->tx_port;
-	if (app_used_tx_port_mask & mask) {
-		RTE_LOG(ERR, APP, "pfc %u: port %"PRIu16" is used already\n",
-				nb_pfc, pconf->tx_port);
-		return -1;
-	}
+	if (app_used_tx_port_mask & mask)
+		app_port_shared = true;
 	app_used_tx_port_mask |= mask;
 	app_used_port_mask |= mask;
 
@@ -279,6 +288,18 @@ enum {
 	OPT_REJ_ADD_NUM,
 #define OPT_REJ_GROW "rej-grow-streak"
 	OPT_REJ_GROW_NUM,
+#define OPT_PF_TREE "pf-tree"
+	OPT_PF_TREE_NUM,
+#define OPT_PF_RATE "pf-rate-gbps"
+	OPT_PF_RATE_NUM,
+#define OPT_PF_TC_MAP "pf-tc-map"
+	OPT_PF_TC_MAP_NUM,
+#define OPT_PF_MAC "pf-inst-mac"
+	OPT_PF_MAC_NUM,
+#define OPT_PF_LEVELS "pf-levels"
+	OPT_PF_LEVELS_NUM,
+#define OPT_PF_DST_MAC "pf-dst-mac"
+	OPT_PF_DST_MAC_NUM,
 };
 
 /*
@@ -306,6 +327,12 @@ app_parse_args(int argc, char **argv)
 		{OPT_CBC_POLL, 1, NULL, OPT_CBC_POLL_NUM},
 		{OPT_REJ_ADD, 1, NULL, OPT_REJ_ADD_NUM},
 		{OPT_REJ_GROW, 1, NULL, OPT_REJ_GROW_NUM},
+		{OPT_PF_TREE, 1, NULL, OPT_PF_TREE_NUM},
+		{OPT_PF_RATE, 1, NULL, OPT_PF_RATE_NUM},
+		{OPT_PF_TC_MAP, 1, NULL, OPT_PF_TC_MAP_NUM},
+		{OPT_PF_MAC, 1, NULL, OPT_PF_MAC_NUM},
+		{OPT_PF_LEVELS, 1, NULL, OPT_PF_LEVELS_NUM},
+		{OPT_PF_DST_MAC, 1, NULL, OPT_PF_DST_MAC_NUM},
 		{NULL,    0, 0,    0          }
 	};
 
@@ -424,6 +451,49 @@ app_parse_args(int argc, char **argv)
 				rej_grow_streak = (uint32_t)atoi(optarg);
 				break;
 
+			case OPT_PF_TREE_NUM:
+				if (pf_parse_tree(optarg)) {
+					RTE_LOG(ERR, APP, "Invalid --pf-tree %s "
+						"(expected class|instance|default)\n", optarg);
+					return -1;
+				}
+				break;
+
+			case OPT_PF_RATE_NUM:
+				pf_conf.rate_gbps = atof(optarg);
+				if (pf_conf.rate_gbps < 0) {
+					RTE_LOG(ERR, APP, "Invalid --pf-rate-gbps %s\n", optarg);
+					return -1;
+				}
+				break;
+
+			case OPT_PF_TC_MAP_NUM:
+				if (pf_parse_tc_map(optarg)) {
+					RTE_LOG(ERR, APP, "Invalid --pf-tc-map %s (13 values "
+						"< %u)\n", optarg, PF_NQ);
+					return -1;
+				}
+				break;
+
+			case OPT_PF_MAC_NUM:
+				if (rte_ether_unformat_addr(optarg, &pf_conf.inst_mac)) {
+					RTE_LOG(ERR, APP, "Invalid --pf-inst-mac %s\n", optarg);
+					return -1;
+				}
+				break;
+
+			case OPT_PF_LEVELS_NUM:
+				pf_conf.levels = atoi(optarg);
+				break;
+
+			case OPT_PF_DST_MAC_NUM:
+				if (rte_ether_unformat_addr(optarg, &pf_conf.dst_mac)) {
+					RTE_LOG(ERR, APP, "Invalid --pf-dst-mac %s\n", optarg);
+					return -1;
+				}
+				pf_conf.set_dst = true;
+				break;
+
 			default:
 				app_usage(prgname);
 				return -1;
@@ -433,6 +503,12 @@ app_parse_args(int argc, char **argv)
 	if (nb_pfc == 0) {
 		RTE_LOG(ERR, APP, "Packet flow not configured!\n");
 		app_usage(prgname);
+		return -1;
+	}
+
+	if (app_port_shared && pf_conf.shape == PF_TREE_OFF) {
+		RTE_LOG(ERR, APP, "several pfc use the same rx or tx port: "
+			"only allowed in PF mode (--pf-tree)\n");
 		return -1;
 	}
 

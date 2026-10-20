@@ -257,6 +257,14 @@ app_rx_thread(struct thread_conf **confs)
 			for(i = 0; i < nb_rx; i++) {
 				get_pkt_sched(rx_mbufs[i],
 						&subport, &pipe, &traffic_class, &queue, &color);
+				if (conf->mac_rewrite) {
+					struct rte_ether_hdr *eh = rte_pktmbuf_mtod(
+							rx_mbufs[i], struct rte_ether_hdr *);
+
+					rte_ether_addr_copy(&conf->src_mac, &eh->src_addr);
+					if (conf->mac_rewrite == 2)
+						rte_ether_addr_copy(&conf->dst_mac, &eh->dst_addr);
+				}
 				rte_sched_port_pkt_write(conf->sched_port,
 						rx_mbufs[i],
 						subport, pipe,
@@ -302,6 +310,7 @@ app_tx_thread(struct thread_conf **confs)
 				if (tx_queue >= N_TX_QUEUES) {
 					tx_queue = 1;
 				}
+				tx_queue = TXQ(conf, tx_queue);
 
 				buffer = tx_buffer[tx_port][tx_queue];
 
@@ -406,7 +415,7 @@ app_mixed_thread_pertcdequeue(struct thread_conf **confs)
 		if (tc_counts[tc] == 0)
 			continue;
 
-		uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, pkts[tc], tc_counts[tc]);
+		uint16_t sent = rte_eth_tx_burst(conf->tx_port, TXQ(conf, tc), pkts[tc], tc_counts[tc]);
 
 		APP_STATS_ADD(conf->stat.nb_tx, sent);
 	}
@@ -457,7 +466,7 @@ app_mixed_thread_priobp(struct thread_conf **confs)
 		tc_counts[tc] = 0;
 		uint16_t n = pending_peek(&pending[tc], mbufs, burst_conf.qos_dequeue);
 		if (n > 0) {
-				uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, mbufs, n);
+				uint16_t sent = rte_eth_tx_burst(conf->tx_port, TXQ(conf, tc), mbufs, n);
 				if (sent) {
 					pending_consume(&pending[tc], sent);
 					APP_STATS_ADD(conf->stat.nb_tx, sent);
@@ -475,7 +484,7 @@ app_mixed_thread_priobp(struct thread_conf **confs)
 			continue;
 
 		// printf("tc_counts[%d] %d\n", tc, tc_counts[tc]);
-		uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, pkts[tc], tc_counts[tc]);
+		uint16_t sent = rte_eth_tx_burst(conf->tx_port, TXQ(conf, tc), pkts[tc], tc_counts[tc]);
 
 		if (unlikely(sent < tc_counts[tc])) {
 			pending_enqueue_burst( &pending[tc], &pkts[tc][sent], tc_counts[tc] - sent);
@@ -533,7 +542,7 @@ pending_retry_tx(struct thread_conf *conf, pending_tc_stats_t *s,
 		return 0;
 
 	uint64_t t0 = rte_rdtsc();
-	uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, out, n);
+	uint16_t sent = rte_eth_tx_burst(conf->tx_port, TXQ(conf, tc), out, n);
 	s->cycles_retry += rte_rdtsc() - t0;
 
 	if (sent) {
@@ -561,7 +570,7 @@ fresh_tx(struct thread_conf *conf, pending_tc_stats_t *s, struct pending_q *pq,
 		int tc, struct rte_mbuf **pkts, uint32_t b_tx, bool retry)
 {
 	uint64_t t0 = rte_rdtsc();
-	uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, pkts, b_tx);
+	uint16_t sent = rte_eth_tx_burst(conf->tx_port, TXQ(conf, tc), pkts, b_tx);
 	s->cycles_tx += rte_rdtsc() - t0;
 	s->pkts_tx_total += sent;
 
@@ -822,7 +831,7 @@ app_mixed_thread_priobp_stats(struct thread_conf **confs)
 		r_sent[tc] = 0;
 		if (n > 0) {
 			uint64_t t0 = rte_rdtsc();
-			uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, mbufs, n);
+			uint16_t sent = rte_eth_tx_burst(conf->tx_port, TXQ(conf, tc), mbufs, n);
 			uint64_t t1 = rte_rdtsc();
 			r_sent[tc] = sent;
 			if (sent) {
@@ -853,7 +862,7 @@ app_mixed_thread_priobp_stats(struct thread_conf **confs)
 
 		if (tc_counts[tc]) {
 			uint64_t t0   = rte_rdtsc();
-			uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, pkts[tc], tc_counts[tc]);
+			uint16_t sent = rte_eth_tx_burst(conf->tx_port, TXQ(conf, tc), pkts[tc], tc_counts[tc]);
 			uint64_t t1   = rte_rdtsc();
 
 			stats[tc].cycles_tx     += (t1 - t0);
@@ -929,7 +938,7 @@ app_mixed_thread_aggbp(struct thread_conf **confs)
 	if (pending.cnt) {
 		uint16_t n = pending_peek(&pending, mbufs, burst_conf.qos_dequeue);
 		
-		uint16_t sent  = rte_eth_tx_burst(conf->tx_port, 0, mbufs, n);
+		uint16_t sent  = rte_eth_tx_burst(conf->tx_port, conf->txq_base, mbufs, n);
 		
 		if (sent) {
 			pending_consume(&pending, sent);
@@ -947,7 +956,7 @@ app_mixed_thread_aggbp(struct thread_conf **confs)
 		
 		uint16_t sent = 0;
 		if (nb_pkt_deq) {
-			sent = rte_eth_tx_burst(conf->tx_port, 0, mbufs, nb_pkt_deq);
+			sent = rte_eth_tx_burst(conf->tx_port, conf->txq_base, mbufs, nb_pkt_deq);
 			
 			if (sent < nb_pkt_deq) {
 				for (uint16_t i = sent; i < nb_pkt_deq; i++)
@@ -998,6 +1007,7 @@ app_mixed_thread_prioprop(struct thread_conf **confs)
 			if (tx_queue >= N_TX_QUEUES) {
 				tx_queue = 1;	
 			}
+			tx_queue = TXQ(conf, tx_queue);
 	
 			buffer = tx_buffer[tx_port][tx_queue];
 				
@@ -1127,7 +1137,7 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 			/* 1) budget */
 			switch (kind) {
 			case CTRL_QBC:
-				cap = qbc_budget(&qbc[tc], conf->tx_port, tc, b_req,
+				cap = qbc_budget(&qbc[tc], conf->tx_port, TXQ(conf, tc), b_req,
 						&warned);
 				break;
 			case CTRL_CBC: {
@@ -1135,7 +1145,7 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 
 				if (c->q != c->c && now - c->last_poll_tsc >= poll_tsc) {
 					uint64_t t_fb = rte_rdtsc();
-					int freed = rte_eth_tx_done_cleanup(conf->tx_port, tc, 0);
+					int freed = rte_eth_tx_done_cleanup(conf->tx_port, TXQ(conf, tc), 0);
 
 					cs->tc[tc].fb_cyc += rte_rdtsc() - t_fb;
 					cs->tc[tc].polls++;
@@ -1147,7 +1157,7 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 					} else if (unlikely(freed < 0 && !warned)) {
 						printf("CBC: rte_eth_tx_done_cleanup(port %u, txq %d) "
 						       "failed (%d): no completions, CBC will stall\n",
-						       conf->tx_port, tc, freed);
+						       conf->tx_port, TXQ(conf, tc), freed);
 						warned = true;
 					}
 					c->last_poll_tsc = now;

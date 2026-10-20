@@ -4,6 +4,7 @@
 
 #include <unistd.h>
 #include <stdint.h>
+#include <signal.h>
 
 #include <rte_log.h>
 #include <rte_mbuf.h>
@@ -27,7 +28,10 @@ uint8_t interactive = APP_INTERACTIVE_DEFAULT;
 uint32_t qavg_period = APP_QAVG_PERIOD;
 uint32_t qavg_ntimes = APP_QAVG_NTIMES;
 
-struct rte_eth_dev_tx_buffer *tx_buffer[RTE_MAX_ETHPORTS][N_TX_QUEUES] = { 0 };
+struct rte_eth_dev_tx_buffer *tx_buffer[RTE_MAX_ETHPORTS][MAX_TXQ_PER_PORT] = { 0 };
+
+/* traffic class -> TX queue inside the instance; identity unless --pf-tc-map */
+uint8_t app_tc2q[N_TC] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
 
 /* main processing loop */
 static int
@@ -69,6 +73,7 @@ app_main_loop(__rte_unused void *dummy)
 			flow->tx_thread.tx_port = flow->tx_port;
 			flow->tx_thread.tx_ring =  flow->tx_ring;
 			flow->tx_thread.tx_queue = flow->tx_queue;
+			flow->tx_thread.txq_base = flow->txq_base;
 
 			tx_confs[tx_idx++] = &flow->tx_thread;
 
@@ -80,6 +85,7 @@ app_main_loop(__rte_unused void *dummy)
 			flow->wt_thread.tx_port =  flow->tx_port;
 			flow->tx_thread.tx_queue = flow->tx_queue;
 			flow->wt_thread.sched_port =  flow->sched_port;
+			flow->wt_thread.txq_base = flow->txq_base;
 
 			wt_confs[wt_idx++] = &flow->wt_thread;
 
@@ -264,6 +270,18 @@ app_stat(void)
 	}
 }
 
+/* SIGINT/SIGTERM (Ctrl-C, pkill from the orchestrator): remove the PF flow
+ * rules before exiting, see pf_cleanup(). The data path keeps running on the
+ * worker lcores meanwhile; the process exits right after. */
+static void
+app_signal(int sig)
+{
+	signal(sig, SIG_DFL);
+	pf_cleanup();
+	fflush(stdout);
+	_exit(0);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -276,6 +294,9 @@ main(int argc, char **argv)
 	ret = app_init();
 	if (ret < 0)
 		return -1;
+
+	signal(SIGINT, app_signal);
+	signal(SIGTERM, app_signal);
 
 	/* launch per-lcore init on every lcore */
 	rte_eal_mp_remote_launch(app_main_loop, NULL, SKIP_MAIN);

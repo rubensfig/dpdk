@@ -76,6 +76,7 @@ static struct {
 	uint16_t n_inst, n_class;
 	enum shape shape;
 	double rate_gbps;           /* 0: no root shaper */
+	uint32_t burst_bytes;       /* shaper bucket; ignored on ice (must be 0) */
 	uint32_t weight[MAX_INST];
 	int levels;                 /* -1: from capabilities, else 3 */
 	int leaf_chain;
@@ -86,10 +87,11 @@ static struct {
 	struct rte_ether_addr tx_mac;   /* source MAC written on every frame */
 	unsigned int stats_ms;
 	bool is_ice;
+	bool is_cnxk;               /* net_cn9k / net_cn10k */
 } g = {
 	.rx_port = 0, .tx_port = 1, .n_inst = 2, .n_class = 8,
-	.shape = SHAPE_CLASS, .rate_gbps = 25.0, .levels = -1,
-	.rxd = 4096, .txd = 1024, .stats_ms = 1000,
+	.shape = SHAPE_CLASS, .rate_gbps = 25.0, .levels = -1, .leaf_chain = -1,
+	.rxd = 4096, .txd = 1024, .stats_ms = 1000, .burst_bytes = 32768,
 };
 
 struct qstat {
@@ -182,9 +184,10 @@ usage(const char *prog)
 	       "  --classes C        classes, <= %d (default 8)\n"
 	       "  --shape class|instance   tree shape (default class)\n"
 	       "  --rate-gbps R      root shaper, 0 = none (default 25)\n"
+	       "  --burst-bytes B    shaper bucket size, non-ice only (default 32768)\n"
 	       "  --weights w0,w1,.. instance weights (default all 1)\n"
 	       "  --levels L         tree depth incl. root and leaves (default: caps, else 3)\n"
-	       "  --leaf-chain K     pass-through parents per leaf (cnxk: 1)\n"
+	       "  --leaf-chain K     pass-through parents per leaf (default: 1 on cnxk, else 0)\n"
 	       "  --tos-map t:c,..   raw ToS byte -> class (default Ixia map)\n"
 	       "  --rxd N --txd N    ring sizes (default 4096 / 1024)\n"
 	       "  --stats-ms MS      stats interval (default 1000)\n"
@@ -207,7 +210,7 @@ parse_args(int argc, char **argv)
 		{"rxd", 1, 0, 'x'}, {"txd", 1, 0, 'y'},
 		{"stats-ms", 1, 0, 'S'}, {"csv", 0, 0, 'C'},
 		{"probe", 0, 0, 'p'}, {"no-tm", 0, 0, 'N'},
-		{"dst-mac", 1, 0, 'D'},
+		{"dst-mac", 1, 0, 'D'}, {"burst-bytes", 1, 0, 'B'},
 		{"help", 0, 0, 'h'}, {0, 0, 0, 0},
 	};
 	const char *tos_map = NULL;
@@ -231,6 +234,7 @@ parse_args(int argc, char **argv)
 				return -1;
 			break;
 		case 'R': g.rate_gbps = atof(optarg); break;
+		case 'B': g.burst_bytes = (uint32_t)strtoul(optarg, NULL, 0); break;
 		case 'w': if (parse_weights(optarg)) return -1; break;
 		case 'L': g.levels = atoi(optarg); break;
 		case 'K': g.leaf_chain = atoi(optarg); break;
@@ -494,8 +498,12 @@ tm_build(void)
 		if (g.is_ice && sp.peak.rate > UINT32_MAX)  /* ice keeps it as uint32_t */
 			rte_exit(EXIT_FAILURE, "ice: shaper rate above %.1f Gb/s overflows\n",
 				 (double)UINT32_MAX * 8 / 1e9);
-		if (!g.is_ice)  /* ice rejects length adjustment and bucket sizes */
+		/* ice rejects length adjustment and bucket sizes; cnxk rejects a
+		 * zero peak bucket ("TM peak size invalid") */
+		if (!g.is_ice) {
 			sp.pkt_length_adjust = RTE_TM_ETH_FRAMING_OVERHEAD_FCS;
+			sp.peak.size = g.burst_bytes;
+		}
 		ret = rte_tm_shaper_profile_add(g.tx_port, SHAPER_ID, &sp, &err);
 		if (ret)
 			rte_exit(EXIT_FAILURE, "shaper_profile_add: %d (%s)\n", ret,
@@ -515,22 +523,26 @@ tm_build(void)
 	/* ice maps the root onto an existing HW node and only programs the nodes
 	 * below it at commit, so a root shaper is silently ignored there: put the
 	 * port shaper on the first node below the root instead. */
-	if (g.is_ice && shaper != RTE_TM_SHAPER_PROFILE_ID_NONE && group_level < 2)
+	/* cnxk: the root (TL1) programs only CIR, a peak-rate shaper there is
+	 * ignored as on ice; both get it on the node below the root */
+	if ((g.is_ice || g.is_cnxk) && shaper != RTE_TM_SHAPER_PROFILE_ID_NONE &&
+	    group_level < 2)
 		rte_exit(EXIT_FAILURE, "ice: the shaper needs a node below the root; "
 			 "use more levels (drop tm_sched_levels or set --levels >= %d)\n",
 			 4 + g.leaf_chain);
 	root = next_id++;
 	tm_add(root, RTE_TM_NODE_ID_NULL, 0, 1, 0, false,
-	       g.is_ice ? RTE_TM_SHAPER_PROFILE_ID_NONE : shaper,
+	       g.is_ice || g.is_cnxk ? RTE_TM_SHAPER_PROFILE_ID_NONE : shaper,
 	       group_level == 1 && g.shape == SHAPE_CLASS ? g.n_class : 1, "root");
 	parent = root;
 	for (int l = 1; l < group_level; l++) {
 		uint32_t id = next_id++;
 
 		tm_add(id, parent, 0, 1, (uint32_t)l, false,
-		       g.is_ice && l == 1 ? shaper : RTE_TM_SHAPER_PROFILE_ID_NONE,
+		       (g.is_ice || g.is_cnxk) && l == 1 ? shaper : RTE_TM_SHAPER_PROFILE_ID_NONE,
 		       l == group_level - 1 && g.shape == SHAPE_CLASS ? g.n_class : 1,
-		       g.is_ice && l == 1 && shaper != RTE_TM_SHAPER_PROFILE_ID_NONE ?
+		       (g.is_ice || g.is_cnxk) && l == 1 &&
+		       shaper != RTE_TM_SHAPER_PROFILE_ID_NONE ?
 		       "pad+shaper" : "pad");
 		parent = id;
 	}
@@ -721,6 +733,12 @@ main(int argc, char **argv)
 
 	rte_eth_dev_info_get(g.tx_port, &info);
 	g.is_ice = strcmp(info.driver_name, "net_ice") == 0;
+	/* cnxk: SQs (leaves) under an SMQ must all have priority 0, so the class
+	 * priority goes on a pass-through SMQ above each leaf */
+	g.is_cnxk = !strcmp(info.driver_name, "net_cn10k") ||
+		    !strcmp(info.driver_name, "net_cn9k");
+	if (g.leaf_chain < 0)
+		g.leaf_chain = g.is_cnxk ? 1 : 0;
 	nb_txq = g.n_inst * g.n_class;
 
 	nb_mbufs = RTE_MAX(nb_txq * (g.txd + BURST) + g.rxd + 8192u, 16383u);
