@@ -3297,7 +3297,14 @@ ice_tx_done_cleanup_simple(struct ice_tx_queue *txq,
 	cnt = free_cnt - free_cnt % txq->tx_rs_thresh;
 
 	for (i = 0; i < cnt; i += n) {
-		if (txq->nb_tx_desc - txq->nb_tx_free < txq->tx_rs_thresh)
+		/*
+		 * nb_tx_free starts at nb_tx_desc - 1, so the descriptors in
+		 * flight are nb_tx_desc - 1 - nb_tx_free. Free a batch only when
+		 * a full tx_rs_thresh batch is in flight; otherwise tx_next_dd
+		 * points at a slot not yet written in this round, whose stale
+		 * DESC_DONE passes the DD check and frees NULL sw_ring entries.
+		 */
+		if (txq->nb_tx_desc - 1 - txq->nb_tx_free < txq->tx_rs_thresh)
 			break;
 
 		n = ice_tx_free_bufs(txq);
