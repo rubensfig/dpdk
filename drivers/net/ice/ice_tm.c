@@ -591,22 +591,25 @@ static int ice_set_node_rate(struct ice_hw *hw,
 			     struct ice_sched_node *sched_node)
 {
 	bool reset = false;
-	uint32_t peak = 0;
-	uint32_t committed = 0;
+	/* rte_tm rates are bytes/s (64 bit); the scheduler takes kb/s (32 bit).
+	 * Keep 64 bit until the conversion: a 32-bit byte rate wraps above
+	 * 2^32 B/s = 34.36 Gb/s, while 100 Gb/s is only 1e8 kb/s. */
+	uint64_t peak = 0;
+	uint64_t committed = 0;
 	uint32_t rate;
 	int status;
 
 	if (tm_node == NULL || tm_node->shaper_profile == NULL) {
 		reset = true;
 	} else {
-		peak = (uint32_t)tm_node->shaper_profile->profile.peak.rate;
-		committed = (uint32_t)tm_node->shaper_profile->profile.committed.rate;
+		peak = tm_node->shaper_profile->profile.peak.rate;
+		committed = tm_node->shaper_profile->profile.committed.rate;
 	}
 
 	if (reset || peak == 0)
 		rate = ICE_SCHED_DFLT_BW;
 	else
-		rate = peak / 1000 * BITS_PER_BYTE;
+		rate = (uint32_t)(peak / 1000 * BITS_PER_BYTE);
 
 
 	status = ice_sched_set_node_bw_lmt(hw->port_info,
@@ -619,7 +622,7 @@ static int ice_set_node_rate(struct ice_hw *hw,
 	if (reset || committed == 0)
 		rate = ICE_SCHED_DFLT_BW;
 	else
-		rate = committed / 1000 * BITS_PER_BYTE;
+		rate = (uint32_t)(committed / 1000 * BITS_PER_BYTE);
 
 	status = ice_sched_set_node_bw_lmt(hw->port_info,
 					   sched_node,

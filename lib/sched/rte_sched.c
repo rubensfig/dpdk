@@ -3209,6 +3209,76 @@ rte_sched_port_dequeue(struct rte_sched_port *port, struct rte_mbuf **pkts, uint
 	return count;
 }
 
+/*
+ * Early exit for rte_sched_port_dequeue_tc().
+ *
+ * Bitmap layout per subport: one bit per queue, 16 per pipe (pipe << 4 | q),
+ * q = TC for TC0..TC11, q = 12..15 for the BE TC. A 64-bit slab holds 4 pipes.
+ * tc_allowed_mask() sets the bits of every TC that still has budget, repeated
+ * for the 4 pipes of a slab; subport_has_allowed() tells whether any queue of
+ * such a TC holds packets. Without one, the grinders would visit every
+ * backlogged pipe (one full lap until pipe_exhaustion) and send nothing.
+ * Reads the bitmap only (array1 to skip empty cache lines); enqueue unchanged.
+ */
+static inline uint64_t
+tc_allowed_mask(const uint32_t *capacity_pct)
+{
+	uint64_t m = 0;
+	uint32_t tc;
+
+	for (tc = 0; tc < RTE_SCHED_TRAFFIC_CLASS_BE; tc++)
+		if (capacity_pct[tc])
+			m |= 1ULL << tc;
+	if (capacity_pct[RTE_SCHED_TRAFFIC_CLASS_BE])
+		m |= 0xFULL << RTE_SCHED_TRAFFIC_CLASS_BE;
+
+	return m | (m << 16) | (m << 32) | (m << 48);
+}
+
+static inline int
+subport_has_allowed(struct rte_sched_subport *subport, uint64_t mask)
+{
+	struct rte_bitmap *bmp = subport->bmp;
+	uint32_t i1;
+
+	if (mask == 0)
+		return 0;
+
+	for (i1 = 0; i1 < bmp->array1_size; i1++) {
+		uint64_t w1 = bmp->array1[i1];
+
+		while (w1) {
+			uint32_t cl = (i1 << RTE_BITMAP_SLAB_BIT_SIZE_LOG2) +
+				__builtin_ctzll(w1);
+			const uint64_t *slab = &bmp->array2[cl << RTE_BITMAP_CL_SLAB_SIZE_LOG2];
+			uint32_t k;
+
+			for (k = 0; k < RTE_BITMAP_CL_SLAB_SIZE; k++)
+				if (slab[k] & mask)
+					return 1;
+			w1 &= w1 - 1;
+		}
+	}
+
+	return 0;
+}
+
+static inline int
+port_has_allowed(struct rte_sched_port *port, uint64_t mask)
+{
+	uint32_t i;
+
+	for (i = 0; i < port->n_subports_per_port; i++)
+		if (subport_has_allowed(port->subports[i], mask))
+			return 1;
+
+	return 0;
+}
+
+/* grinder_handle() calls without a packet before the bitmap is checked again
+ * (about 4 calls per pipe visit, so ~8 pipe visits) */
+#define SCHED_DEQ_TC_IDLE_CHECK (4 * RTE_SCHED_PORT_N_GRINDERS)
+
 int
 rte_sched_port_dequeue_tc(struct rte_sched_port *port, struct rte_mbuf ***pkts, uint32_t n_pkts, uint32_t *capacity_pct, uint32_t *tc_counts)
 {
@@ -3224,12 +3294,26 @@ rte_sched_port_dequeue_tc(struct rte_sched_port *port, struct rte_mbuf ***pkts, 
 
 	rte_sched_port_time_resync(port);
 
+	/* Early exit: stop as soon as no queue of a TC with budget left holds
+	 * packets (see subport_has_allowed). Checked at the start, when a TC
+	 * budget runs out, and after SCHED_DEQ_TC_IDLE_CHECK calls without a
+	 * packet; while something is sendable the loop runs as before. */
+	uint64_t allowed = capacity_pct ? tc_allowed_mask(capacity_pct) : 0;
+	uint32_t idle = 0;
+
+	count = 0;
+	if (capacity_pct && !port_has_allowed(port, allowed))
+		goto copy_out;
+
 	/* Take each queue in the grinder one step further */
-	for (i = 0, count = 0; ; i++)  {
+	for (i = 0; ; i++)  {
+		uint32_t pos = i & (RTE_SCHED_PORT_N_GRINDERS - 1);
+		uint32_t sent;
+
 		subport = port->subports[subport_id];
 
-		count += grinder_handle(port, subport,
-				i & (RTE_SCHED_PORT_N_GRINDERS - 1), capacity_pct);
+		sent = grinder_handle(port, subport, pos, capacity_pct);
+		count += sent;
 
 		if (count == n_pkts) {
 			subport_id++;
@@ -3239,6 +3323,28 @@ rte_sched_port_dequeue_tc(struct rte_sched_port *port, struct rte_mbuf ***pkts, 
 
 			port->subport_id = subport_id;
 			break;
+		}
+
+		if (capacity_pct) {
+			if (sent) {
+				uint32_t tc = subport->grinder[pos].tc_index;
+
+				idle = 0;
+				if (capacity_pct[tc] == 0) {
+					/* this TC's budget just ran out */
+					allowed = tc_allowed_mask(capacity_pct);
+					if (!port_has_allowed(port, allowed)) {
+						port->subport_id = subport_id;
+						break;
+					}
+				}
+			} else if (++idle >= SCHED_DEQ_TC_IDLE_CHECK) {
+				idle = 0;
+				if (!port_has_allowed(port, allowed)) {
+					port->subport_id = subport_id;
+					break;
+				}
+			}
 		}
 
 		if (rte_sched_port_exceptions(subport, i >= RTE_SCHED_PORT_N_GRINDERS)) {
@@ -3256,6 +3362,8 @@ rte_sched_port_dequeue_tc(struct rte_sched_port *port, struct rte_mbuf ***pkts, 
 		}
 	}
 
+copy_out:
+	;
 	uint32_t total = 0;
 	for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
 		if (port->tc_pkts_out[tc] > 0 && pkts[tc] != NULL && port->pkts_out_tc[tc] != NULL) {

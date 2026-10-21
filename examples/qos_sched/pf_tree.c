@@ -222,9 +222,6 @@ pf_tm_build(uint16_t port, uint16_t n_inst)
 
 		memset(&sp, 0, sizeof(sp));
 		sp.peak.rate = (uint64_t)(pf_conf.rate_gbps * 1e9 / 8);
-		if (ice && sp.peak.rate > UINT32_MAX)
-			rte_exit(EXIT_FAILURE, "ice: shaper rate above %.1f Gb/s overflows\n",
-				 (double)UINT32_MAX * 8 / 1e9);
 		if (!ice)	/* ice rejects length adjustment and bucket sizes */
 			sp.pkt_length_adjust = RTE_TM_ETH_FRAMING_OVERHEAD_FCS;
 		ret = rte_tm_shaper_profile_add(port, PF_SHAPER_ID, &sp, &err);
