@@ -245,6 +245,9 @@ struct rte_sched_subport_stats {
 
 	/** Number of packets dropped by congestion management scheme */
 	uint64_t n_pkts_cman_dropped[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
+
+	/** Number of packets ECN-marked (CE) by congestion management scheme */
+	uint64_t n_pkts_cman_marked[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
 };
 
 /** Queue statistics */
@@ -263,6 +266,9 @@ struct rte_sched_queue_stats {
 
 	/** Bytes dropped */
 	uint64_t n_bytes_dropped;
+
+	/** Packets ECN-marked (CE) by congestion management scheme */
+	uint64_t n_pkts_cman_marked;
 };
 
 /** Port configuration parameters. */
