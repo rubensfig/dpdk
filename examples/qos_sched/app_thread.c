@@ -296,7 +296,7 @@ app_tx_thread(struct thread_conf **confs)
 		uint16_t nb_tx = 0;
 		if (likely(nb_pkts != 0)) {
 			for(int i = 0; i < nb_pkts; i++) {
-				int tx_queue = mbufs[i]->hash.sched.traffic_class;
+				int tx_queue = TXQ(mbufs[i]->hash.sched.traffic_class);
 				int tx_port = conf->tx_port;
 
 				if (tx_queue > N_TX_QUEUES) {
@@ -406,7 +406,7 @@ app_mixed_thread_pertcdequeue(struct thread_conf **confs)
 		if (tc_counts[tc] == 0)
 			continue;
 
-		uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, pkts[tc], tc_counts[tc]);
+		uint16_t sent = rte_eth_tx_burst(conf->tx_port, TXQ(tc), pkts[tc], tc_counts[tc]);
 
 		APP_STATS_ADD(conf->stat.nb_tx, sent);
 	}
@@ -457,7 +457,7 @@ app_mixed_thread_priobp(struct thread_conf **confs)
 		tc_counts[tc] = 0;
 		uint16_t n = pending_peek(&pending[tc], mbufs, burst_conf.qos_dequeue);
 		if (n > 0) {
-				uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, mbufs, n);
+				uint16_t sent = rte_eth_tx_burst(conf->tx_port, TXQ(tc), mbufs, n);
 				if (sent) {
 					pending_consume(&pending[tc], sent);
 					APP_STATS_ADD(conf->stat.nb_tx, sent);
@@ -475,7 +475,7 @@ app_mixed_thread_priobp(struct thread_conf **confs)
 			continue;
 
 		// printf("tc_counts[%d] %d\n", tc, tc_counts[tc]);
-		uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, pkts[tc], tc_counts[tc]);
+		uint16_t sent = rte_eth_tx_burst(conf->tx_port, TXQ(tc), pkts[tc], tc_counts[tc]);
 
 		if (unlikely(sent < tc_counts[tc])) {
 			pending_enqueue_burst( &pending[tc], &pkts[tc][sent], tc_counts[tc] - sent);
@@ -533,7 +533,7 @@ pending_retry_tx(struct thread_conf *conf, pending_tc_stats_t *s,
 		return 0;
 
 	uint64_t t0 = rte_rdtsc();
-	uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, out, n);
+	uint16_t sent = rte_eth_tx_burst(conf->tx_port, TXQ(tc), out, n);
 	s->cycles_retry += rte_rdtsc() - t0;
 
 	if (sent) {
@@ -561,7 +561,7 @@ fresh_tx(struct thread_conf *conf, pending_tc_stats_t *s, struct pending_q *pq,
 		int tc, struct rte_mbuf **pkts, uint32_t b_tx, bool retry)
 {
 	uint64_t t0 = rte_rdtsc();
-	uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, pkts, b_tx);
+	uint16_t sent = rte_eth_tx_burst(conf->tx_port, TXQ(tc), pkts, b_tx);
 	s->cycles_tx += rte_rdtsc() - t0;
 	s->pkts_tx_total += sent;
 
@@ -646,16 +646,16 @@ qbc_gcd(uint32_t a, uint32_t b)
 
 /* i) Observe queue state, ii) compute the transmission budget. */
 static inline uint32_t
-qbc_budget(struct qbc_state *q, uint16_t port, int tc, uint32_t b_req,
+qbc_budget(struct qbc_state *q, uint16_t port, int txq, uint32_t b_req,
 		bool *warned)
 {
-	int count = rte_eth_tx_queue_count(port, tc);
+	int count = rte_eth_tx_queue_count(port, txq);
 
 	if (unlikely(count < 0)) {
 		if (!*warned) {
 			printf("QBC: rte_eth_tx_queue_count(port %u, txq %d) failed "
 			       "(%d): running without backpressure\n",
-			       port, tc, count);
+			       port, txq, count);
 			*warned = true;
 		}
 		q->have_u = false;
@@ -822,7 +822,7 @@ app_mixed_thread_priobp_stats(struct thread_conf **confs)
 		r_sent[tc] = 0;
 		if (n > 0) {
 			uint64_t t0 = rte_rdtsc();
-			uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, mbufs, n);
+			uint16_t sent = rte_eth_tx_burst(conf->tx_port, TXQ(tc), mbufs, n);
 			uint64_t t1 = rte_rdtsc();
 			r_sent[tc] = sent;
 			if (sent) {
@@ -853,7 +853,7 @@ app_mixed_thread_priobp_stats(struct thread_conf **confs)
 
 		if (tc_counts[tc]) {
 			uint64_t t0   = rte_rdtsc();
-			uint16_t sent = rte_eth_tx_burst(conf->tx_port, tc, pkts[tc], tc_counts[tc]);
+			uint16_t sent = rte_eth_tx_burst(conf->tx_port, TXQ(tc), pkts[tc], tc_counts[tc]);
 			uint64_t t1   = rte_rdtsc();
 
 			stats[tc].cycles_tx     += (t1 - t0);
@@ -992,7 +992,7 @@ app_mixed_thread_prioprop(struct thread_conf **confs)
 
 	if (likely(nb_pkts)) {
 		for(int i = 0; i < nb_pkts; i++) {
-			int tx_queue = mbufs[i]->hash.sched.traffic_class;
+			int tx_queue = TXQ(mbufs[i]->hash.sched.traffic_class);
 			int tx_port = conf->tx_port;
 	
 			if (tx_queue > N_TX_QUEUES) {
@@ -1046,16 +1046,30 @@ rej_update(struct rej_state *r, uint32_t b_tx, uint32_t b_sent, uint32_t b_req)
 	}
 }
 
-/* ---- shared per-TC loop for none, qbc, cbc, rej ---- */
+/* ---- shared loop for none, qbc, cbc, rej ---- */
 /*
- * Per iteration and TC:
- *   1) B_cap from the controller
- *   2) retry: up to B_cap packets from the TC's pending queue
- *   3) fresh: only if every retried packet was accepted (keeps FIFO order),
- *      up to B_cap - retried, the free pending space and qos_dequeue
- *   4) rejected fresh packets go to the pending queue (or are dropped
- *      when retry is off)
- *   5) controller update with B_tx = retried + fresh, B_sent = accepted
+ * The controllers run per NIC TX queue; the scheduler and the retry
+ * (pending) queues run per TC. With --txq-map pertc every TC has its own
+ * queue and this is the per-TC loop of the paper. With --txq-map hplp the LP
+ * TCs share queue 1: they share its budget, in TC order (lower TC first,
+ * i.e. the scheduler's priority).
+ *
+ * Per iteration:
+ *   1) B_cap of each queue from its controller (once, at its first TC)
+ *   2) retry, per TC in order: up to the queue's remaining budget from the
+ *      TC's pending queue; tried packets use up the queue's budget
+ *   3) fresh budget of the TC: the queue's remaining budget, only if every
+ *      retried packet was accepted (keeps FIFO order), capped by the free
+ *      pending space and qos_dequeue
+ *   4) dequeue all TCs; transmit fresh packets per TC in order, at most the
+ *      queue's remaining budget. When TCs share a queue their offers overlap,
+ *      so a lower TC may get more from the scheduler than is left: the excess
+ *      is held in its pending queue (not offered to the NIC) and leaves first
+ *      next time. Rejected fresh packets go to the pending queue (or are
+ *      dropped when retry is off).
+ *   5) controller update per queue with B_tx = all packets offered to the
+ *      queue, B_sent = all accepted
+ * With one TC per queue, steps 2-5 are exactly the former per-TC loop.
  * With retry, no packet is dropped after leaving the scheduler.
  */
 enum ctrl_kind { CTRL_NONE, CTRL_QBC, CTRL_CBC, CTRL_REJ };
@@ -1070,14 +1084,22 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 	struct thread_conf *conf;
 	int conf_idx = 0;
 	const uint32_t b_req = burst_conf.qos_dequeue;
+	/* NONE has no budget: every TC may offer b_req, nothing is shared */
+	const bool shared = kind != CTRL_NONE;
 
 	struct flow_conf *flow = container_of(confs[0], struct flow_conf, wt_thread);
 	pending_tc_stats_t *stats = flow->tc_stats;
 
 	struct pending_q pending[N_SCHED_TC];
-	struct qbc_state qbc[N_SCHED_TC];
-	struct cbc_state cbc[N_SCHED_TC];
-	struct rej_state rej[N_SCHED_TC];
+	/* controller state per NIC TX queue */
+	struct qbc_state qbc[N_TX_QUEUES];
+	struct cbc_state cbc[N_TX_QUEUES];
+	struct rej_state rej[N_TX_QUEUES];
+	uint32_t q_cap[N_TX_QUEUES];	/* B_cap of the queue this iteration */
+	uint32_t q_left[N_TX_QUEUES];	/* budget its TCs have not used yet */
+	uint32_t q_btx[N_TX_QUEUES];	/* offered to the NIC this iteration */
+	uint32_t q_sent[N_TX_QUEUES];	/* accepted by the NIC this iteration */
+	int q_first[N_TX_QUEUES];	/* first TC of the queue, -1: unused */
 	bool warned = false;
 
 	const uint64_t poll_tsc = (rte_get_tsc_hz() * cbc_poll_us) / 1000000ULL;
@@ -1095,12 +1117,14 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 
 	memset(qbc, 0, sizeof(qbc));
 	memset(cbc, 0, sizeof(cbc));
+	for (int q = 0; q < N_TX_QUEUES; q++) {
+		rej[q].window = b_req;
+		rej[q].streak = 0;
+	}
 	for (int tc = 0; tc < N_SCHED_TC; tc++) {
 		pending_init(&pending[tc]);
 		pstats_reset(&stats[tc]);
 		pkts[tc] = tc_mbufs[tc];
-		rej[tc].window = b_req;
-		rej[tc].streak = 0;
 	}
 
 	for (int i = 0; confs[i] != NULL; i++)
@@ -1120,53 +1144,69 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 
 		capacity_rx_to_sched(conf, mbufs, &cs->inst);
 
+		for (int q = 0; q < N_TX_QUEUES; q++) {
+			q_first[q] = -1;
+			q_btx[q] = 0;
+			q_sent[q] = 0;
+		}
+
 		uint64_t now = rte_rdtsc();
 		for (int tc = 0; tc < N_SCHED_TC; tc++) {
-			uint32_t cap;
+			const int q = TXQ(tc);
 
-			/* 1) budget */
-			switch (kind) {
-			case CTRL_QBC:
-				cap = qbc_budget(&qbc[tc], conf->tx_port, tc, b_req,
-						&warned);
-				break;
-			case CTRL_CBC: {
-				struct cbc_state *c = &cbc[tc];
+			/* 1) budget of the queue, at its first TC */
+			if (q_first[q] < 0) {
+				uint32_t cap;
 
-				if (c->q != c->c && now - c->last_poll_tsc >= poll_tsc) {
-					uint64_t t_fb = rte_rdtsc();
-					int freed = rte_eth_tx_done_cleanup(conf->tx_port, tc, 0);
+				q_first[q] = tc;
+				switch (kind) {
+				case CTRL_QBC:
+					cap = qbc_budget(&qbc[q], conf->tx_port, q, b_req,
+							&warned);
+					break;
+				case CTRL_CBC: {
+					struct cbc_state *c = &cbc[q];
 
-					cs->tc[tc].fb_cyc += rte_rdtsc() - t_fb;
-					cs->tc[tc].polls++;
-					if (freed > 0)
-						cs->tc[tc].freed += (uint64_t)freed;
+					if (c->q != c->c && now - c->last_poll_tsc >= poll_tsc) {
+						uint64_t t_fb = rte_rdtsc();
+						int freed = rte_eth_tx_done_cleanup(conf->tx_port, q, 0);
 
-					if (freed > 0) {
-						c->c = RTE_MIN(c->c + (uint64_t)freed, c->q);
-					} else if (unlikely(freed < 0 && !warned)) {
-						printf("CBC: rte_eth_tx_done_cleanup(port %u, txq %d) "
-						       "failed (%d): no completions, CBC will stall\n",
-						       conf->tx_port, tc, freed);
-						warned = true;
+						cs->tc[tc].fb_cyc += rte_rdtsc() - t_fb;
+						cs->tc[tc].polls++;
+						if (freed > 0)
+							cs->tc[tc].freed += (uint64_t)freed;
+
+						if (freed > 0) {
+							c->c = RTE_MIN(c->c + (uint64_t)freed, c->q);
+						} else if (unlikely(freed < 0 && !warned)) {
+							printf("CBC: rte_eth_tx_done_cleanup(port %u, txq %d) "
+							       "failed (%d): no completions, CBC will stall\n",
+							       conf->tx_port, q, freed);
+							warned = true;
+						}
+						c->last_poll_tsc = now;
 					}
-					c->last_poll_tsc = now;
+					uint64_t u = c->q - c->c;
+					uint64_t b_cap = u < n_desc ? n_desc - u : 0;
+
+					cap = (uint32_t)RTE_MIN(b_cap, (uint64_t)b_req);
+					break;
 				}
-				uint64_t u = c->q - c->c;
-				uint64_t b_cap = u < n_desc ? n_desc - u : 0;
-
-				cs->tc[tc].q_minus_c = (int64_t)u;
-
-				cap = (uint32_t)RTE_MIN(b_cap, (uint64_t)b_req);
-				break;
+				case CTRL_REJ:
+					cap = rej[q].window;
+					break;
+				default:
+					cap = b_req;
+					break;
+				}
+				q_cap[q] = cap;
+				q_left[q] = cap;
 			}
-			case CTRL_REJ:
-				cap = rej[tc].window;
-				break;
-			default:
-				cap = b_req;
-				break;
-			}
+			if (kind == CTRL_CBC)
+				cs->tc[tc].q_minus_c = (int64_t)(cbc[q].q - cbc[q].c);
+
+			/* the TC may use what its queue has left */
+			const uint32_t cap = shared ? q_left[q] : q_cap[q];
 
 			tc_cap[tc] = cap;
 
@@ -1176,6 +1216,8 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 			if (retry && pending[tc].cnt)
 				r_sent[tc] = pending_retry_tx(conf, &stats[tc], &pending[tc],
 						tc, cap, &r_tried[tc]);
+			if (shared)
+				q_left[q] -= r_tried[tc];
 
 			/* 3) fresh budget */
 			if (r_sent[tc] < r_tried[tc]) {
@@ -1196,58 +1238,81 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 				tc_counts);
 
 		for (int tc = 0; tc < N_SCHED_TC; tc++) {
-			/* 4) fresh transmit */
-			uint32_t b_tx = r_tried[tc] + tc_counts[tc];
+			const int q = TXQ(tc);
+			/* 4) fresh transmit, within what the queue has left */
+			uint32_t n = tc_counts[tc];
+			uint32_t hold = 0;
+
+			if (shared && n > q_left[q]) {
+				hold = n - q_left[q];
+				n = q_left[q];
+			}
+
+			uint32_t b_tx = r_tried[tc] + n;
 			uint32_t sent = r_sent[tc];
 			uint32_t dropped = 0;
+			uint16_t pq_before = pending[tc].cnt;
+			uint32_t f_rej = 0;
 
-			if (tc_counts[tc]) {
-				uint16_t pq_before = pending[tc].cnt;
+			if (n) {
 				uint32_t f_sent = fresh_tx(conf, &stats[tc], &pending[tc],
-						tc, pkts[tc], tc_counts[tc], retry);
-				uint32_t f_rej = tc_counts[tc] - f_sent;
+						tc, pkts[tc], n, retry);
 
+				f_rej = n - f_sent;
 				sent += f_sent;
-				/* rejected fresh packets that did not enter the PQ */
-				dropped = retry ? f_rej - (uint32_t)(pending[tc].cnt -
-						pq_before) : f_rej;
 			}
+			if (hold)	/* shared queue only, so retry is on */
+				pending_enqueue_burst_tracked(&pending[tc], &stats[tc],
+						&pkts[tc][n], hold);
+			/* packets that should have entered the PQ but did not */
+			dropped = retry ? f_rej + hold - (uint32_t)(pending[tc].cnt -
+					pq_before) : f_rej;
+			if (shared)
+				q_left[q] -= n;
 
-			/* 5) controller update */
-			struct ctrl_tc_stats *ts = &cs->tc[tc];
+			q_btx[q] += b_tx;
+			q_sent[q] += sent;
 
-			switch (kind) {
-			case CTRL_QBC: {
-				bool h_was = qbc[tc].h_valid;
-				uint32_t h_old = qbc[tc].h;
-
-				qbc_update(&qbc[tc], b_tx, sent, tc_cap[tc]);
-				ts->h_lowered += h_was && qbc[tc].h < h_old;
-				ts->u = qbc[tc].have_u ? (int64_t)qbc[tc].u : CS_UNSET;
-				ts->u0 = qbc[tc].have_u0 ? (int64_t)qbc[tc].u0 : CS_UNSET;
-				ts->h = qbc[tc].h_valid ? (int64_t)qbc[tc].h : CS_UNSET;
-				ts->delta = qbc[tc].delta;
-				break;
-			}
-			case CTRL_CBC:
-				cbc[tc].q += sent;
-				break;
-			case CTRL_REJ:
-				ts->cuts += b_tx > 0 && sent < b_tx;
-				rej_update(&rej[tc], b_tx, sent, b_req);
-				ts->w = rej[tc].window;
-				break;
-			default:
-				break;
-			}
-
-			ctrl_stats_decision(ts, b_req, tc_cap[tc], tc_offer[tc],
+			ctrl_stats_decision(&cs->tc[tc], b_req, tc_cap[tc], tc_offer[tc],
 					tc_counts[tc], r_tried[tc], r_sent[tc], sent,
 					dropped, pending[tc].cnt);
 			cs->inst.sched_deq += tc_counts[tc];
 
 			if (retry)
 				pstats_record_occupancy(&stats[tc], pending[tc].cnt);
+		}
+
+		/* 5) controller update per queue; gauges go to its first TC */
+		for (int q = 0; q < N_TX_QUEUES; q++) {
+			if (q_first[q] < 0)
+				continue;
+
+			struct ctrl_tc_stats *ts = &cs->tc[q_first[q]];
+
+			switch (kind) {
+			case CTRL_QBC: {
+				bool h_was = qbc[q].h_valid;
+				uint32_t h_old = qbc[q].h;
+
+				qbc_update(&qbc[q], q_btx[q], q_sent[q], q_cap[q]);
+				ts->h_lowered += h_was && qbc[q].h < h_old;
+				ts->u = qbc[q].have_u ? (int64_t)qbc[q].u : CS_UNSET;
+				ts->u0 = qbc[q].have_u0 ? (int64_t)qbc[q].u0 : CS_UNSET;
+				ts->h = qbc[q].h_valid ? (int64_t)qbc[q].h : CS_UNSET;
+				ts->delta = qbc[q].delta;
+				break;
+			}
+			case CTRL_CBC:
+				cbc[q].q += q_sent[q];
+				break;
+			case CTRL_REJ:
+				ts->cuts += q_btx[q] > 0 && q_sent[q] < q_btx[q];
+				rej_update(&rej[q], q_btx[q], q_sent[q], b_req);
+				ts->w = rej[q].window;
+				break;
+			default:
+				break;
+			}
 		}
 
 		conf_idx++;

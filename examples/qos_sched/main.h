@@ -86,6 +86,20 @@ extern enum mixed_mode mixed_mode;
 extern uint32_t cbc_poll_us;
 extern uint32_t rej_add_step;
 extern uint32_t rej_grow_streak;
+
+/*
+ * Scheduler TC -> NIC TX queue (--txq-map).
+ *   hplp  (default): TC0 (HP) -> queue 0, every other TC (LP) -> queue 1.
+ *                    The NIC sees two queues whatever the number of
+ *                    scheduler priorities; the LP TCs share one queue and one
+ *                    controller (see app_mixed_thread_ctrl()).
+ *   pertc:           TC i -> queue i (the original mapping).
+ */
+enum txq_map { TXQ_MAP_HPLP, TXQ_MAP_PERTC };
+extern enum txq_map txq_map;
+extern uint16_t tc_txq[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
+void txq_map_apply(void);
+#define TXQ(tc) (tc_txq[(tc)])
 int mixed_mode_parse(const char *name);
 const char *mixed_mode_name(void);
 const char *mixed_mode_list(void);
@@ -254,6 +268,9 @@ telemetry_ctrl_stats(const char *cmd __rte_unused,
 		const char *params, struct rte_tel_data *d);
 int
 telemetry_scenario(const char *cmd __rte_unused,
+		const char *params, struct rte_tel_data *d);
+int
+telemetry_pipe_stats(const char *cmd __rte_unused,
 		const char *params, struct rte_tel_data *d);
 
 

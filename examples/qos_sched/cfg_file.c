@@ -281,6 +281,26 @@ cfg_load_subport_profile(struct rte_cfgfile *cfg,
 	return 0;
 }
 
+/*
+ * [red] keys: "tc N red <key>" (parser) and "tc N wred <key>" (the shipped
+ * profile_red.cfg and our *_mark.cfg) are both accepted. Before, a profile
+ * written with "wred" enabled CMAN with all thresholds 0, i.e. RED silently off.
+ */
+static const char *
+cfg_red_entry(struct rte_cfgfile *cfg, int tc, const char *key)
+{
+	char str[32];
+	const char *entry;
+
+	snprintf(str, sizeof(str), "tc %d red %s", tc, key);
+	entry = rte_cfgfile_get_entry(cfg, "red", str);
+	if (entry == NULL) {
+		snprintf(str, sizeof(str), "tc %d wred %s", tc, key);
+		entry = rte_cfgfile_get_entry(cfg, "red", str);
+	}
+	return entry;
+}
+
 int
 cfg_load_subport(struct rte_cfgfile *cfg, struct rte_sched_subport_params *subport_params)
 {
@@ -301,11 +321,8 @@ cfg_load_subport(struct rte_cfgfile *cfg, struct rte_sched_subport_params *subpo
 		cman_enabled = true;
 
 		for (i = 0; i < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; i++) {
-			char str[32];
-
 			/* Parse RED min thresholds */
-			snprintf(str, sizeof(str), "tc %d red min", i);
-			entry = rte_cfgfile_get_entry(cfg, "red", str);
+			entry = cfg_red_entry(cfg, i, "min");
 			if (entry) {
 				char *next;
 				/* for each packet colour (green, yellow, red) */
@@ -319,8 +336,7 @@ cfg_load_subport(struct rte_cfgfile *cfg, struct rte_sched_subport_params *subpo
 			}
 
 			/* Parse RED max thresholds */
-			snprintf(str, sizeof(str), "tc %d red max", i);
-			entry = rte_cfgfile_get_entry(cfg, "red", str);
+			entry = cfg_red_entry(cfg, i, "max");
 			if (entry) {
 				char *next;
 				/* for each packet colour (green, yellow, red) */
@@ -334,8 +350,7 @@ cfg_load_subport(struct rte_cfgfile *cfg, struct rte_sched_subport_params *subpo
 			}
 
 			/* Parse RED inverse mark probabilities */
-			snprintf(str, sizeof(str), "tc %d red inv prob", i);
-			entry = rte_cfgfile_get_entry(cfg, "red", str);
+			entry = cfg_red_entry(cfg, i, "inv prob");
 			if (entry) {
 				char *next;
 				/* for each packet colour (green, yellow, red) */
@@ -350,8 +365,7 @@ cfg_load_subport(struct rte_cfgfile *cfg, struct rte_sched_subport_params *subpo
 			}
 
 			/* Parse RED EWMA filter weights */
-			snprintf(str, sizeof(str), "tc %d red weight", i);
-			entry = rte_cfgfile_get_entry(cfg, "red", str);
+			entry = cfg_red_entry(cfg, i, "weight");
 			if (entry) {
 				char *next;
 				/* for each packet colour (green, yellow, red) */
@@ -363,6 +377,16 @@ cfg_load_subport(struct rte_cfgfile *cfg, struct rte_sched_subport_params *subpo
 					entry = next;
 				}
 			}
+		}
+	}
+
+	if (cman_params.cman_mode == RTE_SCHED_CMAN_RED && cman_enabled) {
+		for (i = 0; i < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; i++) {
+			struct rte_red_params *r = &cman_params.red_params[i][0];
+
+			printf("RED tc %2d (green): min %u max %u inv_prob %u wq_log2 %u%s\n",
+				i, r->min_th, r->max_th, r->maxp_inv, r->wq_log2,
+				(r->min_th | r->max_th) ? "" : "  [off]");
 		}
 	}
 

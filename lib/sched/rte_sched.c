@@ -1908,6 +1908,29 @@ rte_sched_port_cman_drop(struct rte_sched_port *port,
 	return rte_pie_enqueue(pie_cfg, pie, qlen, pkt->pkt_len, port->time_cpu_cycles);
 }
 
+/*
+ * A packet that CMAN wanted to drop was ECN-marked instead and will be
+ * enqueued. Count it, and keep PIE's queue length in step: rte_pie_enqueue()
+ * only counts the packets it accepts, but rte_sched_port_pie_dequeue()
+ * decrements for every packet that leaves, so qlen would underflow.
+ */
+static inline void
+rte_sched_port_cman_on_mark(struct rte_sched_port *port,
+	struct rte_sched_subport *subport, uint32_t qindex,
+	struct rte_mbuf *pkt)
+{
+	struct rte_sched_queue_extra *qe = subport->queue_extra + qindex;
+	uint32_t tc_index = rte_sched_port_pipe_tc(port, qindex);
+
+	subport->stats.n_pkts_cman_marked[tc_index] += 1;
+	qe->stats.n_pkts_cman_marked += 1;
+
+	if (subport->cman == RTE_SCHED_CMAN_PIE) {
+		qe->pie.qlen += 1;
+		qe->pie.qlen_bytes += pkt->pkt_len;
+	}
+}
+
 static inline void
 rte_sched_port_red_set_queue_empty_timestamp(struct rte_sched_port *port,
 	struct rte_sched_subport *subport, uint32_t qindex)
@@ -2009,35 +2032,101 @@ rte_sched_port_enqueue_qwa_prefetch0(struct rte_sched_port *port,
 	rte_bitmap_prefetch0(subport->bmp, qindex);
 }
 
+/*
+ * ECN marking for CMAN (RED/PIE) congestion signals, RFC 3168.
+ *
+ * Returns 0 if the packet was ECN-capable and now carries CE (or already did),
+ * -1 if it is not ECN-capable (Not-ECT) or not IP; the caller drops those.
+ *
+ * The L2 header is parsed here instead of assuming a 14-byte Ethernet header:
+ * qos_sched receives frames with the VLAN tag still in the frame (RX VLAN
+ * strip is off, see the classifier offsets in examples/qos_sched/app_thread.c),
+ * so the IP header starts at 18 (or 22 for QinQ). mbuf->packet_type is not
+ * used either: it depends on the PMD Rx path and is 0 on some of them.
+ */
 static inline int
 mark_packet_with_ecn(struct rte_mbuf *pkt)
 {
-	struct rte_ipv4_hdr *iphdr;
+	uint8_t *l2 = rte_pktmbuf_mtod(pkt, uint8_t *);
+	uint32_t data_len = rte_pktmbuf_data_len(pkt);
+	uint32_t off = sizeof(struct rte_ether_hdr);
+	uint16_t ether_type;
+	int n_vlan;
 
-	if (!RTE_ETH_IS_IPV4_HDR(pkt->packet_type))
+	if (unlikely(data_len < off))
 		return -1;
 
-	iphdr = rte_pktmbuf_mtod_offset(pkt, struct rte_ipv4_hdr *,
-		sizeof(struct rte_ether_hdr));
+	ether_type = rte_be_to_cpu_16(((struct rte_ether_hdr *)l2)->ether_type);
 
-	/* ECN field is the lowest 2 bits of the TOS byte.
-	*      * Only ECT(0)=10 or ECT(1)=01 packets can be marked.
-	*           */
-	switch (iphdr->type_of_service & 0x3) {
-	case 0x1: /* ECT(1) */
-	case 0x2: /* ECT(0) */
-	iphdr->type_of_service =
-	(iphdr->type_of_service & ~0x3) | 0x3; /* CE */
+	/* Skip up to two VLAN tags (802.1Q / 802.1ad) */
+	for (n_vlan = 0; n_vlan < 2; n_vlan++) {
+		struct rte_vlan_hdr *vh;
 
-	iphdr->hdr_checksum = 0;
-	iphdr->hdr_checksum = rte_ipv4_cksum(iphdr);
-	return 0;
-
-	default:
-	/* Not ECN capable or already CE */
-	return -1;
+		if (ether_type != RTE_ETHER_TYPE_VLAN &&
+		    ether_type != RTE_ETHER_TYPE_QINQ)
+			break;
+		if (unlikely(data_len < off + sizeof(struct rte_vlan_hdr)))
+			return -1;
+		vh = (struct rte_vlan_hdr *)(l2 + off);
+		ether_type = rte_be_to_cpu_16(vh->eth_proto);
+		off += sizeof(struct rte_vlan_hdr);
 	}
+
+	if (ether_type == RTE_ETHER_TYPE_IPV4) {
+		struct rte_ipv4_hdr *ip;
+		uint16_t old_w, new_w;
+		uint32_t sum;
+
+		if (unlikely(data_len < off + sizeof(struct rte_ipv4_hdr)))
+			return -1;
+		ip = (struct rte_ipv4_hdr *)(l2 + off);
+
+		switch (ip->type_of_service & RTE_IPV4_HDR_ECN_MASK) {
+		case 0x0:		/* Not-ECT */
+			return -1;
+		case RTE_IPV4_HDR_ECN_CE:	/* already CE */
+			return 0;
+		default:		/* ECT(0) or ECT(1) */
+			break;
+		}
+
+		/* Incremental checksum update, RFC 1624 eq. 3, on the 16-bit
+		 * word {version_ihl, type_of_service}. */
+		old_w = rte_be_to_cpu_16(*(uint16_t *)ip);
+		ip->type_of_service |= RTE_IPV4_HDR_ECN_CE;
+		new_w = rte_be_to_cpu_16(*(uint16_t *)ip);
+
+		sum = (uint16_t)~rte_be_to_cpu_16(ip->hdr_checksum);
+		sum += (uint16_t)~old_w;
+		sum += new_w;
+		sum = (sum & 0xFFFF) + (sum >> 16);
+		sum = (sum & 0xFFFF) + (sum >> 16);
+		ip->hdr_checksum = rte_cpu_to_be_16((uint16_t)~sum);
+		return 0;
+	}
+
+	if (ether_type == RTE_ETHER_TYPE_IPV6) {
+		struct rte_ipv6_hdr *ip6;
+		uint32_t vtc, ecn;
+
+		if (unlikely(data_len < off + sizeof(struct rte_ipv6_hdr)))
+			return -1;
+		ip6 = (struct rte_ipv6_hdr *)(l2 + off);
+
+		/* vtc_flow: version(4) | traffic class(8) | flow label(20);
+		 * ECN = low 2 bits of the traffic class = bits 20..21. */
+		vtc = rte_be_to_cpu_32(ip6->vtc_flow);
+		ecn = (vtc >> 20) & 0x3;
+		if (ecn == 0x0)
+			return -1;
+		if (ecn != 0x3)
+			ip6->vtc_flow = rte_cpu_to_be_32(vtc | (0x3u << 20));
+		return 0;
+	}
+
+	return -1;
 }
+
 static inline int
 rte_sched_port_enqueue_qwa(struct rte_sched_port *port,
 	struct rte_sched_subport *subport,
@@ -2064,17 +2153,19 @@ rte_sched_port_enqueue_qwa(struct rte_sched_port *port,
 		return 0;
 	} */
 
-	/* Congestion indication from CMAN */
+	/* Congestion indication from CMAN: mark ECN-capable packets with CE,
+	 * drop the others (RFC 3168, sec. 5). */
 	if (unlikely(rte_sched_port_cman_drop(port, subport, pkt, qindex, qlen))) {
-		if (mark_packet_with_ecn(pkt) != 0) {
-			/* Could not mark -> drop */
+		if (qlen >= qsize || mark_packet_with_ecn(pkt) != 0) {
 			rte_pktmbuf_free(pkt);
 			rte_sched_port_update_subport_stats_on_drop(port, subport,
-			qindex, pkt, 1);
+				qindex, pkt, qlen < qsize);
 			rte_sched_port_update_queue_stats_on_drop(subport, qindex,
-			pkt, 1);
+				pkt, qlen < qsize);
 			return 0;
 		}
+		/* Marked, the packet is enqueued below */
+		rte_sched_port_cman_on_mark(port, subport, qindex, pkt);
 	}
 
 	/* Queue full: always drop */
@@ -3086,6 +3177,76 @@ rte_sched_port_dequeue(struct rte_sched_port *port, struct rte_mbuf **pkts, uint
 	return count;
 }
 
+/*
+ * Early exit for rte_sched_port_dequeue_tc().
+ *
+ * Bitmap layout per subport: one bit per queue, 16 per pipe (pipe << 4 | q),
+ * q = TC for TC0..TC11, q = 12..15 for the BE TC. A 64-bit slab holds 4 pipes.
+ * tc_allowed_mask() sets the bits of every TC that still has budget, repeated
+ * for the 4 pipes of a slab; subport_has_allowed() tells whether any queue of
+ * such a TC holds packets. Without one, the grinders would visit every
+ * backlogged pipe (one full lap until pipe_exhaustion) and send nothing.
+ * Reads the bitmap only (array1 to skip empty cache lines); enqueue unchanged.
+ */
+static inline uint64_t
+tc_allowed_mask(const uint32_t *capacity_pct)
+{
+	uint64_t m = 0;
+	uint32_t tc;
+
+	for (tc = 0; tc < RTE_SCHED_TRAFFIC_CLASS_BE; tc++)
+		if (capacity_pct[tc])
+			m |= 1ULL << tc;
+	if (capacity_pct[RTE_SCHED_TRAFFIC_CLASS_BE])
+		m |= 0xFULL << RTE_SCHED_TRAFFIC_CLASS_BE;
+
+	return m | (m << 16) | (m << 32) | (m << 48);
+}
+
+static inline int
+subport_has_allowed(struct rte_sched_subport *subport, uint64_t mask)
+{
+	struct rte_bitmap *bmp = subport->bmp;
+	uint32_t i1;
+
+	if (mask == 0)
+		return 0;
+
+	for (i1 = 0; i1 < bmp->array1_size; i1++) {
+		uint64_t w1 = bmp->array1[i1];
+
+		while (w1) {
+			uint32_t cl = (i1 << RTE_BITMAP_SLAB_BIT_SIZE_LOG2) +
+				__builtin_ctzll(w1);
+			const uint64_t *slab = &bmp->array2[cl << RTE_BITMAP_CL_SLAB_SIZE_LOG2];
+			uint32_t k;
+
+			for (k = 0; k < RTE_BITMAP_CL_SLAB_SIZE; k++)
+				if (slab[k] & mask)
+					return 1;
+			w1 &= w1 - 1;
+		}
+	}
+
+	return 0;
+}
+
+static inline int
+port_has_allowed(struct rte_sched_port *port, uint64_t mask)
+{
+	uint32_t i;
+
+	for (i = 0; i < port->n_subports_per_port; i++)
+		if (subport_has_allowed(port->subports[i], mask))
+			return 1;
+
+	return 0;
+}
+
+/* grinder_handle() calls without a packet before the bitmap is checked again
+ * (about 4 calls per pipe visit, so ~8 pipe visits) */
+#define SCHED_DEQ_TC_IDLE_CHECK (4 * RTE_SCHED_PORT_N_GRINDERS)
+
 int
 rte_sched_port_dequeue_tc(struct rte_sched_port *port, struct rte_mbuf ***pkts, uint32_t n_pkts, uint32_t *capacity_pct, uint32_t *tc_counts)
 {
@@ -3101,12 +3262,26 @@ rte_sched_port_dequeue_tc(struct rte_sched_port *port, struct rte_mbuf ***pkts, 
 
 	rte_sched_port_time_resync(port);
 
+	/* Early exit: stop as soon as no queue of a TC with budget left holds
+	 * packets (see subport_has_allowed). Checked at the start, when a TC
+	 * budget runs out, and after SCHED_DEQ_TC_IDLE_CHECK calls without a
+	 * packet; while something is sendable the loop runs as before. */
+	uint64_t allowed = capacity_pct ? tc_allowed_mask(capacity_pct) : 0;
+	uint32_t idle = 0;
+
+	count = 0;
+	if (capacity_pct && !port_has_allowed(port, allowed))
+		goto copy_out;
+
 	/* Take each queue in the grinder one step further */
-	for (i = 0, count = 0; ; i++)  {
+	for (i = 0; ; i++)  {
+		uint32_t pos = i & (RTE_SCHED_PORT_N_GRINDERS - 1);
+		uint32_t sent;
+
 		subport = port->subports[subport_id];
 
-		count += grinder_handle(port, subport,
-				i & (RTE_SCHED_PORT_N_GRINDERS - 1), capacity_pct);
+		sent = grinder_handle(port, subport, pos, capacity_pct);
+		count += sent;
 
 		if (count == n_pkts) {
 			subport_id++;
@@ -3116,6 +3291,28 @@ rte_sched_port_dequeue_tc(struct rte_sched_port *port, struct rte_mbuf ***pkts, 
 
 			port->subport_id = subport_id;
 			break;
+		}
+
+		if (capacity_pct) {
+			if (sent) {
+				uint32_t tc = subport->grinder[pos].tc_index;
+
+				idle = 0;
+				if (capacity_pct[tc] == 0) {
+					/* this TC's budget just ran out */
+					allowed = tc_allowed_mask(capacity_pct);
+					if (!port_has_allowed(port, allowed)) {
+						port->subport_id = subport_id;
+						break;
+					}
+				}
+			} else if (++idle >= SCHED_DEQ_TC_IDLE_CHECK) {
+				idle = 0;
+				if (!port_has_allowed(port, allowed)) {
+					port->subport_id = subport_id;
+					break;
+				}
+			}
 		}
 
 		if (rte_sched_port_exceptions(subport, i >= RTE_SCHED_PORT_N_GRINDERS)) {
@@ -3133,6 +3330,8 @@ rte_sched_port_dequeue_tc(struct rte_sched_port *port, struct rte_mbuf ***pkts, 
 		}
 	}
 
+copy_out:
+	;
 	uint32_t total = 0;
 	for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
 		if (port->tc_pkts_out[tc] > 0 && pkts[tc] != NULL && port->pkts_out_tc[tc] != NULL) {

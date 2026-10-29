@@ -70,6 +70,8 @@ static const char usage[] =
 	"    --cbc-poll US : CBC completion poll period T_poll in us (default %u)       \n"
 	"    --rej-add-step A : REJ additive window step (default %u)                   \n"
 	"    --rej-grow-streak K : REJ full transmits before growing W (default %u)     \n"
+	"    --txq-map hplp|pertc : scheduler TC -> NIC TX queue. hplp (default): TC0 \n"
+	"           on queue 0, all other TCs share queue 1. pertc: TC i on queue i.  \n"
 ;
 
 /* display usage */
@@ -279,6 +281,8 @@ enum {
 	OPT_REJ_ADD_NUM,
 #define OPT_REJ_GROW "rej-grow-streak"
 	OPT_REJ_GROW_NUM,
+#define OPT_TXQ_MAP "txq-map"
+	OPT_TXQ_MAP_NUM,
 };
 
 /*
@@ -306,6 +310,7 @@ app_parse_args(int argc, char **argv)
 		{OPT_CBC_POLL, 1, NULL, OPT_CBC_POLL_NUM},
 		{OPT_REJ_ADD, 1, NULL, OPT_REJ_ADD_NUM},
 		{OPT_REJ_GROW, 1, NULL, OPT_REJ_GROW_NUM},
+		{OPT_TXQ_MAP, 1, NULL, OPT_TXQ_MAP_NUM},
 		{NULL,    0, 0,    0          }
 	};
 
@@ -424,11 +429,24 @@ app_parse_args(int argc, char **argv)
 				rej_grow_streak = (uint32_t)atoi(optarg);
 				break;
 
+			case OPT_TXQ_MAP_NUM:
+				if (strcmp(optarg, "hplp") == 0)
+					txq_map = TXQ_MAP_HPLP;
+				else if (strcmp(optarg, "pertc") == 0)
+					txq_map = TXQ_MAP_PERTC;
+				else {
+					RTE_LOG(ERR, APP, "Invalid --txq-map %s (hplp|pertc)\n", optarg);
+					return -1;
+				}
+				break;
+
 			default:
 				app_usage(prgname);
 				return -1;
 			}
 	}
+
+	txq_map_apply();
 
 	if (nb_pfc == 0) {
 		RTE_LOG(ERR, APP, "Packet flow not configured!\n");

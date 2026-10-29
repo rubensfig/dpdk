@@ -4,6 +4,7 @@
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <memory.h>
 
 #include <rte_log.h>
@@ -56,6 +57,20 @@ struct ring_thresh tx_thresh = {
 };
 
 uint32_t nb_pfc;
+
+enum txq_map txq_map = TXQ_MAP_HPLP;
+uint16_t tc_txq[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
+
+void
+txq_map_apply(void)
+{
+	for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++)
+		tc_txq[tc] = txq_map == TXQ_MAP_PERTC ? tc : (tc == 0 ? 0 : 1);
+	RTE_LOG(INFO, APP, "TX queue map: %s (%s)\n",
+		txq_map == TXQ_MAP_PERTC ? "pertc" : "hplp",
+		txq_map == TXQ_MAP_PERTC ? "TC i -> queue i" :
+		"TC0 -> queue 0, TC1..12 -> queue 1");
+}
 const char *cfg_profile = NULL;
 int mp_size = NB_MBUF;
 struct flow_conf qos_conf[MAX_DATA_STREAMS];
@@ -371,7 +386,16 @@ app_init_port(uint16_t portid, struct rte_mempool *mp, bool hqos_init)
 		       	rte_exit(EXIT_FAILURE, "rte_eth_tx_queue_setup: err=%d, port=%u queue=%d\n", ret, portid, i);
 	}
 
-	app_init_port_tm(portid);
+	/*
+	 * The TM hierarchy is the cnxk (Octeon) one. iavf rejects it (3 levels,
+	 * no priorities in the VF): there the NIC serves the TX queues
+	 * round-robin, and with --txq-map hplp only HP and LP queues exist.
+	 */
+	if (strstr(dev_info.driver_name, "iavf") == NULL)
+		app_init_port_tm(portid);
+	else
+		RTE_LOG(INFO, APP, "Port %u: %s: no TM hierarchy\n", portid,
+			dev_info.driver_name);
 
 	/* Start device */
 	ret = rte_eth_dev_start(portid);
@@ -700,6 +724,8 @@ int app_init(void)
 				   "Controller run telemetry (monotonic). Params: flow_id");
 	rte_telemetry_register_cmd("/qos/scenario", telemetry_scenario,
 				   "Static run configuration. No params");
+	rte_telemetry_register_cmd("/qos/pipe_stats", telemetry_pipe_stats,
+				   "Pipe queues per TC (subport 0), counters since last read. Params: flow_id,pipe[,pipe...]");
 
 	RTE_LOG(INFO, APP, "time stamp clock running at %" PRIu64 " Hz\n",
 			 rte_get_timer_hz());
