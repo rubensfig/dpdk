@@ -222,8 +222,15 @@ pf_tm_build(uint16_t port, uint16_t n_inst)
 
 		memset(&sp, 0, sizeof(sp));
 		sp.peak.rate = (uint64_t)(pf_conf.rate_gbps * 1e9 / 8);
-		if (!ice)	/* ice rejects length adjustment and bucket sizes */
+		if (!ice) {	/* ice rejects length adjustment and bucket sizes */
+			/* cnxk: explicit burst, 20 us at the shaper rate, at most the
+			 * hardware maximum (~128 KB); left at 0 the driver's default
+			 * fails above ~34 Gb/s ("TM peak size invalid") */
+			uint64_t burst = sp.peak.rate / 50000;		/* 20 us */
+
 			sp.pkt_length_adjust = RTE_TM_ETH_FRAMING_OVERHEAD_FCS;
+			sp.peak.size = RTE_MIN(RTE_MAX(burst, (uint64_t)9216), (uint64_t)130816);
+		}
 		ret = rte_tm_shaper_profile_add(port, PF_SHAPER_ID, &sp, &err);
 		if (ret)
 			rte_exit(EXIT_FAILURE, "PF tree port %u: shaper: %d (%s)\n", port,
@@ -234,18 +241,24 @@ pf_tm_build(uint16_t port, uint16_t n_inst)
 	printf("PF tree port %u: %s-major, %u instances x %u queues, %d levels, "
 	       "shaper %.2f Gb/s%s\n", port, by_class ? "class" : "instance",
 	       n_inst, PF_NQ, levels, pf_conf.rate_gbps,
-	       ice ? " (ice: on the node below the root, L2 bytes)" : "");
+	       ice ? " (ice: on the node below the root, L2 bytes)" :
+	       group_level >= 2 ? " (on the node below the root, +24 B per frame)" : " (on the root)");
 
-	/* ice maps the root onto an existing HW node and programs only the
-	 * nodes below it, so the shaper goes on the first node under the root */
+	/* The shaper goes on the first node under the root, for both drivers:
+	 * ice maps the root onto an existing HW node and programs only the nodes
+	 * below it; on cnxk the root is TL1, which has no peak (PIR) shaper, so a
+	 * peak-only profile on the root is accepted but never shapes. The node
+	 * below (TL2 on cnxk) has a PIR. Needs group_level >= 2 (a pad level). */
+	const bool shaper_below_root = group_level >= 2;
+
 	root = next_id++;
 	pf_tm_add(port, ice, root, RTE_TM_NODE_ID_NULL, 0, 1, 0, false,
-		  ice ? RTE_TM_SHAPER_PROFILE_ID_NONE : shaper,
+		  shaper_below_root ? RTE_TM_SHAPER_PROFILE_ID_NONE : shaper,
 		  group_level == 1 && by_class ? PF_NQ : 1, "root");
 	parent = root;
 	for (int l = 1; l < group_level; l++) {
 		uint32_t id = next_id++;
-		bool sh = ice && l == 1;
+		bool sh = shaper_below_root && l == 1;
 
 		pf_tm_add(port, ice, id, parent, 0, 1, (uint32_t)l, false,
 			  sh ? shaper : RTE_TM_SHAPER_PROFILE_ID_NONE,
