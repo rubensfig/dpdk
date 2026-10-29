@@ -4,6 +4,7 @@
 
 #include <stddef.h>
 #include <unistd.h>
+#include <stdlib.h>
 #include <string.h>
 #include <rte_telemetry.h>
 #include <rte_cycles.h>
@@ -592,6 +593,99 @@ telemetry_ctrl_stats(const char *cmd __rte_unused, const char *params,
 	}
 	rte_tel_data_add_dict_container(d, "tc", tc, 0);
 
+	return 0;
+}
+
+/*
+ * /qos/pipe_stats,<flow_id>,<pipe>[,<pipe>...]: the scheduler queues of a few
+ * pipes of subport 0 (e.g. the pipes of the TCP households), per traffic class
+ * 0 .. PIPE_STATS_TCS-1:
+ *   qlen        packets in the queue now
+ *   pkts        packets written to the queue      } since the previous read:
+ *   dropped     packets dropped (tail + RED)      } rte_sched_queue_read_stats()
+ *   cman_drop   of these, dropped by RED/PIE      } clears the counters, so
+ *   cman_mark   packets ECN-marked (CE) by RED    } there must be one reader
+ * Read from the control thread like pipe_stat(); the counters are plain
+ * uint64 updated by the worker, so a read can miss an update in flight.
+ */
+#define PIPE_STATS_MAX 16
+#define PIPE_STATS_TCS 4
+
+int
+telemetry_pipe_stats(const char *cmd __rte_unused, const char *params,
+		struct rte_tel_data *d)
+{
+	static const char *const names[5] = {
+		"qlen", "pkts", "dropped", "cman_drop", "cman_mark" };
+	uint32_t pipes[PIPE_STATS_MAX];
+	char buf[256];
+	char *save = NULL;
+	char *tok;
+	int flow_id, n = 0;
+
+	if (params == NULL || *params == '\0')
+		return -EINVAL;
+	snprintf(buf, sizeof(buf), "%s", params);
+	tok = strtok_r(buf, ",", &save);
+	flow_id = parse_flow_id(tok);
+	if (flow_id < 0)
+		return -EINVAL;
+
+	struct rte_sched_port *port = qos_conf[flow_id].sched_port;
+	uint32_t n_pipes = subport_params[0].n_pipes_per_subport_enabled;
+
+	/* validate all pipes first, so that no error path leaks containers */
+	while ((tok = strtok_r(NULL, ",", &save)) != NULL && n < PIPE_STATS_MAX) {
+		char *end;
+		unsigned long pipe = strtoul(tok, &end, 10);
+
+		if (*end != '\0' || pipe >= n_pipes)
+			return -EINVAL;
+		pipes[n++] = (uint32_t)pipe;
+	}
+	if (n == 0)
+		return -EINVAL;
+
+	rte_tel_data_start_dict(d);
+	rte_tel_data_add_dict_uint(d, "tsc", rte_rdtsc());
+
+	for (int i = 0; i < n; i++) {
+		struct rte_tel_data *p = rte_tel_data_alloc();
+		struct rte_tel_data *a[5] = { NULL };
+		char key[24];
+
+		if (p == NULL)
+			return -ENOMEM;
+		rte_tel_data_start_dict(p);
+		for (int k = 0; k < 5; k++) {
+			a[k] = rte_tel_data_alloc();
+			if (a[k] == NULL) {
+				for (int j = 0; j < k; j++)
+					rte_tel_data_free(a[j]);
+				rte_tel_data_free(p);
+				return -ENOMEM;
+			}
+			rte_tel_data_start_array(a[k], RTE_TEL_UINT_VAL);
+		}
+		/* read-and-clear: counters cover the time since the previous read */
+		for (uint32_t t = 0; t < PIPE_STATS_TCS; t++) {
+			struct rte_sched_queue_stats st;
+			uint16_t qlen = 0;
+
+			memset(&st, 0, sizeof(st));
+			rte_sched_queue_read_stats(port,
+				pipes[i] * RTE_SCHED_QUEUES_PER_PIPE + t, &st, &qlen);
+			rte_tel_data_add_array_uint(a[0], qlen);
+			rte_tel_data_add_array_uint(a[1], st.n_pkts);
+			rte_tel_data_add_array_uint(a[2], st.n_pkts_dropped);
+			rte_tel_data_add_array_uint(a[3], st.n_pkts_cman_dropped);
+			rte_tel_data_add_array_uint(a[4], st.n_pkts_cman_marked);
+		}
+		for (int k = 0; k < 5; k++)
+			rte_tel_data_add_dict_container(p, names[k], a[k], 0);
+		snprintf(key, sizeof(key), "pipe_%u", pipes[i]);
+		rte_tel_data_add_dict_container(d, key, p, 0);
+	}
 	return 0;
 }
 

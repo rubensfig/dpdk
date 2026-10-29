@@ -84,6 +84,9 @@ static const char usage[] =
 	"    --pf-levels L : TM tree depth (default: detected)                          \n"
 	"    --pf-dst-mac MAC : static MACs: source = tx port MAC, destination = MAC   \n"
 	"           with byte 1 + instance (Ixia upstream 00:<i>:01:00:00:01)           \n"
+	"    --txq-map hplp|pertc : scheduler TC -> NIC TX queue outside PF mode.     \n"
+	"           hplp: TC0 on queue 0, all other TCs share queue 1. pertc: TC i   \n"
+	"           on queue i. Default: hplp on iavf, pertc otherwise (cnxk)       \n"
 ;
 
 /* display usage */
@@ -300,6 +303,8 @@ enum {
 	OPT_PF_LEVELS_NUM,
 #define OPT_PF_DST_MAC "pf-dst-mac"
 	OPT_PF_DST_MAC_NUM,
+#define OPT_TXQ_MAP "txq-map"
+	OPT_TXQ_MAP_NUM,
 };
 
 /*
@@ -333,6 +338,7 @@ app_parse_args(int argc, char **argv)
 		{OPT_PF_MAC, 1, NULL, OPT_PF_MAC_NUM},
 		{OPT_PF_LEVELS, 1, NULL, OPT_PF_LEVELS_NUM},
 		{OPT_PF_DST_MAC, 1, NULL, OPT_PF_DST_MAC_NUM},
+		{OPT_TXQ_MAP, 1, NULL, OPT_TXQ_MAP_NUM},
 		{NULL,    0, 0,    0          }
 	};
 
@@ -459,6 +465,17 @@ app_parse_args(int argc, char **argv)
 				}
 				break;
 
+			case OPT_TXQ_MAP_NUM:
+				if (strcmp(optarg, "hplp") == 0)
+					txq_map = TXQ_MAP_HPLP;
+				else if (strcmp(optarg, "pertc") == 0)
+					txq_map = TXQ_MAP_PERTC;
+				else {
+					RTE_LOG(ERR, APP, "Invalid --txq-map %s (hplp|pertc)\n", optarg);
+					return -1;
+				}
+				break;
+
 			case OPT_PF_RATE_NUM:
 				pf_conf.rate_gbps = atof(optarg);
 				if (pf_conf.rate_gbps < 0) {
@@ -498,6 +515,12 @@ app_parse_args(int argc, char **argv)
 				app_usage(prgname);
 				return -1;
 			}
+	}
+
+	/* the TC -> queue map is set per port: txq_map_apply(), pf_init_ports() */
+	if (txq_map != TXQ_MAP_AUTO && pf_conf.shape != PF_TREE_OFF) {
+		RTE_LOG(ERR, APP, "--txq-map does not apply in PF mode (use --pf-tc-map)\n");
+		return -1;
 	}
 
 	if (nb_pfc == 0) {

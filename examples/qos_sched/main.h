@@ -87,6 +87,18 @@ extern enum mixed_mode mixed_mode;
 extern uint32_t cbc_poll_us;
 extern uint32_t rej_add_step;
 extern uint32_t rej_grow_streak;
+
+/*
+ * Scheduler TC -> NIC TX queue outside PF mode (--txq-map), kept in app_tc2q:
+ *   hplp:  TC0 (HP) -> queue 0, every other TC (LP) -> queue 1. The NIC sees
+ *          two queues whatever the number of scheduler priorities; the LP TCs
+ *          share one queue and one controller (see app_mixed_thread_ctrl()).
+ *   pertc: TC i -> queue i (the original mapping).
+ *   auto (no --txq-map): hplp on iavf, pertc otherwise (cnxk).
+ */
+enum txq_map { TXQ_MAP_AUTO, TXQ_MAP_HPLP, TXQ_MAP_PERTC };
+extern enum txq_map txq_map;
+void txq_map_apply(const char *driver_name);
 int mixed_mode_parse(const char *name);
 const char *mixed_mode_name(void);
 const char *mixed_mode_list(void);
@@ -145,7 +157,9 @@ bool mixed_mode_has_tc_stats(void);
 #define PF_NQ 8                    /* NIC classes = TX queues per instance */
 #define MAX_TXQ_PER_PORT 128
 extern uint8_t app_tc2q[N_TC];
-#define TXQ(conf, tc) ((uint16_t)((conf)->txq_base + app_tc2q[(tc)]))
+/* queue of a TC inside the instance (controller index) and on the port */
+#define TCQ(tc) (app_tc2q[(tc)])
+#define TXQ(conf, tc) ((uint16_t)((conf)->txq_base + TCQ(tc)))
 
 enum pf_tree_shape {
 	PF_TREE_OFF = 0,	/* VF / cnxk behaviour, one instance per port */
@@ -297,6 +311,9 @@ telemetry_ctrl_stats(const char *cmd __rte_unused,
 		const char *params, struct rte_tel_data *d);
 int
 telemetry_scenario(const char *cmd __rte_unused,
+		const char *params, struct rte_tel_data *d);
+int
+telemetry_pipe_stats(const char *cmd __rte_unused,
 		const char *params, struct rte_tel_data *d);
 
 

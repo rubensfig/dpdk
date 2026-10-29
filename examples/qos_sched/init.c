@@ -4,6 +4,7 @@
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <memory.h>
 #include <string.h>
 
@@ -58,6 +59,31 @@ struct ring_thresh tx_thresh = {
 };
 
 uint32_t nb_pfc;
+
+enum txq_map txq_map = TXQ_MAP_AUTO;
+
+/*
+ * Outside PF mode: scheduler TC -> TX queue (app_tc2q) from --txq-map, or
+ * from the driver when not given (hplp on iavf, pertc on cnxk and others).
+ * PF mode sets app_tc2q itself (pf_init_ports(), --pf-tc-map).
+ */
+void
+txq_map_apply(const char *driver_name)
+{
+	enum txq_map m = txq_map;
+
+	if (m == TXQ_MAP_AUTO)
+		m = (driver_name && strstr(driver_name, "iavf")) ? TXQ_MAP_HPLP :
+			TXQ_MAP_PERTC;
+	for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++)
+		app_tc2q[tc] = m == TXQ_MAP_PERTC ? tc : (tc == 0 ? 0 : 1);
+	RTE_LOG(INFO, APP, "TX queue map: %s%s (%s)\n",
+		m == TXQ_MAP_PERTC ? "pertc" : "hplp",
+		txq_map == TXQ_MAP_AUTO ? ", from the driver" : "",
+		m == TXQ_MAP_PERTC ? "TC i -> queue i" :
+		"TC0 -> queue 0, TC1..12 -> queue 1");
+}
+
 const char *cfg_profile = NULL;
 int mp_size = NB_MBUF;
 struct flow_conf qos_conf[MAX_DATA_STREAMS];
@@ -669,9 +695,19 @@ app_init_port(uint16_t portid, struct rte_mempool *mp, bool hqos_init)
 		       	rte_exit(EXIT_FAILURE, "rte_eth_tx_queue_setup: err=%d, port=%u queue=%d\n", ret, portid, i);
 	}
 
-	/* cnxk (Octeon) rte_tm tree; on iavf, PMDLink sets priorities after start */
-	if (strcmp(dev_info.driver_name, "net_iavf") != 0)
+	/*
+	 * The TM hierarchy is the cnxk (Octeon) one. iavf rejects it (3 levels,
+	 * no priorities in the VF): there PMDLink sets the priorities after the
+	 * port starts, and with --txq-map hplp only HP and LP queues exist.
+	 */
+	if (pf_conf.shape == PF_TREE_OFF)
+		txq_map_apply(dev_info.driver_name);
+
+	if (strstr(dev_info.driver_name, "iavf") == NULL)
 		app_init_port_tm(portid);
+	else
+		RTE_LOG(INFO, APP, "Port %u: %s: no TM hierarchy\n", portid,
+			dev_info.driver_name);
 
 	/* Start device */
 	ret = rte_eth_dev_start(portid);
@@ -1039,6 +1075,8 @@ int app_init(void)
 				   "Controller run telemetry (monotonic). Params: flow_id");
 	rte_telemetry_register_cmd("/qos/scenario", telemetry_scenario,
 				   "Static run configuration. No params");
+	rte_telemetry_register_cmd("/qos/pipe_stats", telemetry_pipe_stats,
+				   "Pipe queues per TC (subport 0), counters since last read. Params: flow_id,pipe[,pipe...]");
 
 	RTE_LOG(INFO, APP, "time stamp clock running at %" PRIu64 " Hz\n",
 			 rte_get_timer_hz());
