@@ -62,7 +62,7 @@ pending_init(struct pending_q *q)
 	q->retry_cnt = rte_calloc("pending_retry", pending_size,
 			sizeof(*q->retry_cnt), RTE_CACHE_LINE_SIZE);
 	if (q->pkts == NULL || q->enqueue_tsc == NULL || q->retry_cnt == NULL)
-		rte_exit(EXIT_FAILURE, "cannot allocate a retry queue of %u packets\n",
+		rte_panic("cannot allocate a retry queue of %u packets\n",
 				pending_size);
 	q->head = q->tail = q->cnt = q->cnt_pktsize = 0;
 }
