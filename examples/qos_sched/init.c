@@ -994,6 +994,20 @@ int app_init(void)
 	if (app_load_cfg_profile(cfg_profile) != 0)
 		rte_exit(EXIT_FAILURE, "Invalid configuration profile\n");
 
+	/* watched pipes (--watch-pipes) must exist in subport 0 of the cfg */
+	for (i = 0; i < nb_pfc; i++)
+		for (uint32_t w = 0; w < qos_conf[i].cs.n_watch; w++)
+			if (qos_conf[i].cs.watch_pipe[w] >=
+					subport_params[0].n_pipes_per_subport_enabled)
+				rte_exit(EXIT_FAILURE, "--watch-pipes: pipe %u of instance %u "
+					"is beyond the %u pipes of subport 0\n",
+					qos_conf[i].cs.watch_pipe[w], i,
+					subport_params[0].n_pipes_per_subport_enabled);
+
+	RTE_LOG(INFO, APP, "retry queue %u packets per TC; statistics %s "
+		"(peak window %u ms, watch period %u us)\n", pending_size,
+		stats_on ? "on" : "off (--no-stats)", stats_win_ms, watch_us);
+
 	/* Initialize each active flow */
 	for(i = 0; i < nb_pfc; i++) {
 		uint32_t socket = rte_lcore_to_socket_id(qos_conf[i].rx_core);

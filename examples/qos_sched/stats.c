@@ -479,12 +479,12 @@ static const struct {
 	CS_C(active), CS_C(req), CS_C(cap), CS_C(ov), CS_C(deq), CS_C(tx),
 	CS_C(sent), CS_C(retried), CS_C(retry_sent), CS_C(dropped),
 	CS_C(stalls), CS_C(bound), CS_C(polls), CS_C(freed), CS_C(fb_cyc),
-	CS_C(h_lowered), CS_C(cuts),
+	CS_C(h_lowered), CS_C(cuts), CS_C(pq_area),
 #undef CS_C
 }, cs_gauges[] = {
 #define CS_G(f) { #f, offsetof(struct ctrl_tc_stats, f) }
 	CS_G(pq), CS_G(q_minus_c), CS_G(u), CS_G(u0), CS_G(h), CS_G(delta),
-	CS_G(w),
+	CS_G(w), CS_G(pq_max_win),
 #undef CS_G
 };
 
@@ -533,6 +533,12 @@ telemetry_ctrl_stats(const char *cmd __rte_unused, const char *params,
 	rte_tel_data_add_dict_uint(inst, "sched_drop", cs->inst.sched_drop);
 	rte_tel_data_add_dict_uint(inst, "sched_deq", cs->inst.sched_deq);
 	rte_tel_data_add_dict_uint(inst, "rx_ring_drop", cs->rx_ring_drop);
+	rte_tel_data_add_dict_uint(inst, "cyc_busy", cs->inst.cyc_busy);
+	rte_tel_data_add_dict_uint(inst, "cyc_idle", cs->inst.cyc_idle);
+	rte_tel_data_add_dict_uint(inst, "cyc_enq", cs->inst.cyc_enq);
+	rte_tel_data_add_dict_uint(inst, "cyc_ctrl", cs->inst.cyc_ctrl);
+	rte_tel_data_add_dict_uint(inst, "cyc_deq", cs->inst.cyc_deq);
+	rte_tel_data_add_dict_uint(inst, "cyc_tx", cs->inst.cyc_tx);
 	if (flow->rx_ring != NULL)
 		rte_tel_data_add_dict_uint(inst, "rx_ring",
 				rte_ring_count(flow->rx_ring));
@@ -592,6 +598,55 @@ telemetry_ctrl_stats(const char *cmd __rte_unused, const char *params,
 		rte_tel_data_add_dict_container(tc, "txq_count", qc, 0);
 	}
 	rte_tel_data_add_dict_container(d, "tc", tc, 0);
+
+	/*
+	 * Watched pipes (--watch-pipes): "watch" = { "pipe_<p>": { qlen_area,
+	 * pkts, dropped (uint counters), qlen, qlen_max_win (int gauges) } },
+	 * arrays indexed by TC 0 .. CS_WATCH_TCS-1.
+	 */
+	if (cs->n_watch > 0) {
+		struct rte_tel_data *wd = rte_tel_data_alloc();
+
+		if (wd == NULL)
+			return 0;
+		rte_tel_data_start_dict(wd);
+		for (uint32_t i = 0; i < cs->n_watch; i++) {
+			const struct ctrl_watch_stats *w = &cs->watch[i];
+			const uint64_t *uc[3] = { w->qlen_area, w->pkts, w->dropped };
+			const int64_t *ig[2] = { w->qlen, w->qlen_max_win };
+			static const char *const un[3] = { "qlen_area", "pkts", "dropped" };
+			static const char *const in[2] = { "qlen", "qlen_max_win" };
+			struct rte_tel_data *p = rte_tel_data_alloc();
+			char key[24];
+
+			if (p == NULL)
+				break;
+			rte_tel_data_start_dict(p);
+			for (int k = 0; k < 3; k++) {
+				struct rte_tel_data *a = rte_tel_data_alloc();
+
+				if (a == NULL)
+					continue;
+				rte_tel_data_start_array(a, RTE_TEL_UINT_VAL);
+				for (int q = 0; q < CS_WATCH_TCS; q++)
+					rte_tel_data_add_array_uint(a, uc[k][q]);
+				rte_tel_data_add_dict_container(p, un[k], a, 0);
+			}
+			for (int k = 0; k < 2; k++) {
+				struct rte_tel_data *a = rte_tel_data_alloc();
+
+				if (a == NULL)
+					continue;
+				rte_tel_data_start_array(a, RTE_TEL_INT_VAL);
+				for (int q = 0; q < CS_WATCH_TCS; q++)
+					rte_tel_data_add_array_int(a, ig[k][q]);
+				rte_tel_data_add_dict_container(p, in[k], a, 0);
+			}
+			snprintf(key, sizeof(key), "pipe_%u", cs->watch_pipe[i]);
+			rte_tel_data_add_dict_container(wd, key, p, 0);
+		}
+		rte_tel_data_add_dict_container(d, "watch", wd, 0);
+	}
 
 	return 0;
 }
@@ -732,7 +787,10 @@ telemetry_scenario(const char *cmd __rte_unused,
 	rte_tel_data_add_dict_uint(d, "qos_dequeue", burst_conf.qos_dequeue);
 	rte_tel_data_add_dict_uint(d, "tx_burst", burst_conf.tx_burst);
 	rte_tel_data_add_dict_int(d, "mp_size", mp_size);
-	rte_tel_data_add_dict_uint(d, "pending_max", PENDING_MAX);
+	rte_tel_data_add_dict_uint(d, "pending_max", pending_size);
+	rte_tel_data_add_dict_uint(d, "stats_on", stats_on);
+	rte_tel_data_add_dict_uint(d, "stats_win_ms", stats_win_ms);
+	rte_tel_data_add_dict_uint(d, "watch_us", watch_us);
 	rte_tel_data_add_dict_uint(d, "cbc_poll_us", cbc_poll_us);
 	rte_tel_data_add_dict_uint(d, "rej_add_step", rej_add_step);
 	rte_tel_data_add_dict_uint(d, "rej_grow_streak", rej_grow_streak);
@@ -774,6 +832,16 @@ telemetry_scenario(const char *cmd __rte_unused,
 		rte_tel_data_add_dict_uint(fd, "tx_core", f->tx_core);
 		rte_tel_data_add_dict_uint(fd, "rx_queue", f->rx_queue);
 		rte_tel_data_add_dict_uint(fd, "txq_base", f->txq_base);
+		if (f->cs.n_watch > 0) {
+			struct rte_tel_data *wp = rte_tel_data_alloc();
+
+			if (wp != NULL) {
+				rte_tel_data_start_array(wp, RTE_TEL_UINT_VAL);
+				for (uint32_t w = 0; w < f->cs.n_watch; w++)
+					rte_tel_data_add_array_uint(wp, f->cs.watch_pipe[w]);
+				rte_tel_data_add_dict_container(fd, "watch_pipes", wp, 0);
+			}
+		}
 		if (rte_eth_dev_info_get(f->tx_port, &info) == 0 &&
 				info.driver_name != NULL)
 			rte_tel_data_add_dict_string(fd, "pmd", info.driver_name);

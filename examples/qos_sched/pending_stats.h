@@ -1,13 +1,40 @@
 #pragma once
+#include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#include <rte_branch_prediction.h>
 #include <rte_cycles.h>
 #include <math.h>
 
-#define PENDING_MAX 512
+/*
+ * Retry (pending) queue size. PENDING_MAX is the largest size the code
+ * supports; the size used at run time is pending_size (--pq-size, a power of
+ * two in [PENDING_MIN, PENDING_MAX], default PENDING_DEFAULT), pending_mask =
+ * pending_size - 1 is the ring mask.
+ */
+#define PENDING_MIN     16
+#define PENDING_MAX     4096
+#define PENDING_DEFAULT 512
+extern uint32_t pending_size;
+extern uint32_t pending_mask;
+
+/*
+ * Statistics switch (--no-stats clears it). With stats_on false the data path
+ * skips every statistics update and every TSC read that only feeds
+ * statistics, so the overhead of the instrumentation itself can be measured
+ * (compare delivered throughput and NIC/Ixia counters with and without).
+ */
+extern bool stats_on;
+
+/* TSC for statistics only: 0 when statistics are off (differences stay 0) */
+static inline uint64_t
+stats_tsc(void)
+{
+	return likely(stats_on) ? rte_rdtsc() : 0;
+}
 
 /* ── Histogram bucket config ─────────────────────────── */
-#define PHIST_OCC_BUCKETS   16   /* occupancy:  bucket i → [i*(PENDING_MAX/16), ...) */
+#define PHIST_OCC_BUCKETS   16   /* occupancy:  bucket i → [i*(pending_size/16), ...) */
 #define PHIST_RETRY_BUCKETS  8   /* retry count: 0,1,2,3,4,5,6,7+                    */
 
 #define PHIST_BUCKETS_PER_DECADE 30      /* resolution knob: higher = finer */
@@ -102,6 +129,8 @@ static inline double pstats_lat_bucket_lower_ns(uint32_t idx) {
 static inline void
 pstats_record_occupancy(pending_tc_stats_t *s, uint32_t occ)
 {
+	if (unlikely(!stats_on))
+		return;
 
 	s->occ_sum += occ;
 	s->occ_samples++;
@@ -109,8 +138,8 @@ pstats_record_occupancy(pending_tc_stats_t *s, uint32_t occ)
 	if (occ > s->occ_max) 
 		s->occ_max = occ;
 
-	/* occupancy histogram: linear buckets of size PENDING_MAX/BUCKETS */
-	uint32_t b = (occ * PHIST_OCC_BUCKETS) / (PENDING_MAX + 1);
+	/* occupancy histogram: linear buckets of size pending_size/BUCKETS */
+	uint32_t b = (occ * PHIST_OCC_BUCKETS) / (pending_size + 1);
 	if (b >= PHIST_OCC_BUCKETS) 
 		b = PHIST_OCC_BUCKETS - 1;
 
@@ -128,6 +157,8 @@ pstats_record_occupancy(pending_tc_stats_t *s, uint32_t occ)
 static inline void
 pstats_record_loss(pending_tc_stats_t *s, uint32_t loss)
 {
+	if (unlikely(!stats_on))
+		return;
 	s->retry_loss += loss;
 
 }

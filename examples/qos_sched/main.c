@@ -192,7 +192,7 @@ app_stat(void)
 			flow->wt_thread.stat.nb_rx - flow->wt_thread.stat.nb_drop);
 		printf("-------+------------+------------+\n");
 
-	if (mixed_mode_has_tc_stats()) {
+	if (stats_on && mixed_mode_has_tc_stats()) {
 	uint64_t hz = rte_get_tsc_hz();
 	printf("-------+------------ Pending Queue Stats -------------+\n");
 	printf("  TC   | avg_occ | max_occ | avg_lat_ns | max_lat_ns | loss | cyc/tx | cyc/retry |\n");
@@ -212,13 +212,13 @@ app_stat(void)
 	
 	/* occupancy histogram */
 	if (s->occ_samples && s->occ_max > 0) {
-		printf("  occ_hist (bucket=%d slots):\n", PENDING_MAX / PHIST_OCC_BUCKETS);
+		printf("  occ_hist (bucket=%u slots):\n", pending_size / PHIST_OCC_BUCKETS);
 		for (int b = 0; b < PHIST_OCC_BUCKETS; b++) {
 
 			if (!s->occ_hist[b]) continue;
 
-			printf("    [%4d-%4d]: %lu\n", b * PENDING_MAX / PHIST_OCC_BUCKETS,
-			(b + 1) * PENDING_MAX / PHIST_OCC_BUCKETS - 1, s->occ_hist[b]);
+			printf("    [%4u-%4u]: %lu\n", b * pending_size / PHIST_OCC_BUCKETS,
+			(b + 1) * pending_size / PHIST_OCC_BUCKETS - 1, s->occ_hist[b]);
 		}
 	}
 	

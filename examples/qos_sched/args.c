@@ -23,6 +23,13 @@
 #define SYS_CPU_DIR "/sys/devices/system/cpu/cpu%u/topology/"
 
 static uint32_t app_main_core = 1;
+
+/* retry queue size and statistics switches (pending_stats.h, ctrl_stats.h) */
+uint32_t pending_size = PENDING_DEFAULT;
+uint32_t pending_mask = PENDING_DEFAULT - 1;
+bool stats_on = true;
+uint32_t stats_win_ms = 100;
+uint32_t watch_us = 1000;
 static uint32_t app_numa_mask;
 static uint64_t app_used_port_mask = 0;
 static uint64_t app_used_rx_port_mask = 0;
@@ -84,6 +91,16 @@ static const char usage[] =
 	"    --pf-levels L : TM tree depth (default: detected)                          \n"
 	"    --pf-dst-mac MAC : static MACs: source = tx port MAC, destination = MAC   \n"
 	"           with byte 1 + instance (Ixia upstream 00:<i>:01:00:00:01)           \n"
+	"    --pq-size N : retry (pending) queue size per TC in packets, a power of   \n"
+	"           two in [16, 4096] (default 512)                                   \n"
+	"    --no-stats : disable all run statistics in the data path (ctrl_stats,   \n"
+	"           pending stats, loop cycles, watched pipes), to measure their cost \n"
+	"    --stats-win-ms MS : window of the peak gauges pq_max_win and             \n"
+	"           qlen_max_win (default 100)                                        \n"
+	"    --watch-pipes F:P[,P..] : watch the scheduler queues of pipes P (subport \n"
+	"           0) of instance F (pfc index from 0), up to 8 pipes; repeat the    \n"
+	"           option for each instance                                          \n"
+	"    --watch-us US : read period of the watched pipes (default 1000)          \n"
 	"    --txq-map hplp|pertc : scheduler TC -> NIC TX queue outside PF mode.     \n"
 	"           hplp: TC0 on queue 0, all other TCs share queue 1. pertc: TC i   \n"
 	"           on queue i. Default: hplp on iavf, pertc otherwise (cnxk)       \n"
@@ -305,7 +322,50 @@ enum {
 	OPT_PF_DST_MAC_NUM,
 #define OPT_TXQ_MAP "txq-map"
 	OPT_TXQ_MAP_NUM,
+#define OPT_PQ_SIZE "pq-size"
+	OPT_PQ_SIZE_NUM,
+#define OPT_NO_STATS "no-stats"
+	OPT_NO_STATS_NUM,
+#define OPT_STATS_WIN "stats-win-ms"
+	OPT_STATS_WIN_NUM,
+#define OPT_WATCH_PIPES "watch-pipes"
+	OPT_WATCH_PIPES_NUM,
+#define OPT_WATCH_US "watch-us"
+	OPT_WATCH_US_NUM,
 };
+
+/*
+ * --watch-pipes F:P[,P...]: pipes of subport 0 watched in instance F.
+ * The pipe range is checked against the cfg in app_init (it is not loaded yet).
+ */
+static int
+app_parse_watch_pipes(const char *arg)
+{
+	char buf[256];
+	char *end, *save = NULL, *tok;
+	unsigned long f;
+
+	if (strlen(arg) >= sizeof(buf))
+		return -1;
+	snprintf(buf, sizeof(buf), "%s", arg);
+	f = strtoul(buf, &end, 10);
+	if (end == buf || *end != ':' || f >= MAX_DATA_STREAMS)
+		return -1;
+
+	struct ctrl_stats *cs = &qos_conf[f].cs;
+
+	cs->n_watch = 0;
+	for (tok = strtok_r(end + 1, ",", &save); tok != NULL;
+			tok = strtok_r(NULL, ",", &save)) {
+		unsigned long pipe = strtoul(tok, &end, 10);
+
+		if (end == tok || *end != '\0' || pipe >= MAX_SCHED_PIPES ||
+				cs->n_watch >= CS_WATCH_MAX)
+			return -1;
+		cs->watch_pipe[cs->n_watch++] = (uint32_t)pipe;
+	}
+	return cs->n_watch > 0 ? 0 : -1;
+}
 
 /*
  * Parses the argument given in the command line of the application,
@@ -339,6 +399,11 @@ app_parse_args(int argc, char **argv)
 		{OPT_PF_LEVELS, 1, NULL, OPT_PF_LEVELS_NUM},
 		{OPT_PF_DST_MAC, 1, NULL, OPT_PF_DST_MAC_NUM},
 		{OPT_TXQ_MAP, 1, NULL, OPT_TXQ_MAP_NUM},
+		{OPT_PQ_SIZE, 1, NULL, OPT_PQ_SIZE_NUM},
+		{OPT_NO_STATS, 0, NULL, OPT_NO_STATS_NUM},
+		{OPT_STATS_WIN, 1, NULL, OPT_STATS_WIN_NUM},
+		{OPT_WATCH_PIPES, 1, NULL, OPT_WATCH_PIPES_NUM},
+		{OPT_WATCH_US, 1, NULL, OPT_WATCH_US_NUM},
 		{NULL,    0, 0,    0          }
 	};
 
@@ -511,6 +576,47 @@ app_parse_args(int argc, char **argv)
 				pf_conf.set_dst = true;
 				break;
 
+			case OPT_PQ_SIZE_NUM: {
+				long v = atol(optarg);
+
+				if (v < PENDING_MIN || v > PENDING_MAX || (v & (v - 1))) {
+					RTE_LOG(ERR, APP, "Invalid --pq-size %s (power of two "
+						"in [%u, %u])\n", optarg, PENDING_MIN, PENDING_MAX);
+					return -1;
+				}
+				pending_size = (uint32_t)v;
+				pending_mask = pending_size - 1;
+				break;
+			}
+
+			case OPT_NO_STATS_NUM:
+				stats_on = false;
+				break;
+
+			case OPT_STATS_WIN_NUM:
+				if (atoi(optarg) <= 0) {
+					RTE_LOG(ERR, APP, "Invalid --stats-win-ms %s\n", optarg);
+					return -1;
+				}
+				stats_win_ms = (uint32_t)atoi(optarg);
+				break;
+
+			case OPT_WATCH_PIPES_NUM:
+				if (app_parse_watch_pipes(optarg)) {
+					RTE_LOG(ERR, APP, "Invalid --watch-pipes %s (F:P[,P..], "
+						"at most %u pipes)\n", optarg, CS_WATCH_MAX);
+					return -1;
+				}
+				break;
+
+			case OPT_WATCH_US_NUM:
+				if (atoi(optarg) <= 0) {
+					RTE_LOG(ERR, APP, "Invalid --watch-us %s\n", optarg);
+					return -1;
+				}
+				watch_us = (uint32_t)atoi(optarg);
+				break;
+
 			default:
 				app_usage(prgname);
 				return -1;
@@ -528,6 +634,13 @@ app_parse_args(int argc, char **argv)
 		app_usage(prgname);
 		return -1;
 	}
+
+	for (i = nb_pfc; i < MAX_DATA_STREAMS; i++)
+		if (qos_conf[i].cs.n_watch) {
+			RTE_LOG(ERR, APP, "--watch-pipes: instance %u is not configured "
+				"(%u pfc)\n", i, nb_pfc);
+			return -1;
+		}
 
 	if (app_port_shared && pf_conf.shape == PF_TREE_OFF) {
 		RTE_LOG(ERR, APP, "several pfc use the same rx or tx port: "

@@ -135,7 +135,7 @@ bool mixed_mode_has_tc_stats(void);
 #endif
 
 #if APP_COLLECT_STAT
-#define APP_STATS_ADD(stat,val) (stat) += (val)
+#define APP_STATS_ADD(stat,val) do { if (likely(stats_on)) (stat) += (val); } while (0)
 #else
 #define APP_STATS_ADD(stat,val) do {(void) (val);} while (0)
 #endif

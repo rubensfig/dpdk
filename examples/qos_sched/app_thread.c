@@ -40,114 +40,103 @@
 // #define COLOR_OFFSET	19
 // }
 
+/*
+ * Retry (pending) queue: FIFO ring of pending_size packets (--pq-size, a
+ * power of two), allocated by pending_init() with rte_calloc (hugepages:
+ * 17 B per packet slot, ~0.9 MB per instance for 13 TCs at 4096).
+ */
 struct pending_q {
-	struct rte_mbuf *pkts[PENDING_MAX];
-	uint64_t         enqueue_tsc[PENDING_MAX]; /* parallel TSC stamp array    */
-	uint8_t          retry_cnt[PENDING_MAX];   /* how many tx attempts so far */
-	uint16_t         head, tail, cnt, cnt_pktsize;
+	struct rte_mbuf **pkts;
+	uint64_t        *enqueue_tsc;	/* parallel TSC stamp array    */
+	uint8_t         *retry_cnt;	/* how many tx attempts so far */
+	uint32_t         head, tail, cnt, cnt_pktsize;
 } __rte_cache_aligned;
 
 static inline void
 pending_init(struct pending_q *q)
 {
-	    q->head = q->tail = q->cnt = 0;
+	q->pkts = rte_calloc("pending_pkts", pending_size, sizeof(*q->pkts),
+			RTE_CACHE_LINE_SIZE);
+	q->enqueue_tsc = rte_calloc("pending_tsc", pending_size,
+			sizeof(*q->enqueue_tsc), RTE_CACHE_LINE_SIZE);
+	q->retry_cnt = rte_calloc("pending_retry", pending_size,
+			sizeof(*q->retry_cnt), RTE_CACHE_LINE_SIZE);
+	if (q->pkts == NULL || q->enqueue_tsc == NULL || q->retry_cnt == NULL)
+		rte_exit(EXIT_FAILURE, "cannot allocate a retry queue of %u packets\n",
+				pending_size);
+	q->head = q->tail = q->cnt = q->cnt_pktsize = 0;
 }
 
 static inline void pending_enqueue_burst(struct pending_q *q, struct rte_mbuf **mbufs, uint16_t nb_mbufs) {
 	for (uint16_t i = 0; i < nb_mbufs; i++) {
-		if (unlikely(q->cnt == PENDING_MAX)) {
+		if (unlikely(q->cnt == pending_size)) {
 			/* policy decision: drop remaining packets */
 			rte_pktmbuf_free(mbufs[i]);
 			continue;
 		}
 
 		q->pkts[q->tail] = mbufs[i];
-		q->tail = (q->tail + 1) & (PENDING_MAX - 1);
+		q->tail = (q->tail + 1) & pending_mask;
 		q->cnt++;
 		q->cnt_pktsize += mbufs[i]->pkt_len;
 	}
 }
 
 static inline void pending_enqueue_burst_tracked(struct pending_q *q, pending_tc_stats_t *s, struct rte_mbuf **mbufs, uint16_t nb_mbufs) {
-	uint64_t now = rte_rdtsc();
-	uint16_t dropped = 0;
+	uint64_t now = stats_tsc();
 
 	for (uint16_t i = 0; i < nb_mbufs; i++) {
 
-		if (unlikely(q->cnt >= PENDING_MAX)) {
-			printf("DROPPED\n");
+		if (unlikely(q->cnt >= pending_size)) {
 			/* policy decision: drop remaining packets */
 			rte_pktmbuf_free(mbufs[i]);
-			s->retry_loss++;
+			if (likely(stats_on))
+				s->retry_loss++;
 			continue;
 		}
 
 		q->pkts[q->tail] = mbufs[i];
 		q->enqueue_tsc[q->tail]  = now;
 		q->retry_cnt[q->tail] = 1;
-		q->tail = (q->tail + 1) & (PENDING_MAX - 1);
+		q->tail = (q->tail + 1) & pending_mask;
 		q->cnt++;
 		q->cnt_pktsize += mbufs[i]->pkt_len;
 	}
 
 }
 
-/*
-static inline void
-pending_enqueue_burst_tracked(struct pending_q *q, pending_tc_stats_t *s,
-		                               struct rte_mbuf **pkts_in, uint16_t n)
-{
-	uint64_t now = rte_rdtsc();
-	uint16_t dropped = 0;
-
-	for (uint16_t i = 0; i < n; i++) {
-		if (q->cnt >= PENDING_MAX) {
-		       	rte_pktmbuf_free(pkts_in[i]);
-		       	dropped++; 
-			continue; 
-		}
-
-		uint16_t slot         = (q->tail + i) % PENDING_MAX;
-		q->pkts[slot]         = pkts_in[i];
-		q->enqueue_tsc[slot]  = now;
-		q->retry_cnt[slot]    = 1;
-		q->tail               = (q->tail + 1) % PENDING_MAX;
-		q->cnt++;
-	}
-
-	s->retry_loss += dropped;
-}
-*/
-
 /* Call after a successful pending_consume() to record latency + retries */
 static inline void
 pending_consume_tracked(struct pending_q *q, pending_tc_stats_t *s, uint16_t n)
 {
     for (uint16_t i = 0; i < n; i++) {
-	struct rte_mbuf *m = q->pkts[(q->head + i) & (PENDING_MAX - 1)];
+	uint32_t idx = (q->head + i) & pending_mask;
+	struct rte_mbuf *m = q->pkts[idx];
 
-	pstats_record_latency(s, q->enqueue_tsc[(q->head + i) & (PENDING_MAX - 1)]);
-	pstats_record_retry(s, q->retry_cnt[(q->head + i) & (PENDING_MAX - 1)]);
-	s->pkts_retry_total += q->retry_cnt[(q->head + i) & (PENDING_MAX - 1)];
+	if (likely(stats_on)) {
+		pstats_record_latency(s, q->enqueue_tsc[idx]);
+		pstats_record_retry(s, q->retry_cnt[idx]);
+		s->pkts_retry_total += q->retry_cnt[idx];
+	}
 
 	q->cnt_pktsize -= m->pkt_len;
     }
 
-    q->head = (q->head + n) & (PENDING_MAX - 1);
+    q->head = (q->head + n) & pending_mask;
     q->cnt -= n;
 }
 
 static inline void
 pending_enqueue(struct pending_q *q, struct rte_mbuf *m)
 {
-    if (unlikely(q->cnt == PENDING_MAX)) {
+    if (unlikely(q->cnt == pending_size)) {
 	/* policy decision: drop */
 	rte_pktmbuf_free(m);
 	return;
      }
 
      q->pkts[q->tail] = m;
-     q->tail = (q->tail + 1) & (PENDING_MAX - 1);
+     q->tail = (q->tail + 1) & pending_mask;
      q->cnt++;
      q->cnt_pktsize += m->pkt_len;
 }
@@ -155,10 +144,10 @@ pending_enqueue(struct pending_q *q, struct rte_mbuf *m)
 static inline uint16_t
 pending_peek(struct pending_q *q, struct rte_mbuf **out, uint16_t max)
 {
-    uint16_t n = RTE_MIN(q->cnt, max);
+    uint16_t n = RTE_MIN(q->cnt, (uint32_t)max);
 
 	for (uint16_t i = 0; i < n; i++) {
-		out[i] = q->pkts[(q->head + i) & (PENDING_MAX - 1)];
+		out[i] = q->pkts[(q->head + i) & pending_mask];
 	}
     return n;
 }
@@ -167,11 +156,11 @@ static inline void
 pending_consume(struct pending_q *q, uint16_t n)
 {
     for (uint16_t i = 0; i < n; i++) {
-	struct rte_mbuf *m = q->pkts[(q->head + i) & (PENDING_MAX - 1)];
+	struct rte_mbuf *m = q->pkts[(q->head + i) & pending_mask];
 	q->cnt_pktsize -= m->pkt_len;
     }
 
-    q->head = (q->head + n) & (PENDING_MAX - 1);
+    q->head = (q->head + n) & pending_mask;
     q->cnt -= n;
 }
 
@@ -471,7 +460,7 @@ app_mixed_thread_priobp(struct thread_conf **confs)
 					APP_STATS_ADD(conf->stat.nb_tx, sent);
 				}
 			}
-			uint16_t space = PENDING_MAX - pending[tc].cnt;
+			uint16_t space = pending_size - pending[tc].cnt;
 			tc_ov[tc] = RTE_MIN(space, burst_conf.qos_dequeue);
 		}
 
@@ -503,25 +492,33 @@ app_mixed_thread_priobp(struct thread_conf **confs)
  * Capacity controllers from the paper, one instance per TxQ (= traffic
  * class). Each loop iteration: compute the per-TC budget B_cap, let the
  * scheduler dequeue at most B_cap packets of that TC (tc_ov), transmit them,
- * and update the controller with B_sent. Packets the NIC rejects are dropped
- * (counted in nb_drop and in the per-TC "loss" column).
+ * and update the controller with B_sent. With retry (qbc, cbc, rej), packets
+ * the NIC rejects go to the TC's retry queue and are sent first in later
+ * iterations; without retry (none) they are dropped (nb_drop, tc.dropped).
+ * See app_mixed_thread_ctrl().
+ *
+ * capacity_rx_to_sched(): RX ring -> scheduler; returns the packets read.
  */
-static inline void
+static inline uint32_t
 capacity_rx_to_sched(struct thread_conf *conf, struct rte_mbuf **mbufs,
 		struct ctrl_inst_stats *ci)
 {
 	uint32_t nb_pkt_rec = rte_ring_sc_dequeue_burst(conf->rx_ring,
 			(void **)mbufs, burst_conf.ring_burst, NULL);
 
-	ci->loops++;
+	if (likely(stats_on))
+		ci->loops++;
 	if (likely(nb_pkt_rec)) {
 		uint32_t nb_sent = rte_sched_port_enqueue(conf->sched_port, mbufs,
 				nb_pkt_rec);
 		APP_STATS_ADD(conf->stat.nb_drop, nb_pkt_rec - nb_sent);
 		APP_STATS_ADD(conf->stat.nb_rx, nb_pkt_rec);
-		ci->sched_enq += nb_pkt_rec;
-		ci->sched_drop += nb_pkt_rec - nb_sent;
+		if (likely(stats_on)) {
+			ci->sched_enq += nb_pkt_rec;
+			ci->sched_drop += nb_pkt_rec - nb_sent;
+		}
 	}
+	return nb_pkt_rec;
 }
 
 /*
@@ -534,23 +531,25 @@ pending_retry_tx(struct thread_conf *conf, pending_tc_stats_t *s,
 		struct pending_q *pq, int tc, uint32_t max, uint16_t *n_tried)
 {
 	struct rte_mbuf *out[PENDING_MAX];
-	uint16_t n = pending_peek(pq, out, (uint16_t)RTE_MIN(max, (uint32_t)PENDING_MAX));
+	uint16_t n = pending_peek(pq, out, (uint16_t)RTE_MIN(max, pending_size));
 
 	*n_tried = n;
 	if (n == 0)
 		return 0;
 
-	uint64_t t0 = rte_rdtsc();
+	uint64_t t0 = stats_tsc();
 	uint16_t sent = rte_eth_tx_burst(conf->tx_port, TXQ(conf, tc), out, n);
-	s->cycles_retry += rte_rdtsc() - t0;
 
+	if (likely(stats_on))
+		s->cycles_retry += rte_rdtsc() - t0;
 	if (sent) {
 		pending_consume_tracked(pq, s, sent);
-		s->pkts_tx_total += sent;
+		if (likely(stats_on))
+			s->pkts_tx_total += sent;
 		APP_STATS_ADD(conf->stat.nb_tx, sent);
 	}
 	for (uint16_t i = 0; i < n - sent; i++) {
-		uint16_t idx = (pq->head + i) & (PENDING_MAX - 1);
+		uint32_t idx = (pq->head + i) & pending_mask;
 
 		if (pq->retry_cnt[idx] < UINT8_MAX)
 			pq->retry_cnt[idx]++;
@@ -568,17 +567,19 @@ static inline uint16_t
 fresh_tx(struct thread_conf *conf, pending_tc_stats_t *s, struct pending_q *pq,
 		int tc, struct rte_mbuf **pkts, uint32_t b_tx, bool retry)
 {
-	uint64_t t0 = rte_rdtsc();
+	uint64_t t0 = stats_tsc();
 	uint16_t sent = rte_eth_tx_burst(conf->tx_port, TXQ(conf, tc), pkts, b_tx);
-	s->cycles_tx += rte_rdtsc() - t0;
-	s->pkts_tx_total += sent;
 
+	if (likely(stats_on)) {
+		s->cycles_tx += rte_rdtsc() - t0;
+		s->pkts_tx_total += sent;
+	}
 	if (unlikely(sent < b_tx)) {
 		if (retry) {
 			pending_enqueue_burst_tracked(pq, s, &pkts[sent], b_tx - sent);
 		} else {
 			rte_pktmbuf_free_bulk(&pkts[sent], b_tx - sent);
-			s->retry_loss += b_tx - sent;
+			pstats_record_loss(s, b_tx - sent);
 			APP_STATS_ADD(conf->stat.nb_drop, b_tx - sent);
 		}
 	}
@@ -805,21 +806,30 @@ app_mixed_thread_priobp_stats(struct thread_conf **confs)
 
     while ((conf = confs[conf_idx])) {
 	uint32_t nb_pkt_rec = 0;
-
-	/* RX → Scheduler enqueue */
-	nb_pkt_rec = rte_ring_sc_dequeue_burst(conf->rx_ring, (void **)mbufs, burst_conf.ring_burst, NULL);
+	uint32_t moved = 0;	/* packets enqueued, retried or dequeued */
+	uint64_t t_loop = stats_tsc(), t_enq, t_ctrl, t_deq, t_tx;
 
 	struct ctrl_stats *cs = &container_of(conf, struct flow_conf,
 			wt_thread)->cs;
 
-	cs->inst.loops++;
+	ctrl_stats_tick(cs, conf->sched_port, t_loop);
+
+	/* RX → Scheduler enqueue */
+	nb_pkt_rec = rte_ring_sc_dequeue_burst(conf->rx_ring, (void **)mbufs, burst_conf.ring_burst, NULL);
+
+	if (likely(stats_on))
+		cs->inst.loops++;
 	if (likely(nb_pkt_rec)) {
 		uint32_t nb_sent = rte_sched_port_enqueue(conf->sched_port, mbufs, nb_pkt_rec);
 		APP_STATS_ADD(conf->stat.nb_drop, nb_pkt_rec - nb_sent);
 		APP_STATS_ADD(conf->stat.nb_rx,  nb_pkt_rec);
-		cs->inst.sched_enq += nb_pkt_rec;
-		cs->inst.sched_drop += nb_pkt_rec - nb_sent;
+		if (likely(stats_on)) {
+			cs->inst.sched_enq += nb_pkt_rec;
+			cs->inst.sched_drop += nb_pkt_rec - nb_sent;
+		}
+		moved += nb_pkt_rec;
 	}
+	t_enq = stats_tsc();
 
 	/* ── TX path: drain pending ──────────────────────────── */
 	for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
@@ -829,16 +839,18 @@ app_mixed_thread_priobp_stats(struct thread_conf **confs)
 		r_tried[tc] = n;
 		r_sent[tc] = 0;
 		if (n > 0) {
-			uint64_t t0 = rte_rdtsc();
+			uint64_t t0 = stats_tsc();
 			uint16_t sent = rte_eth_tx_burst(conf->tx_port, TXQ(conf, tc), mbufs, n);
-			uint64_t t1 = rte_rdtsc();
+			uint64_t t1 = stats_tsc();
 			r_sent[tc] = sent;
+			moved += n;
 			if (sent) {
 				pending_consume_tracked(&pending[tc], &stats[tc], sent);
-				//pending_consume(&pending[tc], sent);
 				APP_STATS_ADD(conf->stat.nb_tx, sent);
-				stats[tc].cycles_retry += (t1 - t0);
-				stats[tc].pkts_tx_total += sent;
+				if (likely(stats_on)) {
+					stats[tc].cycles_retry += (t1 - t0);
+					stats[tc].pkts_tx_total += sent;
+				}
 			}
 
 		}
@@ -847,32 +859,36 @@ app_mixed_thread_priobp_stats(struct thread_conf **confs)
 		pstats_record_occupancy(&stats[tc], pending[tc].cnt);
 
 		uint16_t used = pending[tc].cnt;
-		uint16_t headroom = (used < PENDING_MAX) ? (PENDING_MAX - used) : 0;
+		uint16_t headroom = (used < pending_size) ? (pending_size - used) : 0;
 		tc_ov[tc] = RTE_MIN(headroom, burst_conf.qos_dequeue);
 	}
+	t_ctrl = stats_tsc();
 
 
 	/* ── Scheduler dequeue + fresh TX ───────────────────── */
 	memcpy(tc_offer, tc_ov, sizeof(tc_offer));
 	rte_sched_port_dequeue_tc(conf->sched_port, pkts, burst_conf.qos_dequeue, tc_ov, tc_counts);
+	t_deq = stats_tsc();
 
 	for (int tc = 0; tc < RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE; tc++) {
 		uint32_t f_sent = 0, dropped = 0;
 
 		if (tc_counts[tc]) {
-			uint64_t t0   = rte_rdtsc();
+			uint64_t t0   = stats_tsc();
 			uint16_t sent = rte_eth_tx_burst(conf->tx_port, TXQ(conf, tc), pkts[tc], tc_counts[tc]);
-			uint64_t t1   = rte_rdtsc();
+			uint64_t t1   = stats_tsc();
 
-			stats[tc].cycles_tx     += (t1 - t0);
-			stats[tc].pkts_tx_total += sent;
+			if (likely(stats_on)) {
+				stats[tc].cycles_tx     += (t1 - t0);
+				stats[tc].pkts_tx_total += sent;
+			}
 			f_sent = sent;
+			moved += tc_counts[tc];
 
 			if (unlikely(sent < tc_counts[tc])) {
-				uint16_t pq_before = pending[tc].cnt;
+				uint32_t pq_before = pending[tc].cnt;
 
 				pending_enqueue_burst_tracked(&pending[tc], &stats[tc], &pkts[tc][sent], tc_counts[tc] - sent);
-				// pending_enqueue_burst(&pending[tc], &pkts[tc][sent], tc_counts[tc] - sent);
 				dropped = (tc_counts[tc] - sent) -
 					(uint32_t)(pending[tc].cnt - pq_before);
 			}
@@ -884,7 +900,20 @@ app_mixed_thread_priobp_stats(struct thread_conf **confs)
 				tc_offer[tc], tc_offer[tc], tc_counts[tc], r_tried[tc],
 				r_sent[tc], r_sent[tc] + f_sent, dropped,
 				pending[tc].cnt);
-		cs->inst.sched_deq += tc_counts[tc];
+		if (likely(stats_on))
+			cs->inst.sched_deq += tc_counts[tc];
+	}
+	t_tx = stats_tsc();
+
+	if (likely(stats_on)) {
+		cs->inst.cyc_enq += t_enq - t_loop;
+		cs->inst.cyc_ctrl += t_ctrl - t_enq;
+		cs->inst.cyc_deq += t_deq - t_ctrl;
+		cs->inst.cyc_tx += t_tx - t_deq;
+		if (moved)
+			cs->inst.cyc_busy += t_tx - t_loop;
+		else
+			cs->inst.cyc_idle += t_tx - t_loop;
 	}
 
 	conf_idx++;
@@ -1149,8 +1178,12 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 	while ((conf = confs[conf_idx])) {
 		struct ctrl_stats *cs = &container_of(conf, struct flow_conf,
 				wt_thread)->cs;
+		uint64_t t_loop = stats_tsc(), t_enq, t_ctrl, t_deq, t_tx;
+		uint32_t moved;	/* packets enqueued, retried or dequeued */
 
-		capacity_rx_to_sched(conf, mbufs, &cs->inst);
+		ctrl_stats_tick(cs, conf->sched_port, t_loop);
+		moved = capacity_rx_to_sched(conf, mbufs, &cs->inst);
+		t_enq = stats_tsc();
 
 		for (int q = 0; q < N_TX_QUEUES; q++) {
 			q_first[q] = -1;
@@ -1177,14 +1210,16 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 					struct cbc_state *c = &cbc[q];
 
 					if (c->q != c->c && now - c->last_poll_tsc >= poll_tsc) {
-						uint64_t t_fb = rte_rdtsc();
+						uint64_t t_fb = stats_tsc();
 						int freed = rte_eth_tx_done_cleanup(conf->tx_port,
 								conf->txq_base + q, 0);
 
-						cs->tc[tc].fb_cyc += rte_rdtsc() - t_fb;
-						cs->tc[tc].polls++;
-						if (freed > 0)
-							cs->tc[tc].freed += (uint64_t)freed;
+						if (likely(stats_on)) {
+							cs->tc[tc].fb_cyc += rte_rdtsc() - t_fb;
+							cs->tc[tc].polls++;
+							if (freed > 0)
+								cs->tc[tc].freed += (uint64_t)freed;
+						}
 
 						if (freed > 0) {
 							c->c = RTE_MIN(c->c + (uint64_t)freed, c->q);
@@ -1212,7 +1247,7 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 				q_cap[q] = cap;
 				q_left[q] = cap;
 			}
-			if (kind == CTRL_CBC)
+			if (kind == CTRL_CBC && likely(stats_on))
 				cs->tc[tc].q_minus_c = (int64_t)(cbc[q].q - cbc[q].c);
 
 			/* the TC may use what its queue has left */
@@ -1228,6 +1263,7 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 						tc, cap, &r_tried[tc]);
 			if (shared)
 				q_left[q] -= r_tried[tc];
+			moved += r_tried[tc];
 
 			/* 3) fresh budget */
 			if (r_sent[tc] < r_tried[tc]) {
@@ -1237,15 +1273,17 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 
 				if (retry)
 					left = RTE_MIN(left,
-						(uint32_t)(PENDING_MAX - pending[tc].cnt));
+						(uint32_t)(pending_size - pending[tc].cnt));
 				tc_ov[tc] = RTE_MIN(left, b_req);
 			}
 		}
 
+		t_ctrl = stats_tsc();
 		memset(tc_counts, 0, sizeof(tc_counts));
 		memcpy(tc_offer, tc_ov, sizeof(tc_offer));
 		rte_sched_port_dequeue_tc(conf->sched_port, pkts, b_req, tc_ov,
 				tc_counts);
+		t_deq = stats_tsc();
 
 		for (int tc = 0; tc < N_SCHED_TC; tc++) {
 			const int q = TCQ(tc);	/* queue inside the instance */
@@ -1286,7 +1324,9 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 			ctrl_stats_decision(&cs->tc[tc], b_req, tc_cap[tc], tc_offer[tc],
 					tc_counts[tc], r_tried[tc], r_sent[tc], sent,
 					dropped, pending[tc].cnt);
-			cs->inst.sched_deq += tc_counts[tc];
+			moved += tc_counts[tc];
+			if (likely(stats_on))
+				cs->inst.sched_deq += tc_counts[tc];
 
 			if (retry)
 				pstats_record_occupancy(&stats[tc], pending[tc].cnt);
@@ -1305,6 +1345,8 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 				uint32_t h_old = qbc[q].h;
 
 				qbc_update(&qbc[q], q_btx[q], q_sent[q], q_cap[q]);
+				if (unlikely(!stats_on))
+					break;
 				ts->h_lowered += h_was && qbc[q].h < h_old;
 				ts->u = qbc[q].have_u ? (int64_t)qbc[q].u : CS_UNSET;
 				ts->u0 = qbc[q].have_u0 ? (int64_t)qbc[q].u0 : CS_UNSET;
@@ -1316,13 +1358,27 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 				cbc[q].q += q_sent[q];
 				break;
 			case CTRL_REJ:
-				ts->cuts += q_btx[q] > 0 && q_sent[q] < q_btx[q];
+				if (likely(stats_on))
+					ts->cuts += q_btx[q] > 0 && q_sent[q] < q_btx[q];
 				rej_update(&rej[q], q_btx[q], q_sent[q], b_req);
-				ts->w = rej[q].window;
+				if (likely(stats_on))
+					ts->w = rej[q].window;
 				break;
 			default:
 				break;
 			}
+		}
+		t_tx = stats_tsc();
+
+		if (likely(stats_on)) {
+			cs->inst.cyc_enq += t_enq - t_loop;
+			cs->inst.cyc_ctrl += t_ctrl - t_enq;
+			cs->inst.cyc_deq += t_deq - t_ctrl;
+			cs->inst.cyc_tx += t_tx - t_deq;
+			if (moved)
+				cs->inst.cyc_busy += t_tx - t_loop;
+			else
+				cs->inst.cyc_idle += t_tx - t_loop;
 		}
 
 		conf_idx++;
