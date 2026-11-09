@@ -30,6 +30,7 @@ uint32_t pending_mask = PENDING_DEFAULT - 1;
 bool stats_on = true;
 uint32_t stats_win_ms = 100;
 uint32_t watch_us = 1000;
+uint32_t backlog_us = 100;
 static uint32_t app_numa_mask;
 static uint64_t app_used_port_mask = 0;
 static uint64_t app_used_rx_port_mask = 0;
@@ -101,6 +102,8 @@ static const char usage[] =
 	"           0) of instance F (pfc index from 0), up to 8 pipes; repeat the    \n"
 	"           option for each instance                                          \n"
 	"    --watch-us US : read period of the watched pipes (default 1000)          \n"
+	"    --backlog-us US : read period of the per-TC scheduler backlog (sched_enq,\n"
+	"           sched_drop, backlog; subport 0) (default 100)                     \n"
 	"    --txq-map hplp|pertc : scheduler TC -> NIC TX queue outside PF mode.     \n"
 	"           hplp: TC0 on queue 0, all other TCs share queue 1. pertc: TC i   \n"
 	"           on queue i. Default: hplp on iavf, pertc otherwise (cnxk)       \n"
@@ -332,6 +335,8 @@ enum {
 	OPT_WATCH_PIPES_NUM,
 #define OPT_WATCH_US "watch-us"
 	OPT_WATCH_US_NUM,
+#define OPT_BACKLOG_US "backlog-us"
+	OPT_BACKLOG_US_NUM,
 };
 
 /*
@@ -404,6 +409,7 @@ app_parse_args(int argc, char **argv)
 		{OPT_STATS_WIN, 1, NULL, OPT_STATS_WIN_NUM},
 		{OPT_WATCH_PIPES, 1, NULL, OPT_WATCH_PIPES_NUM},
 		{OPT_WATCH_US, 1, NULL, OPT_WATCH_US_NUM},
+		{OPT_BACKLOG_US, 1, NULL, OPT_BACKLOG_US_NUM},
 		{NULL,    0, 0,    0          }
 	};
 
@@ -615,6 +621,14 @@ app_parse_args(int argc, char **argv)
 					return -1;
 				}
 				watch_us = (uint32_t)atoi(optarg);
+				break;
+
+			case OPT_BACKLOG_US_NUM:
+				if (atoi(optarg) <= 0) {
+					RTE_LOG(ERR, APP, "Invalid --backlog-us %s\n", optarg);
+					return -1;
+				}
+				backlog_us = (uint32_t)atoi(optarg);
 				break;
 
 			default:

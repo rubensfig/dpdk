@@ -1005,8 +1005,14 @@ int app_init(void)
 					subport_params[0].n_pipes_per_subport_enabled);
 
 	RTE_LOG(INFO, APP, "retry queue %u packets per TC; statistics %s "
-		"(peak window %u ms, watch period %u us)\n", pending_size,
-		stats_on ? "on" : "off (--no-stats)", stats_win_ms, watch_us);
+		"(peak window %u ms, watch period %u us, backlog period %u us)\n",
+		pending_size, stats_on ? "on" : "off (--no-stats)", stats_win_ms,
+		watch_us, backlog_us);
+	if (port_params.n_subports_per_port > 1)
+		RTE_LOG(WARNING, APP, "%u subports: the per-TC backlog "
+			"(ctrl_stats sched_enq/backlog) counts subport 0 only, "
+			"but deq counts all subports\n",
+			port_params.n_subports_per_port);
 
 	/* Initialize each active flow */
 	for(i = 0; i < nb_pfc; i++) {

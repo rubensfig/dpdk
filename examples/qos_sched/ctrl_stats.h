@@ -46,7 +46,24 @@
  *    watch           scheduler queues of the watched pipes (--watch-pipes)
  *    All of it stays 0 / -1 with --no-stats.
  */
-#define CTRL_STATS_VERSION 3
+/*
+ *  4: per-TC scheduler backlog, read by the worker every --backlog-us from
+ *    the subport statistics (subport 0) with rte_sched_subport_read_stats():
+ *    tc.sched_enq        counter, packets written into the TC's queues
+ *    tc.sched_drop       counter, packets the scheduler dropped at enqueue
+ *                        (tail drop and CMAN drops)
+ *    tc.backlog          gauge, sched_enq - deq: packets held in the TC's
+ *                        scheduler queues at the last read
+ *    tc.backlog_area     counter, sum of backlog x TSC ticks (backlog held
+ *                        between reads): (d backlog_area) / (d tsc) is the
+ *                        time-averaged backlog of a record interval
+ *    tc.backlog_max_win  gauge, peak sampled backlog of the last completed
+ *                        window (--stats-win-ms); -1 before the first window
+ *    The read clears the subport counters: do not use the interactive
+ *    "show subport stats" command during a run. All of it stays 0 / -1 with
+ *    --no-stats.
+ */
+#define CTRL_STATS_VERSION 4
 #define CS_UNSET (-1)
 
 struct ctrl_tc_stats {
@@ -80,8 +97,15 @@ struct ctrl_tc_stats {
 	/* ---- occupancy over time (version 3) ---- */
 	uint64_t pq_area;	/* counter: sum of pq x TSC ticks */
 	int64_t pq_max_win;	/* gauge: peak pq of the last completed window */
+	/* ---- scheduler backlog (version 4) ---- */
+	uint64_t sched_enq;	/* counter: packets written into the TC's queues */
+	uint64_t sched_drop;	/* counter: packets dropped at enqueue */
+	uint64_t backlog_area;	/* counter: sum of backlog x TSC ticks */
+	int64_t backlog;	/* gauge: sched_enq - deq at the last read */
+	int64_t backlog_max_win; /* gauge: peak backlog of the last completed window */
 	/* writer-private (not exported) */
 	uint32_t pq_max_cur;	/* peak pq of the current window */
+	int64_t backlog_max_cur; /* peak backlog of the current window */
 };
 
 /*
@@ -145,13 +169,15 @@ struct ctrl_stats {
 	uint64_t last_tsc;	/* previous tick */
 	uint64_t win_end;	/* end of the current peak window */
 	uint64_t watch_last;	/* previous watched-pipe read */
+	uint64_t backlog_last;	/* previous backlog read */
 	/* written by the RX lcore: keep it on its own cache line */
 	alignas(RTE_CACHE_LINE_SIZE) uint64_t rx_ring_drop;
 };
 
-/* --stats-win-ms, --watch-us (args.c) */
+/* --stats-win-ms, --watch-us, --backlog-us (args.c) */
 extern uint32_t stats_win_ms;
 extern uint32_t watch_us;
+extern uint32_t backlog_us;
 
 static inline void
 ctrl_stats_init_gauges(struct ctrl_stats *cs)
@@ -168,6 +194,9 @@ ctrl_stats_init_gauges(struct ctrl_stats *cs)
 		t->w = CS_UNSET;
 		t->pq_max_win = CS_UNSET;
 		t->pq_max_cur = 0;
+		t->backlog = 0;
+		t->backlog_max_win = CS_UNSET;
+		t->backlog_max_cur = 0;
 	}
 	for (uint32_t i = 0; i < CS_WATCH_MAX; i++)
 		for (int q = 0; q < CS_WATCH_TCS; q++) {
@@ -178,6 +207,39 @@ ctrl_stats_init_gauges(struct ctrl_stats *cs)
 	cs->last_tsc = 0;
 	cs->win_end = 0;
 	cs->watch_last = 0;
+	cs->backlog_last = 0;
+}
+
+/*
+ * Per-TC scheduler backlog (version 4). Reads, and thereby clears, the
+ * statistics of subport 0, which count the packets written into and dropped
+ * at the TC's queues since the previous read. tc.deq counts the packets
+ * dequeued per TC up to now on this lcore, so sched_enq - deq is the exact
+ * backlog at the read. Called from ctrl_stats_tick() only.
+ */
+static inline void
+ctrl_stats_backlog(struct ctrl_stats *cs, struct rte_sched_port *port,
+		uint64_t now, uint64_t dt)
+{
+	struct rte_sched_subport_stats st;
+	uint32_t tc_ov;
+
+	if (rte_sched_subport_read_stats(port, 0, &st, &tc_ov) != 0)
+		return;
+	for (int tc = 0; tc < CS_N_TC; tc++) {
+		struct ctrl_tc_stats *t = &cs->tc[tc];
+		int64_t b;
+
+		if (t->backlog > 0)	/* held value since the previous read */
+			t->backlog_area += (uint64_t)t->backlog * dt;
+		t->sched_enq += st.n_pkts_tc[tc];
+		t->sched_drop += st.n_pkts_tc_dropped[tc];
+		b = (int64_t)(t->sched_enq - t->deq);
+		t->backlog = b;
+		if (b > t->backlog_max_cur)
+			t->backlog_max_cur = b;
+	}
+	cs->backlog_last = now;
 }
 
 /*
@@ -198,6 +260,15 @@ ctrl_stats_tick(struct ctrl_stats *cs, struct rte_sched_port *port, uint64_t now
 		cs->last_tsc = now;
 		cs->win_end = now + hz / 1000 * stats_win_ms;
 		cs->watch_last = now;
+		cs->backlog_last = now;
+		/* clear the subport counters: nothing is enqueued before the
+		 * first iteration of this lcore, so the backlog starts at 0 */
+		{
+			struct rte_sched_subport_stats st;
+			uint32_t tc_ov;
+
+			rte_sched_subport_read_stats(port, 0, &st, &tc_ov);
+		}
 		return;
 	}
 
@@ -212,6 +283,11 @@ ctrl_stats_tick(struct ctrl_stats *cs, struct rte_sched_port *port, uint64_t now
 	}
 
 	bool close_win = now >= cs->win_end;
+	uint64_t bdt = now - cs->backlog_last;
+
+	/* the window close always reads, so the peak covers the whole window */
+	if (bdt >= hz / 1000000 * backlog_us || close_win)
+		ctrl_stats_backlog(cs, port, now, bdt);
 
 	if (close_win) {
 		for (int tc = 0; tc < CS_N_TC; tc++) {
@@ -219,6 +295,8 @@ ctrl_stats_tick(struct ctrl_stats *cs, struct rte_sched_port *port, uint64_t now
 
 			t->pq_max_win = t->pq_max_cur;
 			t->pq_max_cur = (uint32_t)t->pq;
+			t->backlog_max_win = t->backlog_max_cur;
+			t->backlog_max_cur = t->backlog > 0 ? t->backlog : 0;
 		}
 		cs->win_end += hz / 1000 * stats_win_ms;
 		if (cs->win_end <= now)		/* fell behind: restart the window */

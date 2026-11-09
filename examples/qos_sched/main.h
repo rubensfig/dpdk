@@ -67,17 +67,20 @@ enum mixed_mode {
 #endif
 #endif
 
-/* CBC completion poll period T_poll in us (--cbc-poll overrides) */
+/* CBC completion poll period T_poll in us (--cbc-poll overrides).
+ * 200 us: evaluation setting (plan v5, Table 1 c); was 10 us. */
 #ifndef CBC_POLL_US
-#define CBC_POLL_US 10u
+#define CBC_POLL_US 200u
 #endif
 
-/* REJ: additive step A, grow streak K, minimum window (CLI overrides A, K) */
+/* REJ: additive step A, grow streak K, minimum window (CLI overrides A, K).
+ * A = 64, K = 4: evaluation setting (plan v5, Table 1 c), calibrated on the
+ * E810; was A = 8, K = 32, which collapses part of the instances. */
 #ifndef REJ_ADD_STEP
-#define REJ_ADD_STEP 8u
+#define REJ_ADD_STEP 64u
 #endif
 #ifndef REJ_GROW_STREAK
-#define REJ_GROW_STREAK 32u
+#define REJ_GROW_STREAK 4u
 #endif
 #ifndef REJ_MIN
 #define REJ_MIN 1u
