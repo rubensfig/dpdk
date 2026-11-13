@@ -63,7 +63,15 @@
  *    "show subport stats" command during a run. All of it stays 0 / -1 with
  *    --no-stats.
  */
-#define CTRL_STATS_VERSION 4
+/*
+ *  5: tc.overtakes  counter, fresh packets the NIC accepted in a decision
+ *                   that left older packets of the same TC in the retry
+ *                   queue after the retry step. Each such packet left ahead
+ *                   of an older packet of its TC, so this is an upper bound
+ *                   on per-flow reordering at the DUT. 0 by construction for
+ *                   pab_op; also counted for none/qbc/cbc/rej.
+ */
+#define CTRL_STATS_VERSION 5
 #define CS_UNSET (-1)
 
 struct ctrl_tc_stats {
@@ -86,6 +94,9 @@ struct ctrl_tc_stats {
 	uint64_t fb_cyc;	/* CBC: TSC cycles spent in the polls */
 	uint64_t h_lowered;	/* QBC: decreases of H */
 	uint64_t cuts;		/* REJ: window cuts after a partial transmit */
+	uint64_t overtakes;	/* fresh packets accepted by the NIC while older
+				 * packets of the same TC were still in the retry
+				 * queue (possible reordering, see v5) */
 	/* ---- gauges ---- */
 	int64_t pq;		/* retry queue occupancy */
 	int64_t q_minus_c;	/* CBC: Q - C, outstanding packets */

@@ -44,6 +44,8 @@ enum mixed_mode {
 	MIXED_MODE_PERTCDEQUEUE,
 	MIXED_MODE_PRIOPROP,
 	MIXED_MODE_REJ,			/* REJ, outcome-based window (appendix) */
+	MIXED_MODE_PAB_OP,		/* PAB, order-preserving: no new dequeue
+					 * while the TC's retry queue is non-empty */
 	MIXED_MODE_MAX
 };
 

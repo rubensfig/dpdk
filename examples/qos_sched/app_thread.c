@@ -766,9 +766,21 @@ struct cbc_state {
 
 /* end CBC */
 
-/* ---- mode: priobp_stats ---- */
+/* ---- mode: priobp_stats (PAB) and pab_op ---- */
+/*
+ * PAB: retry first, then dequeue new packets up to the free retry-queue
+ * space, also after a rejected retry. The NIC may then accept new packets
+ * in the fresh tx_burst (the PMD can free descriptors inside that call)
+ * while older packets of the same TC remain in the retry queue, so packets
+ * of a flow can leave out of order. tc.overtakes counts these packets.
+ *
+ * pab_op (ordered = true): identical, except that a TC dequeues nothing
+ * new while its retry queue is non-empty after the retry step. Packets of
+ * a TC then leave in dequeue order, at the cost of head-of-line blocking
+ * behind rejected packets.
+ */
 static void
-app_mixed_thread_priobp_stats(struct thread_conf **confs)
+app_mixed_thread_pab(struct thread_conf **confs, bool ordered)
 {
     struct rte_mbuf *mbufs[burst_conf.ring_burst];
     struct thread_conf *conf;
@@ -795,6 +807,12 @@ app_mixed_thread_priobp_stats(struct thread_conf **confs)
     /* per-TC retry burst of this iteration, for ctrl_stats */
     uint16_t r_tried[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
     uint16_t r_sent[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
+    /* retry-queue occupancy left after the retry step (overtakes) */
+    uint32_t pq_left[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
+
+    printf("PAB: %s\n", ordered ?
+	   "order-preserving (no new dequeue while the retry queue is non-empty)" :
+	   "new dequeue also after a rejected retry");
 
     struct rte_mbuf *tc_mbufs[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE][burst_conf.qos_dequeue];
     struct rte_mbuf **pkts[RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE];
@@ -860,9 +878,14 @@ app_mixed_thread_priobp_stats(struct thread_conf **confs)
 		/* STATS: occupancy snapshot */
 		pstats_record_occupancy(&stats[tc], pending[tc].cnt);
 
-		uint16_t used = pending[tc].cnt;
-		uint16_t headroom = (used < pending_size) ? (pending_size - used) : 0;
-		tc_ov[tc] = RTE_MIN(headroom, burst_conf.qos_dequeue);
+		uint32_t used = pending[tc].cnt;
+		uint32_t headroom = (used < pending_size) ? (pending_size - used) : 0;
+
+		pq_left[tc] = used;
+		if (ordered && used > 0)
+			tc_ov[tc] = 0;	/* older packets still wait: keep order */
+		else
+			tc_ov[tc] = RTE_MIN(headroom, burst_conf.qos_dequeue);
 	}
 	t_ctrl = stats_tsc();
 
@@ -886,6 +909,8 @@ app_mixed_thread_priobp_stats(struct thread_conf **confs)
 			}
 			f_sent = sent;
 			moved += tc_counts[tc];
+			if (likely(stats_on) && sent && pq_left[tc] > 0)
+				cs->tc[tc].overtakes += sent;
 
 			if (unlikely(sent < tc_counts[tc])) {
 				uint32_t pq_before = pending[tc].cnt;
@@ -922,6 +947,18 @@ app_mixed_thread_priobp_stats(struct thread_conf **confs)
 	if (confs[conf_idx] == NULL)
 	conf_idx = 0;
      }
+}
+
+static void
+app_mixed_thread_priobp_stats(struct thread_conf **confs)
+{
+	app_mixed_thread_pab(confs, false);
+}
+
+static void
+app_mixed_thread_pab_op(struct thread_conf **confs)
+{
+	app_mixed_thread_pab(confs, true);
 }
 
 /* ---- mode: aggbp ---- */
@@ -1155,6 +1192,7 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 	uint16_t r_tried[N_SCHED_TC];
 	uint16_t r_sent[N_SCHED_TC];
 	uint32_t tc_cap[N_SCHED_TC];
+	uint32_t pq_left[N_SCHED_TC];	/* retry queue after the retry step */
 
 	memset(qbc, 0, sizeof(qbc));
 	memset(cbc, 0, sizeof(cbc));
@@ -1269,6 +1307,7 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 			if (shared)
 				q_left[q] -= r_tried[tc];
 			moved += r_tried[tc];
+			pq_left[tc] = pending[tc].cnt;
 
 			/* 3) fresh budget */
 			if (r_sent[tc] < r_tried[tc]) {
@@ -1313,6 +1352,8 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 
 				f_rej = n - f_sent;
 				sent += f_sent;
+				if (likely(stats_on) && f_sent && pq_left[tc] > 0)
+					cs->tc[tc].overtakes += f_sent;
 			}
 			if (hold)	/* shared queue only, so retry is on */
 				pending_enqueue_burst_tracked(&pending[tc], &stats[tc],
@@ -1436,6 +1477,7 @@ static const struct {
 	[MIXED_MODE_PERTCDEQUEUE] = { "pertcdequeue", app_mixed_thread_pertcdequeue, false },
 	[MIXED_MODE_PRIOPROP]     = { "prioprop",     app_mixed_thread_prioprop,     false },
 	[MIXED_MODE_REJ]          = { "rej",          app_mixed_thread_rej,          true  },
+	[MIXED_MODE_PAB_OP]       = { "pab_op",       app_mixed_thread_pab_op,       true  },
 };
 
 int
@@ -1458,7 +1500,7 @@ mixed_mode_name(void)
 const char *
 mixed_mode_list(void)
 {
-	return "none|qbc|cbc|rej|priobp|priobp_stats|aggbp|pertcdequeue|prioprop";
+	return "none|qbc|cbc|rej|priobp|priobp_stats|pab_op|aggbp|pertcdequeue|prioprop";
 }
 
 bool

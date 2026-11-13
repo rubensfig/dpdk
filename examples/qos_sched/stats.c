@@ -479,7 +479,7 @@ static const struct {
 	CS_C(active), CS_C(req), CS_C(cap), CS_C(ov), CS_C(deq), CS_C(tx),
 	CS_C(sent), CS_C(retried), CS_C(retry_sent), CS_C(dropped),
 	CS_C(stalls), CS_C(bound), CS_C(polls), CS_C(freed), CS_C(fb_cyc),
-	CS_C(h_lowered), CS_C(cuts), CS_C(pq_area),
+	CS_C(h_lowered), CS_C(cuts), CS_C(overtakes), CS_C(pq_area),
 	CS_C(sched_enq), CS_C(sched_drop), CS_C(backlog_area),
 #undef CS_C
 }, cs_gauges[] = {
