@@ -88,6 +88,7 @@ enum mixed_mode {
 
 extern enum mixed_mode mixed_mode;
 extern uint32_t cbc_poll_us;
+extern uint32_t cbc_limit;	/* CBC limit L in packets, 0: N_desc */
 extern uint32_t rej_add_step;
 extern uint32_t rej_grow_streak;
 

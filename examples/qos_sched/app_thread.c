@@ -749,7 +749,9 @@ qbc_update(struct qbc_state *q, uint32_t b_tx, uint32_t b_sent,
  * CBC: Completion-Based Capacity (paper Algorithm 1).
  *
  *   every T_poll: C += rte_eth_tx_done_cleanup()
- *   B_cap = max(0, N_desc - (Q - C)),  Q += B_sent
+ *   B_cap = max(0, L - (Q - C)),  Q += B_sent
+ *
+ * L = min(--cbc-limit, N_desc); without --cbc-limit, L = N_desc.
  *
  * N_desc is the configured TxQ depth (ring_conf.tx_size). T_poll is
  * cbc_poll_us (--cbc-poll, default CBC_POLL_US). A TxQ with nothing outstanding is not polled.
@@ -1141,6 +1143,8 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 
 	const uint64_t poll_tsc = (rte_get_tsc_hz() * cbc_poll_us) / 1000000ULL;
 	const uint64_t n_desc = ring_conf.tx_size;
+	/* CBC limit L on outstanding packets per TxQ: L = min(--cbc-limit, N_desc) */
+	const uint64_t cbc_l = (cbc_limit != 0 && cbc_limit < n_desc) ? cbc_limit : n_desc;
 
 	struct rte_mbuf *tc_mbufs[N_SCHED_TC][burst_conf.qos_dequeue];
 	struct rte_mbuf **pkts[N_SCHED_TC];
@@ -1169,7 +1173,8 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 				wt_thread)->cs);
 
 	if (kind == CTRL_CBC)
-		printf("CBC: N_desc=%" PRIu64 " T_poll=%u us\n", n_desc, cbc_poll_us);
+		printf("CBC: N_desc=%" PRIu64 " L=%" PRIu64 " T_poll=%u us\n", n_desc, cbc_l,
+		       cbc_poll_us);
 	if (kind == CTRL_REJ)
 		printf("REJ: A=%u K=%u W_min=%u\n", rej_add_step, rej_grow_streak,
 				(uint32_t)REJ_MIN);
@@ -1232,7 +1237,7 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 						c->last_poll_tsc = now;
 					}
 					uint64_t u = c->q - c->c;
-					uint64_t b_cap = u < n_desc ? n_desc - u : 0;
+					uint64_t b_cap = u < cbc_l ? cbc_l - u : 0;
 
 					cap = (uint32_t)RTE_MIN(b_cap, (uint64_t)b_req);
 					break;
@@ -1415,6 +1420,7 @@ app_mixed_thread_rej(struct thread_conf **confs)
 /* ---- mode selection (--mode) ---- */
 enum mixed_mode mixed_mode = MIXED_MODE_DEFAULT;
 uint32_t cbc_poll_us = CBC_POLL_US;
+uint32_t cbc_limit;	/* --cbc-limit, 0: use N_desc */
 
 static const struct {
 	const char *name;

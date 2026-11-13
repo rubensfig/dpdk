@@ -78,6 +78,7 @@ static const char usage[] =
 	"    --mode NAME : mixed-thread backpressure mode (default qbc, or set at build) \n"
 	"           none|qbc|cbc|rej|priobp|priobp_stats|aggbp|pertcdequeue|prioprop    \n"
 	"    --cbc-poll US : CBC completion poll period T_poll in us (default %u)       \n"
+	"    --cbc-limit L : CBC limit on outstanding packets per TxQ (default N_desc)  \n"
 	"    --rej-add-step A : REJ additive window step (default %u)                   \n"
 	"    --rej-grow-streak K : REJ full transmits before growing W (default %u)     \n"
 	"    --pf-tree class|instance|default : PF mode, all pfc share the PF port(s);   \n"
@@ -307,6 +308,8 @@ enum {
 	OPT_MODE_NUM,
 #define OPT_CBC_POLL "cbc-poll"
 	OPT_CBC_POLL_NUM,
+#define OPT_CBC_LIMIT "cbc-limit"
+	OPT_CBC_LIMIT_NUM,
 #define OPT_REJ_ADD "rej-add-step"
 	OPT_REJ_ADD_NUM,
 #define OPT_REJ_GROW "rej-grow-streak"
@@ -395,6 +398,7 @@ app_parse_args(int argc, char **argv)
 		{OPT_CFG, 1, NULL, OPT_CFG_NUM},
 		{OPT_MODE, 1, NULL, OPT_MODE_NUM},
 		{OPT_CBC_POLL, 1, NULL, OPT_CBC_POLL_NUM},
+		{OPT_CBC_LIMIT, 1, NULL, OPT_CBC_LIMIT_NUM},
 		{OPT_REJ_ADD, 1, NULL, OPT_REJ_ADD_NUM},
 		{OPT_REJ_GROW, 1, NULL, OPT_REJ_GROW_NUM},
 		{OPT_PF_TREE, 1, NULL, OPT_PF_TREE_NUM},
@@ -510,6 +514,14 @@ app_parse_args(int argc, char **argv)
 					return -1;
 				}
 				cbc_poll_us = (uint32_t)atoi(optarg);
+				break;
+
+			case OPT_CBC_LIMIT_NUM:
+				if (atoi(optarg) <= 0) {
+					RTE_LOG(ERR, APP, "Invalid --cbc-limit %s\n", optarg);
+					return -1;
+				}
+				cbc_limit = (uint32_t)atoi(optarg);
 				break;
 
 			case OPT_REJ_ADD_NUM:
