@@ -46,6 +46,7 @@ enum mixed_mode {
 	MIXED_MODE_REJ,			/* REJ, outcome-based window (appendix) */
 	MIXED_MODE_PAB_OP,		/* PAB, order-preserving: no new dequeue
 					 * while the TC's retry queue is non-empty */
+	MIXED_MODE_CBC_BQL,		/* CBC with an adaptive limit L (BQL/DQL) */
 	MIXED_MODE_MAX
 };
 
@@ -78,6 +79,12 @@ enum mixed_mode {
 /* REJ: additive step A, grow streak K, minimum window (CLI overrides A, K).
  * A = 64, K = 4: evaluation setting (plan v5, Table 1 c), calibrated on the
  * E810; was A = 8, K = 32, which collapses part of the instances. */
+/* CBC/BQL: hold time in us over which the smallest slack is collected before
+ * L shrinks by it (DQL's slack_hold_time; Linux uses HZ, here 1 ms) */
+#ifndef CBC_BQL_HOLD_US
+#define CBC_BQL_HOLD_US 1000u
+#endif
+
 #ifndef REJ_ADD_STEP
 #define REJ_ADD_STEP 64u
 #endif
@@ -91,6 +98,8 @@ enum mixed_mode {
 extern enum mixed_mode mixed_mode;
 extern uint32_t cbc_poll_us;
 extern uint32_t cbc_limit;	/* CBC limit L in packets, 0: N_desc */
+extern uint32_t cbc_bql_hold_us;	/* CBC/BQL: slack hold time before shrinking L */
+extern uint32_t cbc_bql_min;	/* CBC/BQL: lower bound of L, 0: 2 x tx_rs_thresh */
 extern uint32_t rej_add_step;
 extern uint32_t rej_grow_streak;
 

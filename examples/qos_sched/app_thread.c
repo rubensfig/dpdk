@@ -762,7 +762,74 @@ struct cbc_state {
 	uint64_t q;		/* Q: packets accepted by the NIC */
 	uint64_t c;		/* C: completed packets */
 	uint64_t last_poll_tsc;
+	/* CBC/BQL only */
+	uint32_t limit;		/* adaptive limit L on Q - C */
+	bool hungry;		/* the last iteration with a budget used all of it */
+	bool limited;		/* hungry at some point since the last poll */
+	uint64_t q_prev;	/* Q at the previous poll */
+	uint64_t slack_start;	/* TSC: start of the current slack hold window */
+	uint32_t lowest_slack;	/* smallest slack in the window, UINT32_MAX: none */
 };
+
+/*
+ * CBC/BQL (--mode cbc_bql): CBC with the limit L adapted per TxQ in the style
+ * of Linux BQL / DQL (lib/dynamic_queue_limits.c), in packets. At every poll:
+ *
+ *   starved while limited: packets were held back by L since the last poll
+ *     (the budget was the binding constraint) and the poll finds less than one
+ *     completion batch (eps = tx_rs_thresh) outstanding: L was too small for
+ *     the current drain rate. L grows by the packets queued and completed
+ *     within this poll interval, at least eps.
+ *   otherwise, with completions: slack = L - 2 x completions of this poll is
+ *     what the queue held beyond two poll intervals of work. The smallest
+ *     slack over the hold time (--cbc-bql-hold) is taken off L.
+ *
+ * L settles near two poll intervals of the current drain rate, within
+ * [L_min, L_max]. DQL grows when a queue overshoots its limit; CBC never
+ * admits beyond L, so "limited" is read from the budget instead.
+ *
+ * L_max = min(--cbc-limit, N_desc - tx_free_thresh - tx_rs_thresh): the ring
+ * then never runs short of free descriptors, the driver never reclaims inside
+ * tx_burst, and every completion is counted by rte_eth_tx_done_cleanup(), so
+ * Q - C stays exact. L starts at L_max, i.e. as CBC with that limit.
+ * L_min = --cbc-bql-min, default 2 x tx_rs_thresh.
+ */
+static inline void
+cbc_bql_poll(struct cbc_state *c, uint64_t now, uint32_t freed, uint32_t eps,
+		uint32_t l_min, uint32_t l_max, uint64_t hold_tsc,
+		struct ctrl_tc_stats *ts)
+{
+	uint64_t limit = c->limit;
+	const uint64_t out = c->q - c->c;
+
+	if (c->limited && out < eps) {
+		uint64_t inside = c->c > c->q_prev ? c->c - c->q_prev : 0;
+
+		limit += RTE_MAX(inside, (uint64_t)eps);
+		c->slack_start = now;
+		c->lowest_slack = UINT32_MAX;
+		if (likely(stats_on))
+			ts->l_grown++;
+	} else if (freed > 0) {
+		uint64_t two = 2 * (uint64_t)freed;
+		uint32_t slack = limit > two ? (uint32_t)(limit - two) : 0;
+
+		if (slack < c->lowest_slack)
+			c->lowest_slack = slack;
+		if (now - c->slack_start >= hold_tsc) {
+			if (c->lowest_slack != UINT32_MAX && c->lowest_slack > 0) {
+				limit -= c->lowest_slack;
+				if (likely(stats_on))
+					ts->l_shrunk++;
+			}
+			c->slack_start = now;
+			c->lowest_slack = UINT32_MAX;
+		}
+	}
+	c->limit = (uint32_t)RTE_MIN(RTE_MAX(limit, (uint64_t)l_min), (uint64_t)l_max);
+	c->limited = false;
+	c->q_prev = c->q;
+}
 
 /* end CBC */
 
@@ -1148,7 +1215,7 @@ rej_update(struct rej_state *r, uint32_t b_tx, uint32_t b_sent, uint32_t b_req)
  * With one TC per queue, steps 2-5 are exactly the former per-TC loop.
  * With retry, no packet is dropped after leaving the scheduler.
  */
-enum ctrl_kind { CTRL_NONE, CTRL_QBC, CTRL_CBC, CTRL_REJ };
+enum ctrl_kind { CTRL_NONE, CTRL_QBC, CTRL_CBC, CTRL_REJ, CTRL_CBC_BQL };
 
 #define N_SCHED_TC RTE_SCHED_TRAFFIC_CLASSES_PER_PIPE
 
@@ -1162,6 +1229,11 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 	const uint32_t b_req = burst_conf.qos_dequeue;
 	/* NONE has no budget: every TC may offer b_req, nothing is shared */
 	const bool shared = kind != CTRL_NONE;
+	/* CBC/BQL is CBC with an adaptive L */
+	const bool bql = kind == CTRL_CBC_BQL;
+
+	if (bql)
+		kind = CTRL_CBC;
 
 	struct flow_conf *flow = container_of(confs[0], struct flow_conf, wt_thread);
 	pending_tc_stats_t *stats = flow->tc_stats;
@@ -1182,6 +1254,26 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 	const uint64_t n_desc = ring_conf.tx_size;
 	/* CBC limit L on outstanding packets per TxQ: L = min(--cbc-limit, N_desc) */
 	const uint64_t cbc_l = (cbc_limit != 0 && cbc_limit < n_desc) ? cbc_limit : n_desc;
+	/* CBC/BQL: completion granularity eps and the bounds of L, from what the
+	 * PMD configured for the first TxQ (all TxQs share one tx_conf) */
+	uint32_t bql_eps = 32, bql_min = 0, bql_max = (uint32_t)cbc_l;
+	const uint64_t bql_hold_tsc = (rte_get_tsc_hz() * cbc_bql_hold_us) / 1000000ULL;
+
+	if (bql) {
+		struct rte_eth_txq_info qi;
+		uint32_t free_thresh = 32;
+
+		if (rte_eth_tx_queue_info_get(confs[0]->tx_port, confs[0]->txq_base,
+				&qi) == 0) {
+			if (qi.conf.tx_rs_thresh > 0)
+				bql_eps = qi.conf.tx_rs_thresh;
+			free_thresh = qi.conf.tx_free_thresh;
+		}
+		if (n_desc > (uint64_t)free_thresh + bql_eps)
+			bql_max = (uint32_t)RTE_MIN(cbc_l, n_desc - free_thresh - bql_eps);
+		bql_min = cbc_bql_min ? cbc_bql_min : 2 * bql_eps;
+		bql_min = RTE_MIN(bql_min, bql_max);
+	}
 
 	struct rte_mbuf *tc_mbufs[N_SCHED_TC][burst_conf.qos_dequeue];
 	struct rte_mbuf **pkts[N_SCHED_TC];
@@ -1197,6 +1289,10 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 	memset(qbc, 0, sizeof(qbc));
 	memset(cbc, 0, sizeof(cbc));
 	for (int q = 0; q < N_TX_QUEUES; q++) {
+		cbc[q].limit = bql ? bql_max : (uint32_t)cbc_l;
+		cbc[q].lowest_slack = UINT32_MAX;
+	}
+	for (int q = 0; q < N_TX_QUEUES; q++) {
 		rej[q].window = b_req;
 		rej[q].streak = 0;
 	}
@@ -1210,9 +1306,13 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 		ctrl_stats_init_gauges(&container_of(confs[i], struct flow_conf,
 				wt_thread)->cs);
 
-	if (kind == CTRL_CBC)
+	if (kind == CTRL_CBC && !bql)
 		printf("CBC: N_desc=%" PRIu64 " L=%" PRIu64 " T_poll=%u us\n", n_desc, cbc_l,
 		       cbc_poll_us);
+	if (bql)
+		printf("CBC/BQL: N_desc=%" PRIu64 " L in [%u, %u] eps=%u T_poll=%u us "
+		       "hold=%u us\n", n_desc, bql_min, bql_max, bql_eps, cbc_poll_us,
+		       cbc_bql_hold_us);
 	if (kind == CTRL_REJ)
 		printf("REJ: A=%u K=%u W_min=%u\n", rej_add_step, rej_grow_streak,
 				(uint32_t)REJ_MIN);
@@ -1252,9 +1352,13 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 				case CTRL_CBC: {
 					struct cbc_state *c = &cbc[q];
 
-					if (c->q != c->c && now - c->last_poll_tsc >= poll_tsc) {
+					/* CBC/BQL also polls an empty TxQ: an empty queue
+					 * while packets are held back is what grows L */
+					if ((c->q != c->c || (bql && c->limited)) &&
+					    now - c->last_poll_tsc >= poll_tsc) {
 						uint64_t t_fb = stats_tsc();
-						int freed = rte_eth_tx_done_cleanup(conf->tx_port,
+						int freed = c->q == c->c ? 0 :
+							rte_eth_tx_done_cleanup(conf->tx_port,
 								conf->txq_base + q, 0);
 
 						if (likely(stats_on)) {
@@ -1272,10 +1376,14 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 							       conf->tx_port, conf->txq_base + q, freed);
 							warned = true;
 						}
+						if (bql)
+							cbc_bql_poll(c, now, freed > 0 ? (uint32_t)freed : 0,
+									bql_eps, bql_min, bql_max,
+									bql_hold_tsc, &cs->tc[tc]);
 						c->last_poll_tsc = now;
 					}
 					uint64_t u = c->q - c->c;
-					uint64_t b_cap = u < cbc_l ? cbc_l - u : 0;
+					uint64_t b_cap = u < c->limit ? c->limit - u : 0;
 
 					cap = (uint32_t)RTE_MIN(b_cap, (uint64_t)b_req);
 					break;
@@ -1290,8 +1398,10 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 				q_cap[q] = cap;
 				q_left[q] = cap;
 			}
-			if (kind == CTRL_CBC && likely(stats_on))
+			if (kind == CTRL_CBC && likely(stats_on)) {
 				cs->tc[tc].q_minus_c = (int64_t)(cbc[q].q - cbc[q].c);
+				cs->tc[tc].l = cbc[q].limit;
+			}
 
 			/* the TC may use what its queue has left */
 			const uint32_t cap = shared ? q_left[q] : q_cap[q];
@@ -1402,6 +1512,14 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 			}
 			case CTRL_CBC:
 				cbc[q].q += q_sent[q];
+				if (bql) {
+					/* limited: the budget was used up and was smaller
+					 * than the request; a zero budget keeps the last
+					 * state, since nothing was offered to tell */
+					if (q_cap[q] > 0)
+						cbc[q].hungry = q_left[q] == 0 && q_cap[q] < b_req;
+					cbc[q].limited |= cbc[q].hungry;
+				}
 				break;
 			case CTRL_REJ:
 				if (likely(stats_on))
@@ -1453,6 +1571,12 @@ app_mixed_thread_cbc(struct thread_conf **confs)
 }
 
 static void
+app_mixed_thread_cbc_bql(struct thread_conf **confs)
+{
+	app_mixed_thread_ctrl(confs, CTRL_CBC_BQL, true);
+}
+
+static void
 app_mixed_thread_rej(struct thread_conf **confs)
 {
 	app_mixed_thread_ctrl(confs, CTRL_REJ, true);
@@ -1462,6 +1586,8 @@ app_mixed_thread_rej(struct thread_conf **confs)
 enum mixed_mode mixed_mode = MIXED_MODE_DEFAULT;
 uint32_t cbc_poll_us = CBC_POLL_US;
 uint32_t cbc_limit;	/* --cbc-limit, 0: use N_desc */
+uint32_t cbc_bql_hold_us = CBC_BQL_HOLD_US;	/* --cbc-bql-hold */
+uint32_t cbc_bql_min;	/* --cbc-bql-min, 0: 2 x tx_rs_thresh */
 
 static const struct {
 	const char *name;
@@ -1478,6 +1604,7 @@ static const struct {
 	[MIXED_MODE_PRIOPROP]     = { "prioprop",     app_mixed_thread_prioprop,     false },
 	[MIXED_MODE_REJ]          = { "rej",          app_mixed_thread_rej,          true  },
 	[MIXED_MODE_PAB_OP]       = { "pab_op",       app_mixed_thread_pab_op,       true  },
+	[MIXED_MODE_CBC_BQL]      = { "cbc_bql",      app_mixed_thread_cbc_bql,      true  },
 };
 
 int
@@ -1500,7 +1627,7 @@ mixed_mode_name(void)
 const char *
 mixed_mode_list(void)
 {
-	return "none|qbc|cbc|rej|priobp|priobp_stats|pab_op|aggbp|pertcdequeue|prioprop";
+	return "none|qbc|cbc|cbc_bql|rej|priobp|priobp_stats|pab_op|aggbp|pertcdequeue|prioprop";
 }
 
 bool

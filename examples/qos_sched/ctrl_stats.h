@@ -71,7 +71,7 @@
  *                   on per-flow reordering at the DUT. 0 by construction for
  *                   pab_op; also counted for none/qbc/cbc/rej.
  */
-#define CTRL_STATS_VERSION 5
+#define CTRL_STATS_VERSION 6
 #define CS_UNSET (-1)
 
 struct ctrl_tc_stats {
@@ -94,6 +94,8 @@ struct ctrl_tc_stats {
 	uint64_t fb_cyc;	/* CBC: TSC cycles spent in the polls */
 	uint64_t h_lowered;	/* QBC: decreases of H */
 	uint64_t cuts;		/* REJ: window cuts after a partial transmit */
+	uint64_t l_grown;	/* CBC/BQL: limit increases (version 6) */
+	uint64_t l_shrunk;	/* CBC/BQL: limit decreases (version 6) */
 	uint64_t overtakes;	/* fresh packets accepted by the NIC while older
 				 * packets of the same TC were still in the retry
 				 * queue (possible reordering, see v5) */
@@ -105,6 +107,7 @@ struct ctrl_tc_stats {
 	int64_t h;		/* QBC: congestion boundary H */
 	int64_t delta;		/* QBC: signal step */
 	int64_t w;		/* REJ: window W */
+	int64_t l;		/* CBC, CBC/BQL: limit L on Q - C (version 6) */
 	/* ---- occupancy over time (version 3) ---- */
 	uint64_t pq_area;	/* counter: sum of pq x TSC ticks */
 	int64_t pq_max_win;	/* gauge: peak pq of the last completed window */
@@ -203,6 +206,7 @@ ctrl_stats_init_gauges(struct ctrl_stats *cs)
 		t->h = CS_UNSET;
 		t->delta = CS_UNSET;
 		t->w = CS_UNSET;
+		t->l = CS_UNSET;
 		t->pq_max_win = CS_UNSET;
 		t->pq_max_cur = 0;
 		t->backlog = 0;

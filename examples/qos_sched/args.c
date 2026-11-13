@@ -76,10 +76,14 @@ static const char usage[] =
 	"           C = TX write-back threshold (default value is %u)                   \n"
 	"    --cfg FILE : profile configuration to load                                 \n"
 	"    --mode NAME : mixed-thread backpressure mode (default qbc, or set at build) \n"
-	"           none|qbc|cbc|rej|priobp|priobp_stats|pab_op|aggbp|pertcdequeue|      \n"
-	"           prioprop (priobp_stats = PAB, pab_op = order-preserving PAB)        \n"
+	"           none|qbc|cbc|cbc_bql|rej|priobp|priobp_stats|pab_op|aggbp|        \n"
+	"           pertcdequeue|prioprop (priobp_stats = PAB, pab_op = order-        \n"
+	"           preserving PAB, cbc_bql = CBC with an adaptive limit, as BQL)     \n"
 	"    --cbc-poll US : CBC completion poll period T_poll in us (default %u)       \n"
 	"    --cbc-limit L : CBC limit on outstanding packets per TxQ (default N_desc)  \n"
+	"           cbc_bql: upper bound of the adaptive limit                       \n"
+	"    --cbc-bql-hold US : cbc_bql slack hold time before L shrinks (default %u) \n"
+	"    --cbc-bql-min L : cbc_bql lower bound of L (default 2 x tx_rs_thresh)     \n"
 	"    --rej-add-step A : REJ additive window step (default %u)                   \n"
 	"    --rej-grow-streak K : REJ full transmits before growing W (default %u)     \n"
 	"    --pf-tree class|instance|default : PF mode, all pfc share the PF port(s);   \n"
@@ -121,7 +125,7 @@ app_usage(const char *prgname)
 		MAX_PKT_TX_BURST, NB_MBUF,
 		RX_PTHRESH, RX_HTHRESH, RX_WTHRESH,
 		TX_PTHRESH, TX_HTHRESH, TX_WTHRESH,
-		CBC_POLL_US, REJ_ADD_STEP, REJ_GROW_STREAK
+		CBC_POLL_US, CBC_BQL_HOLD_US, REJ_ADD_STEP, REJ_GROW_STREAK
 		);
 }
 
@@ -311,6 +315,10 @@ enum {
 	OPT_CBC_POLL_NUM,
 #define OPT_CBC_LIMIT "cbc-limit"
 	OPT_CBC_LIMIT_NUM,
+#define OPT_CBC_BQL_HOLD "cbc-bql-hold"
+	OPT_CBC_BQL_HOLD_NUM,
+#define OPT_CBC_BQL_MIN "cbc-bql-min"
+	OPT_CBC_BQL_MIN_NUM,
 #define OPT_REJ_ADD "rej-add-step"
 	OPT_REJ_ADD_NUM,
 #define OPT_REJ_GROW "rej-grow-streak"
@@ -400,6 +408,8 @@ app_parse_args(int argc, char **argv)
 		{OPT_MODE, 1, NULL, OPT_MODE_NUM},
 		{OPT_CBC_POLL, 1, NULL, OPT_CBC_POLL_NUM},
 		{OPT_CBC_LIMIT, 1, NULL, OPT_CBC_LIMIT_NUM},
+		{OPT_CBC_BQL_HOLD, 1, NULL, OPT_CBC_BQL_HOLD_NUM},
+		{OPT_CBC_BQL_MIN, 1, NULL, OPT_CBC_BQL_MIN_NUM},
 		{OPT_REJ_ADD, 1, NULL, OPT_REJ_ADD_NUM},
 		{OPT_REJ_GROW, 1, NULL, OPT_REJ_GROW_NUM},
 		{OPT_PF_TREE, 1, NULL, OPT_PF_TREE_NUM},
@@ -523,6 +533,22 @@ app_parse_args(int argc, char **argv)
 					return -1;
 				}
 				cbc_limit = (uint32_t)atoi(optarg);
+				break;
+
+			case OPT_CBC_BQL_HOLD_NUM:
+				if (atoi(optarg) <= 0) {
+					RTE_LOG(ERR, APP, "Invalid --cbc-bql-hold %s\n", optarg);
+					return -1;
+				}
+				cbc_bql_hold_us = (uint32_t)atoi(optarg);
+				break;
+
+			case OPT_CBC_BQL_MIN_NUM:
+				if (atoi(optarg) <= 0) {
+					RTE_LOG(ERR, APP, "Invalid --cbc-bql-min %s\n", optarg);
+					return -1;
+				}
+				cbc_bql_min = (uint32_t)atoi(optarg);
 				break;
 
 			case OPT_REJ_ADD_NUM:

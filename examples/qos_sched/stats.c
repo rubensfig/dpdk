@@ -480,12 +480,13 @@ static const struct {
 	CS_C(sent), CS_C(retried), CS_C(retry_sent), CS_C(dropped),
 	CS_C(stalls), CS_C(bound), CS_C(polls), CS_C(freed), CS_C(fb_cyc),
 	CS_C(h_lowered), CS_C(cuts), CS_C(overtakes), CS_C(pq_area),
+	CS_C(l_grown), CS_C(l_shrunk),
 	CS_C(sched_enq), CS_C(sched_drop), CS_C(backlog_area),
 #undef CS_C
 }, cs_gauges[] = {
 #define CS_G(f) { #f, offsetof(struct ctrl_tc_stats, f) }
 	CS_G(pq), CS_G(q_minus_c), CS_G(u), CS_G(u0), CS_G(h), CS_G(delta),
-	CS_G(w), CS_G(pq_max_win), CS_G(backlog), CS_G(backlog_max_win),
+	CS_G(w), CS_G(l), CS_G(pq_max_win), CS_G(backlog), CS_G(backlog_max_win),
 #undef CS_G
 };
 
@@ -794,6 +795,9 @@ telemetry_scenario(const char *cmd __rte_unused,
 	rte_tel_data_add_dict_uint(d, "watch_us", watch_us);
 	rte_tel_data_add_dict_uint(d, "backlog_us", backlog_us);
 	rte_tel_data_add_dict_uint(d, "cbc_poll_us", cbc_poll_us);
+	rte_tel_data_add_dict_uint(d, "cbc_limit", cbc_limit);
+	rte_tel_data_add_dict_uint(d, "cbc_bql_hold_us", cbc_bql_hold_us);
+	rte_tel_data_add_dict_uint(d, "cbc_bql_min", cbc_bql_min);
 	rte_tel_data_add_dict_uint(d, "rej_add_step", rej_add_step);
 	rte_tel_data_add_dict_uint(d, "rej_grow_streak", rej_grow_streak);
 
