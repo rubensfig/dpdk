@@ -798,6 +798,7 @@ telemetry_scenario(const char *cmd __rte_unused,
 	rte_tel_data_add_dict_uint(d, "cbc_limit", cbc_limit);
 	rte_tel_data_add_dict_uint(d, "cbc_bql_hold_us", cbc_bql_hold_us);
 	rte_tel_data_add_dict_uint(d, "cbc_bql_min", cbc_bql_min);
+	rte_tel_data_add_dict_uint(d, "cbc_bql_busy", cbc_bql_busy);
 	rte_tel_data_add_dict_uint(d, "rej_add_step", rej_add_step);
 	rte_tel_data_add_dict_uint(d, "rej_grow_streak", rej_grow_streak);
 

@@ -84,6 +84,8 @@ static const char usage[] =
 	"           cbc_bql: upper bound of the adaptive limit                       \n"
 	"    --cbc-bql-hold US : cbc_bql slack hold time before L shrinks (default %u) \n"
 	"    --cbc-bql-min L : cbc_bql lower bound of L (default 2 x tx_rs_thresh)     \n"
+	"    --cbc-bql-busy : cbc_bql: no shrink in a hold window where L held packets \n"
+	"           back (the scheduler still had packets for the queue)             \n"
 	"    --rej-add-step A : REJ additive window step (default %u)                   \n"
 	"    --rej-grow-streak K : REJ full transmits before growing W (default %u)     \n"
 	"    --pf-tree class|instance|default : PF mode, all pfc share the PF port(s);   \n"
@@ -319,6 +321,8 @@ enum {
 	OPT_CBC_BQL_HOLD_NUM,
 #define OPT_CBC_BQL_MIN "cbc-bql-min"
 	OPT_CBC_BQL_MIN_NUM,
+#define OPT_CBC_BQL_BUSY "cbc-bql-busy"
+	OPT_CBC_BQL_BUSY_NUM,
 #define OPT_REJ_ADD "rej-add-step"
 	OPT_REJ_ADD_NUM,
 #define OPT_REJ_GROW "rej-grow-streak"
@@ -410,6 +414,7 @@ app_parse_args(int argc, char **argv)
 		{OPT_CBC_LIMIT, 1, NULL, OPT_CBC_LIMIT_NUM},
 		{OPT_CBC_BQL_HOLD, 1, NULL, OPT_CBC_BQL_HOLD_NUM},
 		{OPT_CBC_BQL_MIN, 1, NULL, OPT_CBC_BQL_MIN_NUM},
+		{OPT_CBC_BQL_BUSY, 0, NULL, OPT_CBC_BQL_BUSY_NUM},
 		{OPT_REJ_ADD, 1, NULL, OPT_REJ_ADD_NUM},
 		{OPT_REJ_GROW, 1, NULL, OPT_REJ_GROW_NUM},
 		{OPT_PF_TREE, 1, NULL, OPT_PF_TREE_NUM},
@@ -549,6 +554,10 @@ app_parse_args(int argc, char **argv)
 					return -1;
 				}
 				cbc_bql_min = (uint32_t)atoi(optarg);
+				break;
+
+			case OPT_CBC_BQL_BUSY_NUM:
+				cbc_bql_busy = 1;
 				break;
 
 			case OPT_REJ_ADD_NUM:

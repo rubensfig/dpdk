@@ -100,6 +100,7 @@ extern uint32_t cbc_poll_us;
 extern uint32_t cbc_limit;	/* CBC limit L in packets, 0: N_desc */
 extern uint32_t cbc_bql_hold_us;	/* CBC/BQL: slack hold time before shrinking L */
 extern uint32_t cbc_bql_min;	/* CBC/BQL: lower bound of L, 0: 2 x tx_rs_thresh */
+extern uint32_t cbc_bql_busy;	/* CBC/BQL: 1: L does not shrink in a hold window where it bound */
 extern uint32_t rej_add_step;
 extern uint32_t rej_grow_streak;
 

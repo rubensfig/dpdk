@@ -769,6 +769,7 @@ struct cbc_state {
 	uint64_t q_prev;	/* Q at the previous poll */
 	uint64_t slack_start;	/* TSC: start of the current slack hold window */
 	uint32_t lowest_slack;	/* smallest slack in the window, UINT32_MAX: none */
+	bool held;		/* L held packets back in the current hold window */
 };
 
 /*
@@ -793,14 +794,24 @@ struct cbc_state {
  * tx_burst, and every completion is counted by rte_eth_tx_done_cleanup(), so
  * Q - C stays exact. L starts at L_max, i.e. as CBC with that limit.
  * L_min = --cbc-bql-min, default 2 x tx_rs_thresh.
+ *
+ * --cbc-bql-busy: L does not shrink at the end of a hold window in which it
+ * held packets back at some poll. L then bound, so the scheduler still had
+ * packets for the queue, and a shorter TxQ would only move them into the
+ * scheduler. At tx_rs_thresh granularity the slack is L - 2 x eps at every
+ * poll that frees a batch, so without this L falls to L_min at every hold
+ * expiry, also in the middle of a scheduler backlog. L shrinks only after a
+ * whole hold window in which the budget never bound.
  */
 static inline void
 cbc_bql_poll(struct cbc_state *c, uint64_t now, uint32_t freed, uint32_t eps,
-		uint32_t l_min, uint32_t l_max, uint64_t hold_tsc,
+		uint32_t l_min, uint32_t l_max, uint64_t hold_tsc, bool busy,
 		struct ctrl_tc_stats *ts)
 {
 	uint64_t limit = c->limit;
 	const uint64_t out = c->q - c->c;
+
+	c->held |= c->limited;
 
 	if (c->limited && out < eps) {
 		uint64_t inside = c->c > c->q_prev ? c->c - c->q_prev : 0;
@@ -808,6 +819,7 @@ cbc_bql_poll(struct cbc_state *c, uint64_t now, uint32_t freed, uint32_t eps,
 		limit += RTE_MAX(inside, (uint64_t)eps);
 		c->slack_start = now;
 		c->lowest_slack = UINT32_MAX;
+		c->held = false;
 		if (likely(stats_on))
 			ts->l_grown++;
 	} else if (freed > 0) {
@@ -817,13 +829,15 @@ cbc_bql_poll(struct cbc_state *c, uint64_t now, uint32_t freed, uint32_t eps,
 		if (slack < c->lowest_slack)
 			c->lowest_slack = slack;
 		if (now - c->slack_start >= hold_tsc) {
-			if (c->lowest_slack != UINT32_MAX && c->lowest_slack > 0) {
+			if (c->lowest_slack != UINT32_MAX && c->lowest_slack > 0 &&
+			    !(busy && c->held)) {
 				limit -= c->lowest_slack;
 				if (likely(stats_on))
 					ts->l_shrunk++;
 			}
 			c->slack_start = now;
 			c->lowest_slack = UINT32_MAX;
+			c->held = false;
 		}
 	}
 	c->limit = (uint32_t)RTE_MIN(RTE_MAX(limit, (uint64_t)l_min), (uint64_t)l_max);
@@ -1311,8 +1325,8 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 		       cbc_poll_us);
 	if (bql)
 		printf("CBC/BQL: N_desc=%" PRIu64 " L in [%u, %u] eps=%u T_poll=%u us "
-		       "hold=%u us\n", n_desc, bql_min, bql_max, bql_eps, cbc_poll_us,
-		       cbc_bql_hold_us);
+		       "hold=%u us busy=%u\n", n_desc, bql_min, bql_max, bql_eps, cbc_poll_us,
+		       cbc_bql_hold_us, cbc_bql_busy);
 	if (kind == CTRL_REJ)
 		printf("REJ: A=%u K=%u W_min=%u\n", rej_add_step, rej_grow_streak,
 				(uint32_t)REJ_MIN);
@@ -1379,7 +1393,8 @@ app_mixed_thread_ctrl(struct thread_conf **confs, enum ctrl_kind kind,
 						if (bql)
 							cbc_bql_poll(c, now, freed > 0 ? (uint32_t)freed : 0,
 									bql_eps, bql_min, bql_max,
-									bql_hold_tsc, &cs->tc[tc]);
+									bql_hold_tsc, cbc_bql_busy != 0,
+									&cs->tc[tc]);
 						c->last_poll_tsc = now;
 					}
 					uint64_t u = c->q - c->c;
@@ -1588,6 +1603,7 @@ uint32_t cbc_poll_us = CBC_POLL_US;
 uint32_t cbc_limit;	/* --cbc-limit, 0: use N_desc */
 uint32_t cbc_bql_hold_us = CBC_BQL_HOLD_US;	/* --cbc-bql-hold */
 uint32_t cbc_bql_min;	/* --cbc-bql-min, 0: 2 x tx_rs_thresh */
+uint32_t cbc_bql_busy;	/* --cbc-bql-busy */
 
 static const struct {
 	const char *name;
